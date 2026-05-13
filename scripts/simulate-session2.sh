@@ -106,7 +106,7 @@ echo "[D] CLI commands (ISC-10..17)"
 export MACHTSINN_URL="$API"
 export MACHTSINN_KEY="$A_KEY"
 
-CLI="bun /Users/ardin/Projects/machtsinn.ai/src/cli.ts"
+CLI="bun ${PROJECT_ROOT:-$PWD}/src/cli.ts"
 
 # add via CLI
 ADD_OUT=$($CLI add "CLI-test note from Ardin" --scope entity --entity company-a --tags cli,test 2>&1)
@@ -163,7 +163,7 @@ MCP_OUT=$(MACHTSINN_KEY="$A_KEY" MACHTSINN_URL="$API" bash -c '
   sleep 0.3
   echo "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}"
   sleep 0.6
-' | bun /Users/ardin/Projects/machtsinn.ai/src/mcp.ts 2>/dev/null | head -50)
+' | bun ${PROJECT_ROOT:-$PWD}/src/mcp.ts 2>/dev/null | head -50)
 
 check "MCP server returns initialize result" "$MCP_OUT" '"protocolVersion"'
 check "MCP server lists memory_remember tool" "$MCP_OUT" '"memory_remember"'
@@ -180,7 +180,7 @@ MCP_CALL=$(MACHTSINN_KEY="$A_KEY" MACHTSINN_URL="$API" bash -c '
   sleep 0.3
   echo "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_stats\",\"arguments\":{}}}"
   sleep 0.6
-' | bun /Users/ardin/Projects/machtsinn.ai/src/mcp.ts 2>/dev/null | head -50)
+' | bun ${PROJECT_ROOT:-$PWD}/src/mcp.ts 2>/dev/null | head -50)
 
 # MCP wraps payload as {"content":[{"type":"text","text":"<escaped json>"}]} so look for escaped form
 check "MCP tool call memory_stats returns total_memories" "$MCP_CALL" 'total_memories'
