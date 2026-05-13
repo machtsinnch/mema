@@ -1,0 +1,29 @@
+{
+  "name": "machtsinn.ai",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "machtsinn": "./src/cli.ts",
+    "machtsinn-mcp": "./src/mcp.ts"
+  },
+  "scripts": {
+    "dev": "bun --hot src/index.ts",
+    "start": "bun src/index.ts",
+    "cli": "bun src/cli.ts",
+    "mcp": "bun src/mcp.ts",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "gray-matter": "^4.0.3",
+    "hono": "^4.12.18",
+    "ulid": "^3.0.2"
+  }
+}

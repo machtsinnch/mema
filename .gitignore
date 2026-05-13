@@ -1,0 +1,52 @@
+# dependencies (bun install)
+node_modules
+bun.lockb
+
+# output
+out
+dist
+*.tgz
+
+# code coverage
+coverage
+*.lcov
+
+# logs and runtime state
+logs
+*.log
+*.pid
+
+# THE VAULT — contains personal and client memories, NEVER push
+data/
+
+# obsidian config inside data/ (already excluded but doubly safe)
+.obsidian/
+
+# SQLite databases
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+secrets.json
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# IntelliJ based IDEs
+.idea
+
+# Finder (MacOS) folder config
+.DS_Store
+
+# Editor swap files
+*.swp
+*~
