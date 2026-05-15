@@ -2,6 +2,135 @@
 
 All notable changes to mema. Follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v2.9.0 — 2026-05-16
+
+Closes every P0 from the v2.8.0 external review and adds the architectural
+pieces needed to make the "mema competes with Zep/Hindsight on memory
+performance" claim defensible: contradiction detection, LLM-driven
+reflection, entity resolution, RRF fusion helper, and a LongMemEval
+LLM-judge layer for answer-level scoring. Also pivots the license to
+**Business Source License 1.1**.
+
+### Added (P0 from second external review)
+
+- **`MEMA_BENCH_ALLOW_OWNER_OVERRIDE` server flag (P0-A).** When set,
+  the `x-owner` header overrides the API-key-derived owner. The
+  LongMemEval harness now uses this to actually achieve per-question
+  vault isolation (previously silently pooled into one owner). Strict
+  whitelist on the header value (`[A-Za-z0-9._-]{1,64}`). x-actor
+  spoofing still cross-checked against the *effective* owner.
+- **Fail-closed fact approval (P0-B).** `/v2/fact/:id/approve` now
+  rejects with `422 evidence_check_failed` when `derived_from` is empty
+  OR the cited source episode is missing from the vault OR the
+  evidence-check guard fails. `force: true` bypass now requires a
+  non-empty `reason` (`400 force_requires_reason` otherwise).
+- **Entity evidence check (P0-C).** `/v2/entity/:id/approve` runs a
+  parallel gate to facts. New `entityEvidenceCheck(name, aliases, body)`
+  helper + `entityNameLooksLikeFragment(name)` rejects fragment-shaped
+  proposals (pure numbers, currency amounts like "CHF 22", ISO dates,
+  month-day strings, punctuation-only, single chars).
+- **v2-entities as first-class retrieval candidates (P0-D).** Added
+  `"entity"` to `RetrievalKind`, `classifyPath` recognises
+  `/v2-entities/`, and `reindexAll` now includes `data/v2-entities/`
+  in its candidate roots. Calling `/v2/recall` with `kinds:["entity"]`
+  now returns approved v2 entities (was a silent no-op before).
+- **`--extract` real implementation (P0-E).** The LongMemEval harness
+  previously documented but stubbed `--extract`. Now runs inline LLM
+  extraction (via `pickExtractor`) per ingested session, writes drafts,
+  and auto-approves high-confidence (≥0.9) ones via the
+  `/v2/fact/:id/approve` evidence gate. Approval counts surfaced in
+  the report.
+- **Ollama embedder dim probe (P0-F).** `OllamaEmbedder.dim` is no
+  longer `0` until the first `embed()` call. Constructor seeds from
+  `OLLAMA_EMBED_DIM` env, a known-model table (`nomic-embed-text`=768,
+  `mxbai-embed-large`=1024, `bge-m3`=1024, etc.), or an explicit ctor
+  arg. First real embed corrects the seed if it disagrees.
+- **`legal_basis` exposed through `/v2/erase` (P0-G).** Request body
+  accepts `{ record_path, reason, legal_basis? }` and forwards the
+  field to `hardErase` which already supported it. Lets API callers
+  record GDPR Article 17 / nFADP citations alongside the erasure.
+
+### Added (P1 — answer-level benchmark scoring)
+
+- **LLM-judge layer in `bench/longmemeval-harness.ts`.** Two judge
+  modes: `--judge substring` (case-insensitive token check, fast, no
+  LLM) and `--judge llm` (Ollama-based judge prompt). Generates a
+  candidate answer from retrieved context (`--top-k` sessions,
+  `--context-chars`), then judges against the LongMemEval gold
+  answer. Per-category and overall **Answer-correct%** alongside the
+  existing Hit@k metrics.
+
+### Added (NEW — Zep/Hindsight gap closers)
+
+- **Contradiction detection** on fact write. `findContradictions(vault,
+  owner, candidate)` returns existing approved non-invalidated facts
+  that share `(subject, predicate)` with a different object. Exposed
+  at `POST /v2/fact/contradictions`.
+- **Approve-with-supersedes**: `POST /v2/fact/:newId/approve-supersedes/:oldId`
+  atomically approves the new fact and invalidates the old one
+  (setting `superseded_by` to point at the new fact). Runs the same
+  evidence gate as plain approve.
+- **LLM-driven reflection**: `reflectLLM` runs the existing rule-based
+  pass, then feeds the same window of episodes + facts to a
+  structured-prompt LLM that proposes high-confidence beliefs. Drafts
+  go through the same acceptance gate as facts (with `evidence_excerpt`
+  required). Opt-in via `POST /v2/reflect` with `llm: true`.
+- **Entity resolution** (`resolveEntity` + `POST /v2/entity/resolve`).
+  Given a candidate name/aliases/type, returns ranked existing
+  entities by exact match (1.0), substring containment (0.7+0.2×len
+  ratio), and Levenshtein ≤ 2 (0.5+0.4×similarity). Closes the Zep
+  alias-resolution gap. Used by extractors to avoid creating duplicate
+  entities.
+- **Reciprocal Rank Fusion** (`reciprocalRankFusion` in
+  `layer5-rrf.ts`). Standard RRF (k=60 default) for combining keyword,
+  vector, graph candidate lists. Available as a helper today; not yet
+  wired into `/v2/recall` as a fusion strategy (that requires a
+  retrieval pipeline refactor — deferred to v2.10).
+
+### Added (acceptance lifecycle parity)
+
+- **Draft cognitive records**. `recordCognitive` now accepts
+  `status: "draft" | "approved" | "rejected"`, `evidence_excerpt`,
+  `proposed_by`. LLM-driven reflection uses this. Layer 5 retrieval
+  filter now excludes draft / rejected cognitive records (in addition
+  to facts and entities).
+
+### Changed
+
+- **License pivot: MIT → BUSL-1.1.** v2.9.0 onward is under the
+  Business Source License 1.1 with Change Date 2030-05-15 and Change
+  License Apache 2.0. Non-production use (evaluation, academic
+  research, security review, internal development) is free. Production
+  use requires a commercial license. Versions v2.0.0 through v2.8.0
+  remain MIT-licensed at their git tags. See `NOTICE-LICENSE-HISTORY.md`,
+  `LICENSE`, and `LICENSE-MIT-PRE-V2.9.md`.
+- README claim wording updated to reviewer's precise framing: "rejected
+  ~27% of LLM-proposed facts for failing source-evidence checks" (not
+  "caught 27% hallucinations" — that needs human-labeled ground truth).
+- README Quick Start no longer claims a stale "97 assertions" test count.
+
+### Test counts
+
+- v2.8.0: 177 tests, 18 files, 411 expect() calls
+- v2.9.0: 222 tests, 25 files, 525+ expect() calls (+45 tests covering
+  x-owner override, fail-closed fact + entity approval, evidence-check
+  fragment detection, contradiction detection, entity resolution, RRF
+  fusion edge cases)
+
+### Migration notes
+
+- License: production users of v2.9.0+ require a commercial license.
+  v2.0.0–v2.8.0 at their tags stay MIT — no clawback.
+- Schema: `status` field on cognitive records is optional and defaults
+  to `approved` for back-compat. Audit table has no new columns
+  (metadata column from v2.8.0 unchanged).
+- `RetrievalKind` gained the `"entity"` value — existing callers that
+  pass `kinds:["fact", "cognitive"]` are unaffected; callers that
+  asked for `["entity"]` and silently got nothing now get the v2
+  approved entities.
+
+---
+
 ## v2.8.0 — 2026-05-15
 
 Closes the remaining priorities from the external review of v2.5.1

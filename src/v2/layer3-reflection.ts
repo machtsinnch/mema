@@ -22,6 +22,7 @@ import matter from "gray-matter";
 import type { Episode, SemanticFact, CognitiveRecord } from "./types";
 import { recordCognitive } from "./layer3-cognitive";
 import { factValidSince } from "./temporal";
+import { pickExtractor } from "./llm-extractor";
 
 export interface ReflectInput {
   vaultRoot: string;
@@ -30,6 +31,13 @@ export interface ReflectInput {
   since?: string;              // ISO timestamp; default: last 7 days
   min_support?: number;        // minimum evidence count for a belief; default 3
   max_records_emitted?: number;
+  // v2.9.0+ — opt-in LLM-driven belief synthesis (NEW; closes Hindsight gap).
+  // When true, after the rule-based pass runs, the same window of episodes
+  // is fed to a structured-prompt LLM that proposes beliefs/observations as
+  // DRAFTS with evidence excerpts. Drafts go through the acceptance gate
+  // before they surface in retrieval — same governance as fact extraction.
+  llm?: boolean;
+  llm_max_per_window?: number;  // cap on LLM-proposed drafts per call (default 10)
 }
 
 export interface ReflectionReport {
@@ -38,6 +46,10 @@ export interface ReflectionReport {
   windowed_facts: number;
   cognitive_records_created: number;
   records: CognitiveRecord[];
+  // v2.9.0+ separate counts for the LLM-driven pass — surfaces how much
+  // of the report came from the heuristic strategies vs. the LLM.
+  llm_drafts_proposed?: number;
+  llm_errors?: number;
 }
 
 // Walk owner's episode directory for episodes since `since`.
@@ -175,4 +187,169 @@ export function reflect(input: ReflectInput): ReflectionReport {
     cognitive_records_created: records.length,
     records,
   };
+}
+
+// v2.9.0+ LLM-driven reflection (NEW — closes Hindsight "reflection
+// quality" gap). Runs ASYNCHRONOUSLY because it makes one or more LLM
+// calls. Produces DRAFT cognitive records (status: "draft") that go
+// through the acceptance gate before retrieval surfaces them — same
+// governance posture as fact extraction. Reuses pickExtractor() so the
+// same model selection (Ollama / Anthropic / OpenAI) applies.
+//
+// Prompt strategy: feed the LLM a structured window of episodes + facts
+// and ask for high-confidence (subject, predicate, claim) beliefs that
+// the evidence supports. Each belief carries an evidence_excerpt so the
+// acceptance gate can verify it before promoting.
+const REFLECT_SYSTEM = `You are a careful reflection assistant for an AI memory system. Given a window of recent conversation episodes and extracted facts, propose HIGH-CONFIDENCE beliefs the agent should hold about the user, their world, or their preferences.
+
+Rules:
+- Only emit beliefs the evidence DIRECTLY supports — no speculation, no extrapolation.
+- Each belief must reference at least one episode or fact ID as evidence.
+- Reject:
+  · single-incident generalizations ("user once mentioned X" is not a belief)
+  · contradicted patterns (do not synthesize beliefs from one-off contradictions)
+  · social-graph fabrications (do not claim relationships not stated)
+- Prefer beliefs about persistent preferences, roles, decisions, or commitments — not transient mentions.
+- Confidence: 0.95 only when explicitly stated across multiple episodes; 0.85 for clearly implied by 2+ pieces of evidence; ≤0.75 → don't emit.
+
+Output ONLY valid JSON, no prose, no markdown fences. Schema:
+{ "beliefs": [
+    {"content": "concise belief sentence", "evidence_excerpt": "verbatim ≤200-char span from the window that supports this", "confidence": 0.9}
+  ]
+}
+If the window contains zero high-confidence beliefs, return {"beliefs": []}.`;
+
+export async function reflectLLM(input: ReflectInput): Promise<ReflectionReport> {
+  // Run the rule-based pass first.
+  const base = reflect(input);
+
+  // Build a structured window for the LLM. Cap aggregate window size so a
+  // single call doesn't exhaust the model's context.
+  const cap = input.max_records_emitted ?? 50;
+  const maxDrafts = input.llm_max_per_window ?? 10;
+  const cutoff = input.since ?? new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+  const episodes = loadEpisodes(input.vaultRoot, input.owner, cutoff);
+  const facts = loadFacts(input.vaultRoot, input.owner, cutoff);
+
+  const windowParts: string[] = [];
+  let budget = 8000;  // chars
+  for (const ep of episodes.slice(0, 30)) {
+    const line = `[episode ${ep.id}] (${ep.kind}) ${ep.content.replace(/\s+/g, " ").slice(0, 400)}`;
+    if (line.length > budget) break;
+    windowParts.push(line);
+    budget -= line.length + 2;
+  }
+  for (const f of facts.slice(0, 30)) {
+    const line = `[fact ${f.id}] ${f.subject} ${f.predicate} ${f.object} (conf=${f.confidence})`;
+    if (line.length > budget) break;
+    windowParts.push(line);
+    budget -= line.length + 2;
+  }
+  const window = windowParts.join("\n");
+
+  let errors = 0;
+  let proposed = 0;
+  if (window) {
+    try {
+      const extractor = await pickExtractor();
+      // Reuse the extractor's HTTP plumbing by going through its extract()
+      // method, but with a reflection-specific prompt. The extractor returns
+      // {facts, entities} — we shoehorn beliefs into the facts channel and
+      // ignore entities. (Future refactor: add a generic LLM call interface.)
+      // For now we make a direct request mirroring the extractor's contract.
+      const response = await callReflectionLLM(extractor, window);
+      for (const belief of (response.beliefs ?? []).slice(0, maxDrafts)) {
+        if (proposed >= maxDrafts) break;
+        const content = String(belief?.content ?? "").trim();
+        const conf = Number(belief?.confidence ?? 0);
+        const excerpt = String(belief?.evidence_excerpt ?? "").trim();
+        if (!content || conf < 0.75) continue;
+        // Find a supporting episode for derived_from — match by excerpt
+        // substring against each loaded episode body.
+        const supports: string[] = [];
+        const eLower = excerpt.toLowerCase();
+        for (const ep of episodes) {
+          if (ep.content.toLowerCase().includes(eLower)) supports.push(ep.id);
+          if (supports.length >= 3) break;
+        }
+        if (supports.length === 0) continue;  // can't anchor → drop
+        if (base.records.length >= cap) break;
+        const r = recordCognitive(input.vaultRoot, {
+          kind: "belief",
+          content,
+          confidence: Math.min(Math.max(conf, 0), 1),
+          derived_from: supports,
+          actor: input.actor,
+          owner: input.owner,
+          status: "draft",
+          evidence_excerpt: excerpt,
+          proposed_by: `reflect-llm:${extractor.name}`,
+        } as any);
+        base.records.push(r);
+        proposed++;
+      }
+    } catch {
+      errors++;
+    }
+  }
+  base.cognitive_records_created = base.records.length;
+  base.llm_drafts_proposed = proposed;
+  base.llm_errors = errors;
+  return base;
+}
+
+async function callReflectionLLM(
+  extractor: { name: string; extract(text: string): Promise<any> },
+  window: string,
+): Promise<{ beliefs: Array<{ content: string; evidence_excerpt: string; confidence: number }> }> {
+  // We piggy-back on the extractor's HTTP call. To keep the change tightly
+  // scoped, we go directly to Ollama/Anthropic/OpenAI based on the extractor
+  // name. (Future cleanup: the LLM-extractor module should expose a generic
+  // `chat(systemPrompt, userPrompt)` method.)
+  const userPrompt = `Window:\n${window}\n\nReturn the JSON.`;
+  const isOllama = extractor.name.startsWith("ollama:");
+  const model = isOllama ? extractor.name.slice("ollama:".length) : "claude-haiku-4-5";
+
+  if (isOllama) {
+    const host = process.env.OLLAMA_HOST ?? "http://localhost:11434";
+    const r = await fetch(`${host.replace(/\/+$/, "")}/api/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model, system: REFLECT_SYSTEM, prompt: userPrompt, stream: false }),
+    });
+    if (!r.ok) throw new Error(`reflect-llm ollama failed ${r.status}`);
+    const d = await r.json() as { response: string };
+    return parseBeliefs(d.response ?? "");
+  }
+  // Anthropic / OpenAI fallback — minimal implementation.
+  if (process.env.ANTHROPIC_API_KEY) {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 1024,
+        system: REFLECT_SYSTEM,
+        messages: [{ role: "user", content: userPrompt }],
+      }),
+    });
+    if (!r.ok) throw new Error(`reflect-llm anthropic failed ${r.status}`);
+    const d = await r.json() as { content: Array<{ text: string }> };
+    return parseBeliefs(d.content?.[0]?.text ?? "");
+  }
+  throw new Error("no LLM backend available for reflection");
+}
+
+function parseBeliefs(raw: string): { beliefs: any[] } {
+  // The model sometimes wraps JSON in ```json ... ``` fences despite the prompt.
+  const stripped = raw.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+  try {
+    const j = JSON.parse(stripped);
+    if (j && Array.isArray(j.beliefs)) return j;
+  } catch { /* fall through */ }
+  return { beliefs: [] };
 }

@@ -6,14 +6,16 @@ import { observe } from "./layer1-episodic";
 import {
   recordFact, invalidateFact, getFactsValidAt, readFact,
   approveFact, rejectFact, listDraftFacts, evidenceCheck,
+  findContradictions,
 } from "./layer2-semantic";
 import {
   createEntity, readEntity, findEntityByName, listEntities, mergeEntities,
-  approveEntity, rejectEntity, listDraftEntities,
+  approveEntity, rejectEntity, listDraftEntities, entityEvidenceCheck,
+  resolveEntity,
 } from "./layer2-entities";
 import { findEpisode } from "./layer1-episodic";
 import { recordCognitive, supersedeBelief, addDerivedFrom } from "./layer3-cognitive";
-import { reflect } from "./layer3-reflection";
+import { reflect, reflectLLM } from "./layer3-reflection";
 import { buildGovernance, hardErase } from "./layer4-governance";
 import { recall } from "./layer5-retrieval";
 import { initVectorStore, pickEmbedder, indexRecord, reindexAll, vectorIndexHealth } from "./layer5-embeddings";
@@ -287,10 +289,13 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   });
 
   // v2.7+ acceptance lifecycle endpoints — approve / reject draft facts.
-  // Approve runs the evidence-check guard against the source episode body
-  // before promoting the draft, unless force=true is passed (e.g. for
-  // facts whose subject/object is a synonym or alias not literally in
-  // the source).
+  // v2.9.0+ (P0-B from second external review): the evidence gate is
+  // FAIL-CLOSED. A draft cannot be promoted unless:
+  //   1. derived_from is non-empty (the fact must cite at least one episode)
+  //   2. the cited source episode actually exists in the vault
+  //   3. evidenceCheck passes (subject + object appear in the source body)
+  // Each guard can be overridden by `{force: true, reason: "..."}` — but
+  // `reason` is REQUIRED on force, so every bypass is auditable.
   app.post("/v2/fact/:id/approve", async c => {
     const id = c.req.param("id");
     const parsed = await parseBody<{ reason?: string; force?: boolean }>(c);
@@ -299,20 +304,38 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     const actor = c.get("actor");
     const existing = readFact(cfg.vaultRoot, owner, id);
     if (!existing) return c.json({ error: "not found" }, 404);
-    if (!parsed.body.force) {
-      const epId = (existing.derived_from ?? [])[0];
-      if (epId) {
-        const ep = findEpisode(cfg.vaultRoot, owner, epId);
-        if (ep) {
-          const ec = evidenceCheck(existing.subject, existing.object, ep.content);
-          if (!ec.ok) {
-            return c.json({
-              error: "evidence_check_failed",
-              missing: ec.missing,
-              hint: "subject and/or object not found in source episode body; pass force:true to override",
-            }, 422);
-          }
-        }
+    const force = parsed.body.force === true;
+    if (force && !(parsed.body.reason && parsed.body.reason.trim())) {
+      return c.json({
+        error: "force_requires_reason",
+        hint: "force:true bypasses the evidence gate — provide a non-empty reason for the audit trail",
+      }, 400);
+    }
+    if (!force) {
+      const derivedFrom = (existing.derived_from ?? []).filter(s => typeof s === "string" && s.length > 0);
+      if (derivedFrom.length === 0) {
+        return c.json({
+          error: "evidence_check_failed",
+          missing: ["derived_from"],
+          hint: "draft has no source episode citation; pass {force:true, reason:'...'} to override",
+        }, 422);
+      }
+      const epId = derivedFrom[0];
+      const ep = findEpisode(cfg.vaultRoot, owner, epId);
+      if (!ep) {
+        return c.json({
+          error: "evidence_check_failed",
+          missing: ["source_episode"],
+          hint: `derived_from cites episode '${epId}' which is not in this vault; pass {force:true, reason:'...'} to override`,
+        }, 422);
+      }
+      const ec = evidenceCheck(existing.subject, existing.object, ep.content);
+      if (!ec.ok) {
+        return c.json({
+          error: "evidence_check_failed",
+          missing: ec.missing,
+          hint: "subject and/or object not found in source episode body; pass {force:true, reason:'...'} to override",
+        }, 422);
       }
     }
     const f = approveFact(cfg.vaultRoot, id, owner, actor, parsed.body.reason);
@@ -337,6 +360,64 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   app.get("/v2/facts/drafts", async c => {
     const owner = c.get("owner");
     return c.json({ facts: listDraftFacts(cfg.vaultRoot, owner) });
+  });
+
+  // v2.9.0+ contradiction detection (NEW — Zep-gap closer). Given a
+  // (subject, predicate, object) candidate, returns existing approved
+  // non-invalidated facts that share (subject, predicate) with a
+  // different object. Review tools surface this to reviewers; approving
+  // the new candidate then offers an auto-invalidate-with-supersedes
+  // for the older fact.
+  app.post("/v2/fact/contradictions", async c => {
+    const parsed = await parseBody<{ subject: string; predicate: string; object: string }>(c);
+    if (!parsed.ok) return parsed.response;
+    const owner = c.get("owner");
+    const cs = findContradictions(cfg.vaultRoot, owner, parsed.body);
+    return c.json({ contradictions: cs });
+  });
+
+  // v2.9.0+ approve-with-supersedes (NEW): approve a draft fact AND
+  // invalidate a contradicting older fact in a single atomic-ish
+  // operation. The new fact's `superseded_by` is left null (it is the
+  // CURRENT truth); the old fact gains `invalidated_at` + `superseded_by`
+  // pointing at the new approved fact. The audit chain records both ops.
+  app.post("/v2/fact/:newId/approve-supersedes/:oldId", async c => {
+    const newId = c.req.param("newId");
+    const oldId = c.req.param("oldId");
+    const parsed = await parseBody<{ reason?: string; force?: boolean }>(c);
+    if (!parsed.ok) return parsed.response;
+    const owner = c.get("owner");
+    const actor = c.get("actor");
+    const newFact = readFact(cfg.vaultRoot, owner, newId);
+    if (!newFact) return c.json({ error: "new fact not found" }, 404);
+    const oldFact = readFact(cfg.vaultRoot, owner, oldId);
+    if (!oldFact) return c.json({ error: "old fact not found" }, 404);
+    if (oldFact.subject !== newFact.subject || oldFact.predicate !== newFact.predicate) {
+      return c.json({ error: "old and new facts must share (subject, predicate)" }, 400);
+    }
+    // Run the same evidence gate as /approve.
+    const force = parsed.body.force === true;
+    if (force && !(parsed.body.reason && parsed.body.reason.trim())) {
+      return c.json({ error: "force_requires_reason" }, 400);
+    }
+    if (!force) {
+      const derivedFrom = (newFact.derived_from ?? []).filter(s => typeof s === "string" && s.length > 0);
+      if (derivedFrom.length === 0) {
+        return c.json({ error: "evidence_check_failed", missing: ["derived_from"] }, 422);
+      }
+      const ep = findEpisode(cfg.vaultRoot, owner, derivedFrom[0]);
+      if (!ep) {
+        return c.json({ error: "evidence_check_failed", missing: ["source_episode"] }, 422);
+      }
+      const ec = evidenceCheck(newFact.subject, newFact.object, ep.content);
+      if (!ec.ok) {
+        return c.json({ error: "evidence_check_failed", missing: ec.missing }, 422);
+      }
+    }
+    const approved = approveFact(cfg.vaultRoot, newId, owner, actor, parsed.body.reason);
+    if (!approved) return c.json({ error: "approve failed" }, 500);
+    const invalidated = invalidateFact(cfg.vaultRoot, oldId, owner, actor, newId);
+    return c.json({ approved, invalidated });
   });
 
   app.get("/v2/facts/valid-at", async c => {
@@ -373,12 +454,55 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   });
 
   // v2.7+ approve / reject draft entities.
+  // v2.9.0+ (P0-C): entity approval runs the same fail-closed evidence gate
+  // as facts — entity name or one of its aliases must appear in the cited
+  // source episode body, and the name must not be a fragment-shaped string
+  // (pure number, currency amount, date, punctuation). `force:true` with a
+  // mandatory `reason` bypasses for human-verified cases.
   app.post("/v2/entity/:id/approve", async c => {
     const id = c.req.param("id");
-    const parsed = await parseBody<{ reason?: string }>(c);
+    const parsed = await parseBody<{ reason?: string; force?: boolean }>(c);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
+    const existing = readEntity(cfg.vaultRoot, owner, id);
+    if (!existing) return c.json({ error: "not found" }, 404);
+    const force = parsed.body.force === true;
+    if (force && !(parsed.body.reason && parsed.body.reason.trim())) {
+      return c.json({
+        error: "force_requires_reason",
+        hint: "force:true bypasses the evidence gate — provide a non-empty reason for the audit trail",
+      }, 400);
+    }
+    if (!force) {
+      const derivedFrom = ((existing as any).derived_from ?? []).filter(
+        (s: any) => typeof s === "string" && s.length > 0,
+      ) as string[];
+      if (derivedFrom.length === 0) {
+        return c.json({
+          error: "evidence_check_failed",
+          missing: ["derived_from"],
+          hint: "entity has no source episode citation; pass {force:true, reason:'...'} to override",
+        }, 422);
+      }
+      const epId = derivedFrom[0];
+      const ep = findEpisode(cfg.vaultRoot, owner, epId);
+      if (!ep) {
+        return c.json({
+          error: "evidence_check_failed",
+          missing: ["source_episode"],
+          hint: `derived_from cites episode '${epId}' which is not in this vault; pass {force:true, reason:'...'} to override`,
+        }, 422);
+      }
+      const ec = entityEvidenceCheck(existing.name, existing.aliases ?? [], ep.content);
+      if (!ec.ok) {
+        return c.json({
+          error: "evidence_check_failed",
+          missing: ec.missing,
+          hint: "entity name (or any alias) not found in source body, or name is a fragment (number/currency/date/punctuation); pass {force:true, reason:'...'} to override",
+        }, 422);
+      }
+    }
     const e = approveEntity(cfg.vaultRoot, id, owner, actor, parsed.body.reason);
     if (!e) return c.json({ error: "not found" }, 404);
     return c.json({ entity: e });
@@ -421,6 +545,24 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     const e = findEntityByName(cfg.vaultRoot, owner, c.req.param("name"));
     if (!e) return c.json({ error: "not found" }, 404);
     return c.json({ entity: e });
+  });
+
+  // v2.9.0+ entity resolution (NEW — Zep-gap closer). Given a candidate
+  // {name, aliases, type}, returns existing entities that likely refer
+  // to the same real-world thing. Ranked. Used by extractors before
+  // creating a new entity to avoid duplicates.
+  app.post("/v2/entity/resolve", async c => {
+    const parsed = await parseBody<{
+      name: string; aliases?: string[]; type?: string;
+      include_drafts?: boolean; max_levenshtein?: number;
+    }>(c);
+    if (!parsed.ok) return parsed.response;
+    const owner = c.get("owner");
+    const candidates = resolveEntity(cfg.vaultRoot, owner, parsed.body, {
+      includeDrafts: parsed.body.include_drafts,
+      maxLevenshtein: parsed.body.max_levenshtein,
+    });
+    return c.json({ candidates });
   });
 
   app.post("/v2/entity/:keeperId/merge/:mergedId", async c => {
@@ -476,17 +618,23 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   app.post("/v2/reflect", async c => {
     const parsed = await parseBody<{
       since?: string; min_support?: number; max_records_emitted?: number;
+      // v2.9.0+ (NEW) — opt-in LLM-driven reflection on top of the
+      // rule-based pass. LLM-proposed beliefs land as drafts.
+      llm?: boolean;
+      llm_max_per_window?: number;
     }>(c);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
-    const report = reflect({
+    const args = {
       vaultRoot: cfg.vaultRoot,
       owner, actor,
       since: parsed.body.since,
       min_support: parsed.body.min_support,
       max_records_emitted: parsed.body.max_records_emitted,
-    });
+      llm_max_per_window: parsed.body.llm_max_per_window,
+    };
+    const report = parsed.body.llm ? await reflectLLM(args) : reflect(args);
     return c.json({ report });
   });
 
@@ -544,7 +692,11 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   });
 
   app.post("/v2/erase", async c => {
-    const parsed = await parseBody<{ record_path: string; reason: string }>(c);
+    // v2.9.0+ (P0-G from second external review): expose legal_basis so
+    // API callers can record the GDPR Article / nFADP / etc. citation
+    // that authorized the erasure. hardErase already supported it; the
+    // API just wasn't plumbing it through.
+    const parsed = await parseBody<{ record_path: string; reason: string; legal_basis?: string }>(c);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
@@ -569,6 +721,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
       owner, actor,
       record_path: p,
       reason: parsed.body.reason,
+      legal_basis: parsed.body.legal_basis,
     });
     return c.json(r);
   });

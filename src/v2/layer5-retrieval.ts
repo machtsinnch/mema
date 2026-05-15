@@ -97,6 +97,10 @@ function classifyPath(path: string): RetrievalKind | "v1_memory" {
   if (path.includes("/episodes/")) return "episode";
   if (path.includes("/facts/")) return "fact";
   if (path.includes("/cognitive/")) return "cognitive";
+  // v2.9.0+ — v2-entities under their own kind, separate from v1 entity
+  // storage at data/entities/. This is what makes recall return entities
+  // as first-class hits when callers ask for kinds:["entity"].
+  if (path.includes("/v2-entities/")) return "entity";
   return "v1_memory";   // legacy v1 vault: data/entities/, data/generalized/, data/users/
 }
 
@@ -181,11 +185,10 @@ export async function recall(
       if (!factValidAt(f, validAt, "lt")) continue;
     }
 
-    // v2.7+ acceptance lifecycle filter (applies to fact + entity).
-    // Missing status = "approved" (back-compat). Drafts and rejected are
-    // excluded from default retrieval — review tools call list endpoints
-    // directly to surface them.
-    if (kind === "fact" || kind === "entity") {
+    // v2.7+ acceptance lifecycle filter. v2.9.0+ extends it to cognitive
+    // records since LLM-driven reflectLLM() now writes drafts too.
+    // Missing status = "approved" (back-compat for pre-v2.9 records).
+    if (kind === "fact" || kind === "entity" || kind === "cognitive") {
       const status = (rec.frontmatter as any).status as ("draft" | "approved" | "rejected" | undefined);
       if (status === "draft" || status === "rejected") continue;
     }

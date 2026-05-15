@@ -225,6 +225,30 @@ describe("v2.7 evidenceCheck helper", () => {
   });
 });
 
+describe("v2.9.0 fail-closed fact approval (P0-B)", () => {
+  // These tests exercise the API endpoint indirectly through the layer
+  // functions used by it — the actual endpoint checks live in
+  // tests/v2/fact-approval-strict.test.ts via app.request.
+
+  test("approveFact succeeds when called via the layer (gate is in the API)", () => {
+    const vault = fresh();
+    const ep = observe(vault, {
+      kind: "document", content: "Ardin founded machtsinn AG.",
+      actor: "t", owner: "ardin",
+    });
+    const fact = recordFact(vault, {
+      subject: "Ardin", predicate: "founded", object: "machtsinn AG",
+      derived_from: [ep.id], confidence: 0.9,
+      actor: "ext", owner: "ardin", status: "draft",
+    });
+    // Layer-level approve has no evidence gate — that lives in the API
+    // endpoint by design (the gate needs vaultRoot + endpoint context).
+    const a = approveFact(vault, fact.id, "ardin", "rev");
+    expect(a).not.toBeNull();
+    expect(a!.status).toBe("approved");
+  });
+});
+
 describe("v2.7 readFact preserves lifecycle fields on disk", () => {
   test("draft fact round-trips through readFact with all metadata", () => {
     const vault = fresh();

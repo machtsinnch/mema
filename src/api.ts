@@ -76,8 +76,30 @@ export function buildApi(cfg: { vaultRoot: string; apiKeys: Record<string, strin
     // expose any vault content.
     if (url.pathname === "/health" || url.pathname === "/graph") return next();
     const key = c.req.header("x-api-key") ?? "";
-    const owner = cfg.apiKeys[key];
-    if (!owner) return c.json({ error: "invalid api key" }, 401);
+    const apiKeyOwner = cfg.apiKeys[key];
+    if (!apiKeyOwner) return c.json({ error: "invalid api key" }, 401);
+
+    // v2.9.0+ — benchmark-only x-owner override (P0 from external review).
+    // Production deployments leave MEMA_BENCH_ALLOW_OWNER_OVERRIDE unset and
+    // this branch is a no-op: the owner is always derived from the API key.
+    // Benchmark harnesses (LongMemEval, LoCoMo, Swiss Trust Bench) set the
+    // env var to true at server start, then pass an `x-owner` header per
+    // question to isolate haystacks without provisioning hundreds of API
+    // keys. The override is INTENTIONALLY restricted to a single env-var
+    // toggle so production cannot accidentally enable cross-owner writes.
+    let owner = apiKeyOwner;
+    const allowOwnerOverride = (process.env.MEMA_BENCH_ALLOW_OWNER_OVERRIDE ?? "").toLowerCase() === "true";
+    if (allowOwnerOverride) {
+      const xOwner = c.req.header("x-owner")?.trim() ?? "";
+      if (xOwner) {
+        // Whitelist owner slugs: lowercase alphanumerics + - + _ + ., max 64 chars.
+        // Rejects path traversal, header injection, frontmatter-malforming chars.
+        if (!/^[a-zA-Z0-9._-]{1,64}$/.test(xOwner)) {
+          return c.json({ error: "x-owner format invalid (alphanumeric + .-_ only, ≤64 chars)" }, 400);
+        }
+        owner = xOwner;
+      }
+    }
     c.set("owner", owner);
 
     const rawActor = c.req.header("x-actor")?.trim() ?? "";
@@ -85,7 +107,8 @@ export function buildApi(cfg: { vaultRoot: string; apiKeys: Record<string, strin
     if (!rawActor) {
       actor = owner;
     } else if (rawActor.includes(":")) {
-      // Owner-prefixed form must match the authenticated owner; reject spoofing attempts.
+      // Owner-prefixed form must match the *effective* owner (after any
+      // x-owner override) — reject spoofing attempts.
       const [claimedOwner, label] = rawActor.split(":", 2);
       if (claimedOwner !== owner) {
         return c.json({ error: "x-actor owner-prefix does not match authenticated owner" }, 403);

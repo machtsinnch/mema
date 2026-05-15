@@ -39,17 +39,25 @@ export interface RecordCognitiveInput {
   derived_from: string[];      // episode or fact IDs
   actor: string;
   owner: string;
+  // v2.9.0+ acceptance lifecycle (NEW; mirrors fact/entity lifecycle).
+  // LLM-driven reflection writes drafts; rule-based reflection writes
+  // approved records (back-compat). Missing status = approved.
+  status?: "draft" | "approved" | "rejected";
+  evidence_excerpt?: string;
+  proposed_by?: string;
 }
 
 export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput): CognitiveRecord {
   const id = ulid();
+  const now = new Date().toISOString();
+  const status = input.status ?? "approved";
   const record: CognitiveRecord = {
     id,
     kind: input.kind,
     content: input.content,
     confidence: clampConfidence(input.confidence),
     derived_from: input.derived_from,
-    reflected_at: new Date().toISOString(),
+    reflected_at: now,
     superseded_by: null,
     owner: input.owner,
   };
@@ -74,16 +82,20 @@ export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput):
     reflected_at: record.reflected_at,
     superseded_by: record.superseded_by,
     owner: record.owner,
+    status,
+    ...(input.evidence_excerpt ? { evidence_excerpt: input.evidence_excerpt.slice(0, 500) } : {}),
+    ...(input.proposed_by ? { proposed_by: input.proposed_by, proposed_at: now } : {}),
     links,
   });
   atomicWriteFile(join(dir, recordFilename(slug, id)), file);
 
   appendAudit({
-    op: "REFLECT",
+    op: status === "draft" ? "PROPOSE" : "REFLECT",
     actor: input.actor,
     owner: input.owner,
     record_ids: [id],
     evidence_chain: input.derived_from,
+    ...(input.proposed_by ? { reason: `proposed_by:${input.proposed_by}` } : {}),
   });
 
   return record;

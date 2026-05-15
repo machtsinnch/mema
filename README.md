@@ -12,29 +12,36 @@ services, healthcare, public sector — where audit replay, hard erasure,
 multi-tenant isolation, jurisdiction-aware governance, and inspectable
 storage matter as much as benchmark recall.
 
-[![v2.8.0](https://img.shields.io/badge/release-v2.8.0-blue)](https://github.com/machtsinnch/mema/releases/tag/v2.8.0)
-[![tests](https://img.shields.io/badge/tests-177_passing-green)](https://github.com/machtsinnch/mema/blob/main/tests/)
+[![v2.9.0](https://img.shields.io/badge/release-v2.9.0-blue)](https://github.com/machtsinnch/mema/releases/tag/v2.9.0)
+[![tests](https://img.shields.io/badge/tests-222_passing-green)](https://github.com/machtsinnch/mema/blob/main/tests/)
 [![benchmark](https://img.shields.io/badge/Precision@1-96.0%25-green)](https://github.com/machtsinnch/mema/blob/main/bench/recall-benchmark-v2.py)
-[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![license](https://img.shields.io/badge/license-BUSL--1.1-orange)](LICENSE)
 
 ---
 
 ## Status
 
-**v2.8.0** — Seven-layer verifiable memory architecture, fully aligned
-with the v2.5.1 external review priorities. Acceptance lifecycle gates
-LLM-extracted facts; strict governance mode enforces jurisdiction +
-model-routing policy; atomic writes everywhere; epoch-ms temporal
-compare; graph in-degree influences retrieval ranking. First
-LongMemEval harness shipped.
+**v2.9.0** — Closes every P0 from the v2.8.0 external review plus adds
+the architectural pieces needed to make the "competes with
+Zep/Hindsight on memory performance" claim defensible: contradiction
+detection + auto-supersedes, LLM-driven reflection (drafts gated),
+entity resolution (Zep-style alias inference), RRF fusion helper for
+hybrid retrieval, and an LLM-judge layer on the LongMemEval harness
+so we can report answer-level accuracy alongside Hit@k. License
+pivoted to **Business Source License 1.1** (converts to Apache 2.0
+on 2030-05-15); v2.0.0–v2.8.0 remain MIT at their tags.
 
-- **177 tests passing** across 18 test files (411 `expect()` assertions)
+- **222 tests passing** across 25 test files (525+ `expect()` assertions)
 - **96.0% Precision@1** on a 25-query retrieval benchmark over a real
   347-document corpus (vs 44.0% for the v1 baseline — **+52 percentage
   points**). External harness for LongMemEval included in `bench/`.
-- **Acceptance gate caught ~27% LLM hallucinations** on a real
-  20-episode smoke run of Ardin's vault (111 drafts → 55 approved /
-  30 rejected for evidence-check failure / 26 held for human review).
+- **Acceptance gate rejected ~27% of LLM-proposed facts for failing
+  source-evidence checks** on a real 20-episode smoke run of Ardin's
+  vault (111 drafts → 55 auto-approved / 30 auto-rejected for evidence
+  failure / 26 held for human review). Honest framing: evidence-check
+  failure can mean hallucination, alias/synonym mismatch, or extraction
+  phrasing mismatch — a "hallucination caught" claim needs human-labeled
+  ground truth before it's defensible.
 - **First LongMemEval result** (Wu et al., ICLR 2025, retrieval-only,
   176 questions): Overall **Hit@1=46.0%, Hit@5=84.1%, Hit@10=91.5%**;
   knowledge-update 65.8 / 88.2 / 93.4; temporal-reasoning 30.0 / 86.7 /
@@ -107,7 +114,7 @@ MACHTSINN_RATE_LIMIT_BURST=10000 ./scripts/start.sh
 # Verify
 curl http://localhost:3001/health
 
-# Run the full test suite (97 assertions)
+# Run the full test suite
 bun test
 
 # Import a corpus
@@ -429,4 +436,13 @@ back to `LocalHashEmbedder` when absent).
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+**Business Source License 1.1**, converting to Apache 2.0 on
+**2030-05-15**. Non-production use (evaluation, academic research,
+internal development) is free. Production use requires a commercial
+license — contact the Licensor.
+
+Versions **v2.0.0 through v2.8.0 remain MIT-licensed** at their git
+tags on this repo. See [`LICENSE`](LICENSE),
+[`NOTICE-LICENSE-HISTORY.md`](NOTICE-LICENSE-HISTORY.md), and
+[`LICENSE-MIT-PRE-V2.9.md`](LICENSE-MIT-PRE-V2.9.md) for the full
+history.

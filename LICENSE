@@ -1,21 +1,48 @@
-MIT License
+Business Source License 1.1
+============================
 
-Copyright (c) 2026 machtsinn.ai
+Licensor:             machtsinn AG (Switzerland)
+Licensed Work:        mema — verifiable seven-layer memory infrastructure
+                      The Licensed Work is (c) 2026 machtsinn AG.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+Additional Use Grant: You may make use of the Licensed Work, provided that
+                      you do not use it for a Production Use. A "Production
+                      Use" is any use of the Licensed Work in connection
+                      with a commercial offering, a service that processes
+                      third-party data, or a revenue-generating product.
+                      Non-Production Uses include personal use, internal
+                      evaluation, academic research, security review, and
+                      development on non-production systems.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Change Date:          2030-05-15
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Change License:       Apache License, Version 2.0
+
+For information about alternative licensing arrangements for the Licensed
+Work, please contact the Licensor.
+
+Notice
+------
+
+The Business Source License (this document, or the "License") is not an
+Open Source license. However, the Licensed Work will eventually be made
+available under an Open Source License, as stated in this License.
+
+The terms of this License are set out in the Business Source License 1.1,
+the text of which is available at:
+
+    https://mariadb.com/bsl11
+
+By making use of the Licensed Work you accept those terms together with
+the parameters above. The parameters above prevail over any conflicting
+provision of the standard BSL 1.1 text.
+
+Prior versions
+--------------
+
+Versions v2.0.0 through v2.8.0 of mema were released under the MIT
+License. Those versions remain MIT-licensed at their respective git
+tags on https://github.com/machtsinnch/mema. The MIT license text used
+for those versions is preserved at LICENSE-MIT-PRE-V2.9.md.
+
+See NOTICE-LICENSE-HISTORY.md for the full license-history record.

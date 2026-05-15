@@ -188,7 +188,10 @@ export interface Governance {
 // ─── Layer 5: Retrieval ─────────────────────────────────────────────
 // Hybrid recall: keyword + vector + graph + temporal + policy-aware.
 
-export type RetrievalKind = "episode" | "fact" | "cognitive";
+// v2.9.0+ entity is now a first-class retrieval candidate (P0-D from review).
+// Pre-v2.9 vaults that called recall with kinds:["entity"] silently got
+// nothing; now they get the v2-entities/ approved records.
+export type RetrievalKind = "episode" | "fact" | "cognitive" | "entity";
 
 export interface RetrievalQuery {
   query: string;

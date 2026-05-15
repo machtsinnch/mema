@@ -177,24 +177,40 @@ export class OpenAIEmbedder implements Embedder {
 //   MEMA_EMBEDDER=ollama
 //   OLLAMA_HOST=http://localhost:11434       (default if unset)
 //   OLLAMA_EMBED_MODEL=nomic-embed-text       (default if unset)
+//   OLLAMA_EMBED_DIM=768                       (default if unset; constructor
+//                                               uses this until the first
+//                                               real embed call refines it)
 //
-// Dimension is discovered on the FIRST embed call (Ollama doesn't expose
-// it in /api/tags). If the call fails, OllamaEmbedder throws and pickEmbedder
-// falls back to LocalHashEmbedder for the rest of the process.
+// v2.9.0+ (P0-F from second external review): the constructor seeds the dim
+// from OLLAMA_EMBED_DIM (or a per-model fallback table) so vectorIndexHealth
+// and other consumers that read .dim BEFORE the first embed() call no longer
+// see 0 and incorrectly flag every row as stale. The first real embed call
+// still corrects the dim if it disagrees with the seed.
+const OLLAMA_KNOWN_DIMS: Record<string, number> = {
+  "nomic-embed-text": 768,
+  "mxbai-embed-large": 1024,
+  "all-minilm": 384,
+  "snowflake-arctic-embed": 1024,
+  "bge-m3": 1024,
+};
+
 export class OllamaEmbedder implements Embedder {
   readonly name: string;
-  private _dim: number = 0;
+  private _dim: number;
   private host: string;
   private model: string;
-  constructor(model = "nomic-embed-text", host = "http://localhost:11434") {
+  constructor(model = "nomic-embed-text", host = "http://localhost:11434", dim?: number) {
     this.model = model;
     this.host = host.replace(/\/+$/, "");
     this.name = `ollama:${model}`;
+    const envDim = process.env.OLLAMA_EMBED_DIM ? Number(process.env.OLLAMA_EMBED_DIM) : NaN;
+    const knownDim = OLLAMA_KNOWN_DIMS[model] ?? 0;
+    this._dim = dim ?? (Number.isFinite(envDim) && envDim > 0 ? envDim : knownDim);
   }
   get dim(): number {
-    // Treat 0 as "not yet probed". Most consumers call embed() before
-    // reading dim; LocalHashEmbedder reports a fixed dim up front. For
-    // index-health checks we lazy-probe with a single empty-string embed.
+    // v2.9.0+: never 0 — seeded from OLLAMA_EMBED_DIM env, known-model table,
+    // or explicit constructor arg. The first embed() call corrects this if
+    // the model returns a different dim than we expected.
     return this._dim;
   }
   async embed(text: string): Promise<number[]> {
@@ -211,7 +227,10 @@ export class OllamaEmbedder implements Embedder {
     if (!Array.isArray(d.embedding)) {
       throw new Error(`Ollama embed returned malformed payload (no embedding array)`);
     }
-    if (this._dim === 0) this._dim = d.embedding.length;
+    // First real embed call corrects the seed if it disagrees — the model
+    // is the source of truth for dimension. We log nothing here to keep
+    // the hot path silent; mismatches surface via vectorIndexHealth.
+    if (this._dim === 0 || this._dim !== d.embedding.length) this._dim = d.embedding.length;
     return d.embedding;
   }
 }
@@ -401,6 +420,7 @@ export async function reindexAll(
     `${vaultRoot}/episodes`,
     `${vaultRoot}/facts`,
     `${vaultRoot}/cognitive`,
+    `${vaultRoot}/v2-entities`,      // v2 entity storage (P0-D from review)
     `${vaultRoot}/entities`,         // v1 entity storage
     `${vaultRoot}/generalized`,      // v1 generalized hubs
     `${vaultRoot}/users`,            // v1 user notes
@@ -415,9 +435,13 @@ export async function reindexAll(
         if (opts.owner && opts.owner !== owner) { skipped++; continue; }
         // Skip soft-forgotten and tombstones
         if (fm.forgotten === true || fm.tombstone === true) { skipped++; continue; }
+        // v2.9.0+ acceptance lifecycle filter — never index drafts or
+        // rejected records, even if reindex is run mid-review.
+        if (fm.status === "draft" || fm.status === "rejected") { skipped++; continue; }
         const kind = path.includes("/episodes/") ? "episode"
                    : path.includes("/facts/") ? "fact"
                    : path.includes("/cognitive/") ? "cognitive"
+                   : path.includes("/v2-entities/") ? "entity"
                    : "v1_memory";
         const text = [
           (fm.aliases ?? []).join(" "),

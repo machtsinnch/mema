@@ -252,6 +252,60 @@ export function getFactsValidAt(
   return out;
 }
 
+// v2.9.0+ contradiction detection (NEW — closes the Zep "contradiction
+// handling" gap). A new fact contradicts an existing fact when they share
+// the same (subject, predicate) but have different objects AND both are
+// currently valid (status=approved, not invalidated, not superseded, and
+// their valid_from/valid_to windows overlap).
+//
+// Returns an array of contradicting fact IDs. Callers (the LLM extractor,
+// /v2/fact endpoint, review CLI) can then surface this to a reviewer and
+// optionally auto-invalidate the older fact when the new one is approved.
+export interface ContradictionCandidate {
+  fact_id: string;
+  subject: string;
+  predicate: string;
+  object: string;
+  valid_from: string;
+  confidence: number;
+}
+
+export function findContradictions(
+  vaultRoot: string,
+  owner: string,
+  candidate: { subject: string; predicate: string; object: string },
+): ContradictionCandidate[] {
+  const dir = join(vaultRoot, "facts", owner);
+  if (!existsSync(dir)) return [];
+  const out: ContradictionCandidate[] = [];
+  const subj = candidate.subject.trim().toLowerCase();
+  const pred = candidate.predicate.trim().toLowerCase();
+  const obj = candidate.object.trim().toLowerCase();
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith(".md")) continue;
+    try {
+      const parsed = matter(readFileSync(join(dir, f), "utf8"));
+      const fact = parsed.data as SemanticFact;
+      if ((fact.status ?? "approved") !== "approved") continue;
+      if (fact.invalidated_at) continue;
+      if (fact.superseded_by) continue;
+      if (fact.subject?.trim().toLowerCase() !== subj) continue;
+      if (fact.predicate?.trim().toLowerCase() !== pred) continue;
+      // Same (subject, predicate) — contradiction iff object differs.
+      if (fact.object?.trim().toLowerCase() === obj) continue;
+      out.push({
+        fact_id: fact.id,
+        subject: fact.subject,
+        predicate: fact.predicate,
+        object: fact.object,
+        valid_from: fact.valid_from,
+        confidence: fact.confidence,
+      });
+    } catch { /* skip malformed */ }
+  }
+  return out;
+}
+
 // v2.7+ list all draft facts for an owner (used by review CLI + endpoints).
 export function listDraftFacts(vaultRoot: string, owner: string): SemanticFact[] {
   const dir = join(vaultRoot, "facts", owner);

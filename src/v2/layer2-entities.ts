@@ -136,6 +136,149 @@ export function rejectEntity(
   return fm as Entity;
 }
 
+// v2.9.0+ entity evidence check (P0-C from second external review).
+// Mirror of layer2-semantic's evidenceCheck but for entities — verify
+// that the entity name or one of its aliases actually appears in the
+// cited source episode body. Also rejects fragment-shaped names that
+// the LLM extractor sometimes proposes despite the prompt rules:
+//   - pure numbers ("42", "100,000")
+//   - pure currency amounts ("CHF 22", "$1.5M", "EUR 299")
+//   - pure dates ("2026-05-15", "April 15")
+//   - single-character or empty names
+//   - names that look like punctuation/symbols
+// Override path: callers can pass `force: true` to approveEntity to bypass
+// (with mandatory reason).
+const PURE_NUMERIC = /^[\d.,\s]+$/;
+const PURE_CURRENCY = /^(CHF|EUR|USD|GBP|JPY|CNY|\$|€|£|¥)\s*[\d.,]+[KMB]?\/?(month|year|day|hour|deal|tx|user|seat|node|api|month|yr|y|m)?$/i;
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}(T[\d:.+-]+)?$/;
+const MONTH_DAY = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(,\s*\d{4})?$/i;
+const PUNCT_ONLY = /^[^a-zA-Z0-9]+$/;
+
+export function entityNameLooksLikeFragment(name: string): boolean {
+  const trimmed = name.trim();
+  if (trimmed.length < 2) return true;
+  if (PUNCT_ONLY.test(trimmed)) return true;
+  if (PURE_NUMERIC.test(trimmed)) return true;
+  if (PURE_CURRENCY.test(trimmed)) return true;
+  if (ISO_DATE.test(trimmed)) return true;
+  if (MONTH_DAY.test(trimmed)) return true;
+  return false;
+}
+
+export interface EntityEvidenceResult {
+  ok: boolean;
+  missing?: string[];  // reasons it failed: "fragment_name" | "name_not_in_source" | "no_alias_in_source"
+}
+
+export function entityEvidenceCheck(
+  entityName: string,
+  aliases: string[],
+  episodeBody: string,
+): EntityEvidenceResult {
+  const missing: string[] = [];
+  if (entityNameLooksLikeFragment(entityName)) missing.push("fragment_name");
+  const haystack = episodeBody.toLowerCase();
+  const candidates = [entityName, ...aliases].filter(Boolean).map(s => s.toLowerCase());
+  const anyMatch = candidates.some(c => c.length >= 2 && haystack.includes(c));
+  if (!anyMatch) missing.push("name_not_in_source");
+  return missing.length ? { ok: false, missing } : { ok: true };
+}
+
+// v2.9.0+ entity resolution (NEW — closes the Zep "entity resolution" gap).
+// Find existing entities that LIKELY refer to the same real-world referent
+// as the candidate name + aliases. Uses three signals:
+//   1. Case-insensitive name OR alias exact match
+//   2. Substring containment (e.g. "machtsinn" ⊂ "machtsinn AG")
+//   3. Levenshtein distance ≤ 2 on tokens of length ≥ 4 (typo tolerance)
+// Returns ranked candidates with a fused score in [0,1]. Callers decide
+// whether to merge (mergeEntities API) or surface the suggestion for
+// human review.
+export interface EntityResolutionCandidate {
+  entity_id: string;
+  name: string;
+  aliases: string[];
+  type: string;
+  score: number;          // 0..1; >=0.9 = strong match
+  match_reason: string;   // human-readable why it matched
+}
+
+function lev(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  let prev = Array(b.length + 1).fill(0).map((_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const curr = [i];
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr.push(Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost));
+    }
+    prev = curr;
+  }
+  return prev[b.length];
+}
+
+export function resolveEntity(
+  vaultRoot: string,
+  owner: string,
+  candidate: { name: string; aliases?: string[]; type?: string },
+  options: { includeDrafts?: boolean; maxLevenshtein?: number } = {},
+): EntityResolutionCandidate[] {
+  const dir = join(vaultRoot, "v2-entities", owner);
+  if (!existsSync(dir)) return [];
+  const maxLev = options.maxLevenshtein ?? 2;
+  const queryTerms = new Set<string>();
+  queryTerms.add(candidate.name.toLowerCase().trim());
+  for (const a of candidate.aliases ?? []) queryTerms.add(a.toLowerCase().trim());
+
+  const out: EntityResolutionCandidate[] = [];
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith(".md")) continue;
+    try {
+      const parsed = matter(readFileSync(join(dir, f), "utf8"));
+      const e = parsed.data as Entity;
+      const status = e.status ?? "approved";
+      if (status === "rejected") continue;
+      if (status === "draft" && !options.includeDrafts) continue;
+      if (candidate.type && e.type && candidate.type !== e.type) continue;
+      const existingTerms = new Set<string>();
+      existingTerms.add(e.name.toLowerCase());
+      for (const a of e.aliases ?? []) existingTerms.add(String(a).toLowerCase());
+
+      let best = { score: 0, reason: "" };
+      for (const q of queryTerms) {
+        for (const x of existingTerms) {
+          if (q === x) {
+            if (1 > best.score) best = { score: 1, reason: `exact match: "${q}"` };
+          } else if (q.length >= 3 && x.length >= 3) {
+            if (q.includes(x) || x.includes(q)) {
+              const s = Math.min(q.length, x.length) / Math.max(q.length, x.length);
+              if (s > best.score) best = { score: 0.7 + 0.2 * s, reason: `substring: "${q}" ~ "${x}"` };
+            } else if (q.length >= 4 && x.length >= 4) {
+              const d = lev(q, x);
+              if (d <= maxLev) {
+                const s = 1 - d / Math.max(q.length, x.length);
+                if (s > best.score) best = { score: 0.5 + 0.4 * s, reason: `edit-distance ${d}: "${q}" ~ "${x}"` };
+              }
+            }
+          }
+        }
+      }
+      if (best.score >= 0.5) {
+        out.push({
+          entity_id: e.id,
+          name: e.name,
+          aliases: e.aliases ?? [],
+          type: e.type,
+          score: best.score,
+          match_reason: best.reason,
+        });
+      }
+    } catch { /* skip malformed */ }
+  }
+  return out.sort((a, b) => b.score - a.score);
+}
+
 // v2.7+ list all drafts for an owner (used by review CLI + endpoints).
 export function listDraftEntities(vaultRoot: string, owner: string): Entity[] {
   const dir = join(vaultRoot, "v2-entities", owner);
