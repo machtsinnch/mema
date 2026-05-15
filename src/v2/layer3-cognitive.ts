@@ -88,6 +88,47 @@ export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput):
   return record;
 }
 
+// Append IDs to an existing cognitive record's derived_from chain (dedup'd)
+// and rebuild its links frontmatter. Used by the PAI migration to add
+// cross-memory references after every record exists. Owner-scoped: caller's
+// owner must match the record's owner.
+export function addDerivedFrom(
+  vaultRoot: string,
+  owner: string,
+  id: string,
+  newIds: string[],
+  actor: string,
+): CognitiveRecord | null {
+  const path = pathForCognitive(vaultRoot, owner, id);
+  if (!path) return null;
+  const parsed = matter(readFileSync(path, "utf8"));
+  if (parsed.data.owner !== owner) return null;
+  const existing = (parsed.data.derived_from ?? []) as string[];
+  const merged = [...new Set([...existing, ...newIds])];
+  if (merged.length === existing.length) {
+    // Nothing new — idempotent no-op
+    return parsed.data as CognitiveRecord;
+  }
+  parsed.data.derived_from = merged;
+  parsed.data.links = toWikilinks([
+    ...merged,
+    ...(parsed.data.superseded_by ? [parsed.data.superseded_by as string] : []),
+  ]);
+  for (const k of Object.keys(parsed.data)) {
+    if (parsed.data[k] === undefined) delete parsed.data[k];
+  }
+  writeFileSync(path, matter.stringify(parsed.content.trim(), parsed.data), "utf8");
+  appendAudit({
+    op: "REFLECT",
+    actor,
+    owner,
+    record_ids: [id],
+    evidence_chain: newIds,
+    reason: "add_derived_from",
+  });
+  return parsed.data as CognitiveRecord;
+}
+
 // Soft-supersede an older belief with a newer one. The old record stays in the
 // vault (audit trail), just points to its successor and stops being authoritative.
 export function supersedeBelief(

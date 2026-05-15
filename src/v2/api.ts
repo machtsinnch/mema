@@ -5,7 +5,7 @@ import type { Hono, Context } from "hono";
 import { observe } from "./layer1-episodic";
 import { recordFact, invalidateFact, getFactsValidAt, readFact } from "./layer2-semantic";
 import { createEntity, readEntity, findEntityByName, listEntities, mergeEntities } from "./layer2-entities";
-import { recordCognitive, supersedeBelief } from "./layer3-cognitive";
+import { recordCognitive, supersedeBelief, addDerivedFrom } from "./layer3-cognitive";
 import { reflect } from "./layer3-reflection";
 import { buildGovernance, hardErase } from "./layer4-governance";
 import { recall } from "./layer5-retrieval";
@@ -339,6 +339,21 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     const actor = c.get("actor");
     const rec = recordCognitive(cfg.vaultRoot, { ...parsed.body, actor, owner });
     return c.json({ record: rec });
+  });
+
+  // Append IDs to an existing cognitive record's derived_from chain. Used by
+  // the PAI migration to wire cross-memory wikilinks AFTER all records exist.
+  app.post("/v2/cognitive/:id/derived-from", async c => {
+    const parsed = await parseBody<{ add: string[] }>(c);
+    if (!parsed.ok) return parsed.response;
+    if (!Array.isArray(parsed.body.add)) {
+      return c.json({ error: "body.add must be an array of IDs" }, 400);
+    }
+    const owner = c.get("owner");
+    const actor = c.get("actor");
+    const r = addDerivedFrom(cfg.vaultRoot, owner, c.req.param("id"), parsed.body.add, actor);
+    if (!r) return c.json({ error: "not found" }, 404);
+    return c.json({ record: r });
   });
 
   app.post("/v2/cognitive/:oldId/supersede", async c => {
