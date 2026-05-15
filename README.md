@@ -35,6 +35,12 @@ LongMemEval harness shipped.
 - **Acceptance gate caught ~27% LLM hallucinations** on a real
   20-episode smoke run of Ardin's vault (111 drafts → 55 approved /
   30 rejected for evidence-check failure / 26 held for human review).
+- **First LongMemEval result** (Wu et al., ICLR 2025, retrieval-only,
+  176 questions): Overall **Hit@1=46.0%, Hit@5=84.1%, Hit@10=91.5%**;
+  knowledge-update 65.8 / 88.2 / 93.4; temporal-reasoning 30.0 / 86.7 /
+  96.7; multi-session 32.5 / 72.5 / 80.0. Honest framing: this is
+  session-level retrieval recall, not LongMemEval official
+  answer-correctness — the LLM judge layer is the next milestone.
 - **Draft → approved/rejected lifecycle** on L2 facts and entities,
   with `PROPOSE`/`APPROVE`/`REJECT` audit ops in the hash chain.
 - **Strict policy mode** (`MEMA_POLICY_MODE=strict`) denies missing
