@@ -12,8 +12,8 @@ services, healthcare, public sector — where audit replay, hard erasure,
 multi-tenant isolation, jurisdiction-aware governance, and inspectable
 storage matter as much as benchmark recall.
 
-[![v2.0.0](https://img.shields.io/badge/release-v2.0.0-blue)](https://github.com/machtsinnch/mema/releases/tag/v2.0.0)
-[![tests](https://img.shields.io/badge/tests-97_passing-green)](https://github.com/machtsinnch/mema/blob/main/tests/)
+[![v2.7.0](https://img.shields.io/badge/release-v2.7.0-blue)](https://github.com/machtsinnch/mema/releases/tag/v2.7.0)
+[![tests](https://img.shields.io/badge/tests-143_passing-green)](https://github.com/machtsinnch/mema/blob/main/tests/)
 [![benchmark](https://img.shields.io/badge/Precision@1-96.0%25-green)](https://github.com/machtsinnch/mema/blob/main/bench/recall-benchmark-v2.py)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -21,12 +21,24 @@ storage matter as much as benchmark recall.
 
 ## Status
 
-**v2.0.0** — Seven-layer verifiable memory architecture. Three rounds of
-adversarial review, all critical findings fixed and regression-tested.
+**v2.7.0** — Seven-layer verifiable memory architecture with an
+**acceptance lifecycle** for untrusted producers. LLM extractors and
+other heuristics now propose draft facts/entities that are gated by an
+evidence check and explicit approve/reject decisions before they enter
+the retrieval surface. Heuristic extraction (v2.5) is deprecated in
+favor of LLM-assisted extraction (v2.6+, local Ollama by default).
+Multiple rounds of adversarial review applied; critical findings fixed
+and regression-tested.
 
-- **97 automated assertions** passing across 10 test files
-- **96.0% Precision@1** on a 25-query benchmark over a real 347-document
-  corpus (vs 44.0% for the v1 baseline — **+52 percentage points**)
+- **143 tests passing** across 15 test files (342 `expect()` assertions)
+- **96.0% Precision@1** on a 25-query retrieval benchmark over a real
+  347-document corpus (vs 44.0% for the v1 baseline — **+52 percentage
+  points**). This benchmark measures retrieval on a Markdown corpus —
+  long-horizon memory benchmarks (LongMemEval, LoCoMo) are planned.
+- **Draft → approved/rejected lifecycle** on L2 facts and entities. LLM
+  extractors write `status: "draft"`; retrieval excludes drafts by
+  default; approve/reject endpoints run an evidence-check guard and
+  emit `APPROVE` / `REJECT` audit entries.
 - **MCP v2 surface live** — 9 tools for Claude Code / Cursor / any MCP client
 - Full architecture documented in [`docs/WHITEPAPER.md`](docs/WHITEPAPER.md)
 
@@ -96,12 +108,63 @@ python3 bench/recall-benchmark-v2.py
 
 ---
 
+## Acceptance lifecycle for untrusted producers (v2.7+)
+
+LLM extractors and other untrusted producers do not write directly into
+the retrieval surface. They propose drafts; an evidence-checked review
+step promotes them to `approved` (or marks them `rejected`).
+
+```
+raw episode ─▶ LLM extractor ─▶ DRAFT fact/entity (status: "draft")
+                                        │
+                                        ▼
+                              evidence-check guard
+                                        │
+                            ┌───────────┴───────────┐
+                            ▼                       ▼
+                       APPROVED                  REJECTED
+                  (visible in recall)       (kept for audit,
+                                             never retrievable)
+```
+
+Pipeline:
+
+```bash
+# 1) Extract drafts (status="draft", with evidence excerpts)
+bun scripts/extract-facts-llm.ts --owner ardin
+
+# 2a) Auto-review high-confidence drafts (>=0.9 + evidence passes)
+bun scripts/review-proposals.ts --owner ardin --auto
+
+# 2b) Interactively review the remainder
+bun scripts/review-proposals.ts --owner ardin
+
+# 3) Wire + reindex only after drafts have been resolved
+bun scripts/wire-entity-graph.ts
+curl -X POST http://localhost:3001/v2/vector/reindex -H "x-api-key: dev-ardin"
+```
+
+The evidence-check guard runs server-side on `/v2/fact/:id/approve` and
+returns `422 evidence_check_failed` when the proposed fact's `subject`
+or `object` strings do not appear (case-insensitive substring) in the
+source episode body. Pass `force: true` to override for synonym/alias
+cases. Every state transition appends an `APPROVE` or `REJECT` entry to
+the hash-chained audit log; `verifyChain()` includes these in the chain.
+
+Records written through `/v2/fact` and `/v2/entity` without an explicit
+`status` field default to `approved` — the lifecycle is opt-in and
+fully backward-compatible with existing vaults.
+
+---
+
 ## Architecture invariants (DO NOT BREAK)
 
 1. **Filesystem is the source of truth.** SQLite (audit, vectors, anchors)
    and any future index is derived state, rebuildable from the markdown
    vault.
-2. **All write paths use atomic write** (temp + rename).
+2. **All write paths use atomic write** (temp + rename). *Note: as of
+   v2.7.0 the helper exists in `src/storage.ts` but v2 layer writers
+   are still being migrated; see roadmap.*
 3. **All read endpoints filter through `canRead` (v1) or `owner !==
    query.owner → deny` (v2).** No exceptions.
 4. **Uniform 404** for not-found vs not-readable.
@@ -109,6 +172,9 @@ python3 bench/recall-benchmark-v2.py
    inside UALs after URL-decode).
 6. **N=3 promotion rule** for v1 generalized layer is server-side enforced.
 7. **Audit log is append-only with hash chain + external sealed witness.**
+8. **Untrusted producers write drafts only** (v2.7+). LLM-derived facts
+   and entities are gated by the acceptance lifecycle before they enter
+   the retrieval surface.
 
 ---
 
@@ -119,10 +185,16 @@ python3 bench/recall-benchmark-v2.py
 | Method | Endpoint | Layer | Purpose |
 |---|---|---|---|
 | POST | `/v2/observe` | L1 | Ingest a raw episode |
-| POST | `/v2/fact` | L2 | Record a semantic fact (bi-temporal) |
+| POST | `/v2/fact` | L2 | Record a semantic fact (bi-temporal). Pass `status: "draft"` + `evidence_excerpt` for untrusted producers |
 | POST | `/v2/fact/:id/invalidate` | L2 | Mark a fact invalidated/superseded |
-| GET | `/v2/facts/valid-at?at=...` | L2 | Facts valid at a given timestamp |
-| POST | `/v2/entity` | L2 | Create an entity |
+| POST | `/v2/fact/:id/approve` | L2 | Promote a draft fact to `approved` (runs server-side evidence check unless `force:true`) |
+| POST | `/v2/fact/:id/reject` | L2 | Reject a draft fact (requires `reason`) |
+| GET | `/v2/facts/drafts` | L2 | List all draft facts for the owner (review tools) |
+| GET | `/v2/facts/valid-at?at=...&include_drafts=true` | L2 | Facts valid at a given timestamp |
+| POST | `/v2/entity` | L2 | Create an entity. Pass `status: "draft"` for untrusted producers |
+| POST | `/v2/entity/:id/approve` | L2 | Promote a draft entity to `approved` |
+| POST | `/v2/entity/:id/reject` | L2 | Reject a draft entity (requires `reason`) |
+| GET | `/v2/entities/drafts` | L2 | List all draft entities for the owner |
 | GET | `/v2/entity/find/:name` | L2 | Resolve name/alias to entity |
 | POST | `/v2/entity/:keeperId/merge/:mergedId` | L2 | Merge two entities |
 | POST | `/v2/cognitive` | L3 | Record an experience/observation/belief |

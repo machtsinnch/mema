@@ -167,6 +167,15 @@ export async function recall(
       if (f.invalidated_at && f.invalidated_at < validAt) continue;
     }
 
+    // v2.7+ acceptance lifecycle filter (applies to fact + entity).
+    // Missing status = "approved" (back-compat). Drafts and rejected are
+    // excluded from default retrieval — review tools call list endpoints
+    // directly to surface them.
+    if (kind === "fact" || kind === "entity") {
+      const status = (rec.frontmatter as any).status as ("draft" | "approved" | "rejected" | undefined);
+      if (status === "draft" || status === "rejected") continue;
+    }
+
     // Skip tombstones (hard-erased)
     if (rec.frontmatter.tombstone === true) continue;
     // Skip v1 soft-forgotten

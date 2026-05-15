@@ -11,7 +11,7 @@ import { ulid } from "ulid";
 import { writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import matter from "gray-matter";
-import type { SemanticFact } from "./types";
+import type { SemanticFact, RecordStatus } from "./types";
 import { clampConfidence, toWikilinks, slugify, recordFilename, idFromFilename } from "./types";
 import { appendAudit } from "./layer6-audit";
 
@@ -25,11 +25,18 @@ export interface RecordFactInput {
   confidence?: number;
   actor: string;
   owner: string;
+  // v2.7+ acceptance lifecycle. Omitting status defaults to "approved" so
+  // existing direct-API callers keep their current semantics. LLM extractors
+  // and other untrusted producers should pass "draft" + evidence_excerpt.
+  status?: RecordStatus;
+  evidence_excerpt?: string;
+  proposed_by?: string;
 }
 
 export function recordFact(vaultRoot: string, input: RecordFactInput): SemanticFact {
   const id = ulid();
   const now = new Date().toISOString();
+  const status: RecordStatus = input.status ?? "approved";
   const fact: SemanticFact = {
     id,
     subject: input.subject,
@@ -42,6 +49,9 @@ export function recordFact(vaultRoot: string, input: RecordFactInput): SemanticF
     derived_from: input.derived_from,
     confidence: clampConfidence(input.confidence ?? 0.8),
     owner: input.owner,
+    status,
+    ...(input.evidence_excerpt ? { evidence_excerpt: input.evidence_excerpt.slice(0, 500) } : {}),
+    ...(input.proposed_by ? { proposed_by: input.proposed_by, proposed_at: now } : {}),
   };
 
   const dir = join(vaultRoot, "facts", input.owner);
@@ -69,19 +79,89 @@ export function recordFact(vaultRoot: string, input: RecordFactInput): SemanticF
     derived_from: fact.derived_from,
     confidence: fact.confidence,
     owner: fact.owner,
+    status: fact.status,
+    ...(fact.evidence_excerpt ? { evidence_excerpt: fact.evidence_excerpt } : {}),
+    ...(fact.proposed_by ? { proposed_by: fact.proposed_by, proposed_at: fact.proposed_at } : {}),
     links,
   });
   writeFileSync(join(dir, recordFilename(slug, id)), file, "utf8");
 
+  // Audit op: PROPOSE for drafts (untrusted), EXTRACT for approved (direct writes).
   appendAudit({
-    op: "EXTRACT",
+    op: status === "draft" ? "PROPOSE" : "EXTRACT",
     actor: input.actor,
     owner: input.owner,
     record_ids: [id],
     evidence_chain: input.derived_from,
+    ...(input.proposed_by ? { reason: `proposed_by:${input.proposed_by}` } : {}),
   });
 
   return fact;
+}
+
+// v2.7+ acceptance lifecycle — approve a draft fact, promoting it to
+// "approved" so it surfaces in retrieval. The actor and reason are
+// recorded both on the record and in the audit chain.
+export function approveFact(
+  vaultRoot: string,
+  factId: string,
+  owner: string,
+  actor: string,
+  reason?: string,
+): SemanticFact | null {
+  const path = factPath(vaultRoot, owner, factId);
+  if (!path) return null;
+  const parsed = matter(readFileSync(path, "utf8"));
+  const fm = parsed.data as any;
+  if (fm.owner !== owner) return null;
+  // Idempotent: re-approving an approved record is a no-op + no audit churn.
+  if (fm.status === "approved") return fm as SemanticFact;
+  fm.status = "approved";
+  fm.reviewed_by = actor;
+  fm.reviewed_at = new Date().toISOString();
+  if (reason) fm.review_reason = reason;
+  writeFileSync(path, matter.stringify(parsed.content, fm), "utf8");
+  appendAudit({
+    op: "APPROVE",
+    actor,
+    owner,
+    record_ids: [factId],
+    evidence_chain: (fm.derived_from ?? []) as string[],
+    reason,
+  });
+  return fm as SemanticFact;
+}
+
+// v2.7+ acceptance lifecycle — reject a draft fact. Sets status="rejected"
+// and records the reviewer + reason. Rejected records remain on disk for
+// audit, but retrieval excludes them.
+export function rejectFact(
+  vaultRoot: string,
+  factId: string,
+  owner: string,
+  actor: string,
+  reason: string,
+): SemanticFact | null {
+  const path = factPath(vaultRoot, owner, factId);
+  if (!path) return null;
+  const parsed = matter(readFileSync(path, "utf8"));
+  const fm = parsed.data as any;
+  if (fm.owner !== owner) return null;
+  if (fm.status === "rejected") return fm as SemanticFact;
+  fm.status = "rejected";
+  fm.reviewed_by = actor;
+  fm.reviewed_at = new Date().toISOString();
+  fm.review_reason = reason;
+  writeFileSync(path, matter.stringify(parsed.content, fm), "utf8");
+  appendAudit({
+    op: "REJECT",
+    actor,
+    owner,
+    record_ids: [factId],
+    evidence_chain: (fm.derived_from ?? []) as string[],
+    reason,
+  });
+  return fm as SemanticFact;
 }
 
 // Mark a fact as invalidated (we now know it was wrong, or it's no longer true).
@@ -141,7 +221,13 @@ export function readFact(vaultRoot: string, owner: string, id: string): Semantic
 
 // Get all facts for an owner that were valid at a given point in time.
 // Skips facts invalidated before `at`, or whose valid_to is before `at`.
-export function getFactsValidAt(vaultRoot: string, owner: string, at: string): SemanticFact[] {
+// v2.7+: skips drafts and rejected records unless includeDrafts is true.
+export function getFactsValidAt(
+  vaultRoot: string,
+  owner: string,
+  at: string,
+  includeDrafts = false,
+): SemanticFact[] {
   const dir = join(vaultRoot, "facts", owner);
   if (!existsSync(dir)) return [];
   const out: SemanticFact[] = [];
@@ -150,6 +236,10 @@ export function getFactsValidAt(vaultRoot: string, owner: string, at: string): S
     try {
       const parsed = matter(readFileSync(join(dir, f), "utf8"));
       const fact = parsed.data as SemanticFact;
+      // Acceptance lifecycle filter. Missing status = approved (back-compat).
+      const status = fact.status ?? "approved";
+      if (status === "rejected") continue;
+      if (status === "draft" && !includeDrafts) continue;
       if (fact.valid_from > at) continue;
       if (fact.valid_to && fact.valid_to < at) continue;
       // <= : if invalidated AT the query timestamp, we already knew it was wrong
@@ -158,4 +248,38 @@ export function getFactsValidAt(vaultRoot: string, owner: string, at: string): S
     } catch { /* skip malformed */ }
   }
   return out;
+}
+
+// v2.7+ list all draft facts for an owner (used by review CLI + endpoints).
+export function listDraftFacts(vaultRoot: string, owner: string): SemanticFact[] {
+  const dir = join(vaultRoot, "facts", owner);
+  if (!existsSync(dir)) return [];
+  const out: SemanticFact[] = [];
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith(".md")) continue;
+    try {
+      const parsed = matter(readFileSync(join(dir, f), "utf8"));
+      if (parsed.data.status === "draft") out.push(parsed.data as SemanticFact);
+    } catch { /* skip malformed */ }
+  }
+  return out;
+}
+
+// v2.7+ evidence check: does the proposed fact's subject AND object actually
+// appear (case-insensitive substring) in the source episode body? This is
+// a structural guard against LLM hallucination. Subjects and objects can be
+// multiword entities like "machtsinn AG" — substring match is the right shape.
+// Returns {ok: true} when both terms appear; {ok: false, missing} otherwise.
+export function evidenceCheck(
+  subject: string,
+  object: string,
+  episodeBody: string,
+): { ok: true } | { ok: false; missing: string[] } {
+  const haystack = episodeBody.toLowerCase();
+  const missing: string[] = [];
+  const s = subject.trim().toLowerCase();
+  const o = object.trim().toLowerCase();
+  if (s && !haystack.includes(s)) missing.push("subject");
+  if (o && !haystack.includes(o)) missing.push("object");
+  return missing.length ? { ok: false, missing } : { ok: true };
 }

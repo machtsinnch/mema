@@ -3,8 +3,15 @@
 
 import type { Hono, Context } from "hono";
 import { observe } from "./layer1-episodic";
-import { recordFact, invalidateFact, getFactsValidAt, readFact } from "./layer2-semantic";
-import { createEntity, readEntity, findEntityByName, listEntities, mergeEntities } from "./layer2-entities";
+import {
+  recordFact, invalidateFact, getFactsValidAt, readFact,
+  approveFact, rejectFact, listDraftFacts, evidenceCheck,
+} from "./layer2-semantic";
+import {
+  createEntity, readEntity, findEntityByName, listEntities, mergeEntities,
+  approveEntity, rejectEntity, listDraftEntities,
+} from "./layer2-entities";
+import { findEpisode } from "./layer1-episodic";
 import { recordCognitive, supersedeBelief, addDerivedFrom } from "./layer3-cognitive";
 import { reflect } from "./layer3-reflection";
 import { buildGovernance, hardErase } from "./layer4-governance";
@@ -256,6 +263,10 @@ export function mountV2(app: Hono, cfg: V2Config): void {
       valid_to?: string | null;
       derived_from: string[];
       confidence?: number;
+      // v2.7+: opt-in draft mode for LLM extractors and other untrusted producers.
+      status?: "draft" | "approved";
+      evidence_excerpt?: string;
+      proposed_by?: string;
     }>(c);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
@@ -275,10 +286,64 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     return c.json({ fact: f });
   });
 
+  // v2.7+ acceptance lifecycle endpoints — approve / reject draft facts.
+  // Approve runs the evidence-check guard against the source episode body
+  // before promoting the draft, unless force=true is passed (e.g. for
+  // facts whose subject/object is a synonym or alias not literally in
+  // the source).
+  app.post("/v2/fact/:id/approve", async c => {
+    const id = c.req.param("id");
+    const parsed = await parseBody<{ reason?: string; force?: boolean }>(c);
+    if (!parsed.ok) return parsed.response;
+    const owner = c.get("owner");
+    const actor = c.get("actor");
+    const existing = readFact(cfg.vaultRoot, owner, id);
+    if (!existing) return c.json({ error: "not found" }, 404);
+    if (!parsed.body.force) {
+      const epId = (existing.derived_from ?? [])[0];
+      if (epId) {
+        const ep = findEpisode(cfg.vaultRoot, owner, epId);
+        if (ep) {
+          const ec = evidenceCheck(existing.subject, existing.object, ep.content);
+          if (!ec.ok) {
+            return c.json({
+              error: "evidence_check_failed",
+              missing: ec.missing,
+              hint: "subject and/or object not found in source episode body; pass force:true to override",
+            }, 422);
+          }
+        }
+      }
+    }
+    const f = approveFact(cfg.vaultRoot, id, owner, actor, parsed.body.reason);
+    if (!f) return c.json({ error: "not found" }, 404);
+    return c.json({ fact: f });
+  });
+
+  app.post("/v2/fact/:id/reject", async c => {
+    const id = c.req.param("id");
+    const parsed = await parseBody<{ reason: string }>(c);
+    if (!parsed.ok) return parsed.response;
+    if (!parsed.body.reason || !parsed.body.reason.trim()) {
+      return c.json({ error: "reason is required for reject" }, 400);
+    }
+    const owner = c.get("owner");
+    const actor = c.get("actor");
+    const f = rejectFact(cfg.vaultRoot, id, owner, actor, parsed.body.reason);
+    if (!f) return c.json({ error: "not found" }, 404);
+    return c.json({ fact: f });
+  });
+
+  app.get("/v2/facts/drafts", async c => {
+    const owner = c.get("owner");
+    return c.json({ facts: listDraftFacts(cfg.vaultRoot, owner) });
+  });
+
   app.get("/v2/facts/valid-at", async c => {
     const owner = c.get("owner");
     const at = c.req.query("at") ?? new Date().toISOString();
-    return c.json({ facts: getFactsValidAt(cfg.vaultRoot, owner, at) });
+    const includeDrafts = c.req.query("include_drafts") === "true";
+    return c.json({ facts: getFactsValidAt(cfg.vaultRoot, owner, at, includeDrafts) });
   });
 
   app.get("/v2/fact/:id", async c => {
@@ -290,12 +355,52 @@ export function mountV2(app: Hono, cfg: V2Config): void {
 
   // ── Layer 2: Entities ────────────────────────────────────────────
   app.post("/v2/entity", async c => {
-    const parsed = await parseBody<{ name: string; type: string; aliases?: string[] }>(c);
+    const parsed = await parseBody<{
+      name: string;
+      type: string;
+      aliases?: string[];
+      // v2.7+ acceptance lifecycle opt-in fields.
+      status?: "draft" | "approved";
+      evidence_excerpt?: string;
+      proposed_by?: string;
+      derived_from?: string[];
+    }>(c);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
     const e = createEntity(cfg.vaultRoot, { ...parsed.body, actor, owner });
     return c.json({ entity: e });
+  });
+
+  // v2.7+ approve / reject draft entities.
+  app.post("/v2/entity/:id/approve", async c => {
+    const id = c.req.param("id");
+    const parsed = await parseBody<{ reason?: string }>(c);
+    if (!parsed.ok) return parsed.response;
+    const owner = c.get("owner");
+    const actor = c.get("actor");
+    const e = approveEntity(cfg.vaultRoot, id, owner, actor, parsed.body.reason);
+    if (!e) return c.json({ error: "not found" }, 404);
+    return c.json({ entity: e });
+  });
+
+  app.post("/v2/entity/:id/reject", async c => {
+    const id = c.req.param("id");
+    const parsed = await parseBody<{ reason: string }>(c);
+    if (!parsed.ok) return parsed.response;
+    if (!parsed.body.reason || !parsed.body.reason.trim()) {
+      return c.json({ error: "reason is required for reject" }, 400);
+    }
+    const owner = c.get("owner");
+    const actor = c.get("actor");
+    const e = rejectEntity(cfg.vaultRoot, id, owner, actor, parsed.body.reason);
+    if (!e) return c.json({ error: "not found" }, 404);
+    return c.json({ entity: e });
+  });
+
+  app.get("/v2/entities/drafts", async c => {
+    const owner = c.get("owner");
+    return c.json({ entities: listDraftEntities(cfg.vaultRoot, owner) });
   });
 
   app.get("/v2/entity/:id", async c => {

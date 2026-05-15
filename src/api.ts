@@ -22,6 +22,7 @@ import { logOp, queryLog } from "./db";
 import type { RememberInput, RecallInput, ForgetInput, UpdateInput } from "./types";
 import type { VaultConfig } from "./storage";
 import { mountV2 } from "./v2/api";
+import pkg from "../package.json" with { type: "json" };
 
 type AppEnv = {
   Variables: {
@@ -98,7 +99,7 @@ export function buildApi(cfg: { vaultRoot: string; apiKeys: Record<string, strin
     return next();
   });
 
-  app.get("/health", c => c.json({ ok: true, service: "machtsinn.ai", version: "1.0.0" }));
+  app.get("/health", c => c.json({ ok: true, service: "machtsinn.ai", version: pkg.version }));
 
   // Safe body parser — returns 400 on malformed JSON instead of leaking a 500 with stack.
   // Use everywhere that calls c.req.json() on user-supplied bodies.

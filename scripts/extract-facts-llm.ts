@@ -33,6 +33,11 @@ import { pickExtractor } from "../src/v2/llm-extractor";
 interface Args {
   vault: string; api: string; key: string; owner: string;
   dryRun: boolean; limit: number;
+  // v2.7+ acceptance lifecycle. Default `true` — LLM-extracted facts are
+  // proposed as drafts and must be reviewed (or auto-approved by the
+  // review CLI) before they surface in retrieval. Pass `--commit-direct`
+  // to opt out and write approved records directly (legacy behavior).
+  commitDirect: boolean;
 }
 
 function parseArgs(): Args {
@@ -53,7 +58,35 @@ function parseArgs(): Args {
     owner: String(flags.owner ?? "ardin"),
     dryRun: !!flags["dry-run"],
     limit: flags.limit ? Number(flags.limit) : Infinity,
+    commitDirect: !!flags["commit-direct"],
   };
+}
+
+// v2.7+ extract a short verbatim excerpt from the source episode that
+// best evidences the (subject, predicate, object) claim. Prefers a
+// sentence containing both subject and object; falls back to first
+// sentence containing subject only. Truncated to 500 chars.
+function pickEvidenceExcerpt(
+  episodeBody: string,
+  subject: string,
+  object: string,
+): string | undefined {
+  const text = episodeBody.trim();
+  if (!text) return undefined;
+  const s = subject.trim().toLowerCase();
+  const o = object.trim().toLowerCase();
+  // Sentence split — naive but adequate for evidence excerpts.
+  const sentences = text.split(/(?<=[.!?])\s+(?=[A-Z(])/);
+  let bestBoth: string | undefined;
+  let bestSubj: string | undefined;
+  for (const sent of sentences) {
+    const lower = sent.toLowerCase();
+    if (lower.includes(s) && lower.includes(o)) { bestBoth = sent; break; }
+    if (lower.includes(s) && !bestSubj) bestSubj = sent;
+  }
+  const picked = bestBoth ?? bestSubj;
+  if (!picked) return undefined;
+  return picked.length > 500 ? picked.slice(0, 497) + "..." : picked;
 }
 
 function walk(dir: string): string[] {
@@ -117,6 +150,7 @@ async function main() {
   console.log(`Vault: ${args.vault}`);
   console.log(`Owner: ${args.owner}`);
   console.log(`Mode:  ${args.dryRun ? "dry-run" : "WRITE"}`);
+  console.log(`Gate:  ${args.commitDirect ? "commit-direct (legacy)" : "draft (review required)"}`);
   console.log("");
 
   const extractor = await pickExtractor();
@@ -162,6 +196,11 @@ async function main() {
 
     let facts = 0, ents = 0;
 
+    // v2.7+: untrusted-producer lifecycle. Default behavior writes drafts;
+    // --commit-direct preserves the legacy direct-commit path.
+    const status: "draft" | "approved" = args.commitDirect ? "approved" : "draft";
+    const proposedBy = args.commitDirect ? undefined : `llm-extractor:${extractor.name}`;
+
     // Write entities first so facts can reference them
     for (const e of result.entities) {
       const name = String(e.name ?? "").trim();
@@ -170,7 +209,16 @@ async function main() {
       seenEntities.add(name.toLowerCase());
       if (args.dryRun) { ents++; entitiesCreated++; continue; }
       try {
-        await api(args, "/v2/entity", { name, type: String(e.type ?? "concept"), aliases: [] });
+        const entityExcerpt = pickEvidenceExcerpt(body, name, "");
+        await api(args, "/v2/entity", {
+          name,
+          type: String(e.type ?? "concept"),
+          aliases: [],
+          status,
+          ...(proposedBy ? { proposed_by: proposedBy } : {}),
+          ...(entityExcerpt ? { evidence_excerpt: entityExcerpt } : {}),
+          derived_from: [epId],
+        });
         ents++; entitiesCreated++;
       } catch { /* skip on collision */ }
     }
@@ -186,10 +234,14 @@ async function main() {
       seenFacts.add(tuple);
       if (args.dryRun) { facts++; factsCreated++; continue; }
       try {
+        const excerpt = pickEvidenceExcerpt(body, subj, obj);
         await api(args, "/v2/fact", {
           subject: subj, predicate: pred, object: obj,
           derived_from: [epId],
           confidence: Math.min(Math.max(conf, 0), 1),
+          status,
+          ...(proposedBy ? { proposed_by: proposedBy } : {}),
+          ...(excerpt ? { evidence_excerpt: excerpt } : {}),
         });
         facts++; factsCreated++;
       } catch { /* skip on failure */ }
@@ -206,7 +258,11 @@ async function main() {
   console.log(`  Entities created: ${entitiesCreated}  (skipped: ${entitiesSkipped})`);
   console.log("");
   console.log("Next steps:");
-  console.log("  - bun scripts/wire-entity-graph.ts   (link new facts/entities to episodes)");
+  if (!args.commitDirect && !args.dryRun) {
+    console.log("  - bun scripts/review-proposals.ts --owner " + args.owner + " --auto   (auto-approve high-confidence drafts with evidence)");
+    console.log("  - bun scripts/review-proposals.ts --owner " + args.owner + "          (interactive review of remaining drafts)");
+  }
+  console.log("  - bun scripts/wire-entity-graph.ts   (link approved facts/entities to episodes)");
   console.log("  - bun scripts/fix-graph-connectivity.ts   (unfold any folded wikilinks)");
   console.log("  - curl -X POST http://localhost:3001/v2/vector/reindex -H 'x-api-key: dev-ardin'");
   console.log("  - Cmd+Q + reopen Obsidian to see the cleaner graph");

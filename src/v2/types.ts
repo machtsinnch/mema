@@ -102,6 +102,12 @@ export interface Episode {
 // A fact's validity period (valid_from → valid_to) is what the world claims;
 // invalidated_at is when WE learned it was false (epistemic, not ontological).
 
+// ─── Acceptance lifecycle (v2.7+) ────────────────────────────────────
+// LLM-derived facts and entities pass through a draft → approved/rejected
+// lifecycle. Direct API writes default to "approved" for backward compat.
+// Retrieval excludes drafts and rejected records unless explicitly requested.
+export type RecordStatus = "draft" | "approved" | "rejected";
+
 export interface SemanticFact {
   id: string;
   subject: string;             // entity ID or string
@@ -114,6 +120,15 @@ export interface SemanticFact {
   derived_from: string[];      // episode IDs that justified this fact
   confidence: number;          // [0..1]
   owner: string;
+  // Acceptance lifecycle. Records without a status field are treated as
+  // "approved" by retrieval — this keeps existing vaults working unchanged.
+  status?: RecordStatus;
+  evidence_excerpt?: string;   // verbatim substring from source episode (≤500 chars)
+  proposed_by?: string;        // extractor identifier (e.g., "llm-extractor:ollama:llama3.1:8b")
+  proposed_at?: string;
+  reviewed_by?: string;        // actor that approved/rejected
+  reviewed_at?: string;
+  review_reason?: string;
 }
 
 export interface Entity {
@@ -124,6 +139,14 @@ export interface Entity {
   first_seen: string;
   last_seen: string;
   owner: string;
+  // Acceptance lifecycle — same semantics as SemanticFact.
+  status?: RecordStatus;
+  evidence_excerpt?: string;
+  proposed_by?: string;
+  proposed_at?: string;
+  reviewed_by?: string;
+  reviewed_at?: string;
+  review_reason?: string;
 }
 
 // ─── Layer 3: Cognitive (Hindsight-inspired) ────────────────────────
@@ -213,7 +236,10 @@ export type AuditOp =
   | "REFLECT"           // L3 cognitive record produced
   | "RECALL"            // L5 retrieval performed
   | "POLICY_DENY"       // L4 policy refused access
-  | "ERASE";            // L4 hard erasure
+  | "ERASE"             // L4 hard erasure
+  | "PROPOSE"           // L2 draft fact/entity proposed by extractor (v2.7+)
+  | "APPROVE"           // L2 draft promoted to approved (v2.7+)
+  | "REJECT";           // L2 draft rejected (v2.7+)
 
 export interface AuditEntry {
   seq: number;

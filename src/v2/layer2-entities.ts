@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import matter from "gray-matter";
-import type { Entity } from "./types";
+import type { Entity, RecordStatus } from "./types";
 import { slugify, recordFilename, idFromFilename } from "./types";
 import { appendAudit } from "./layer6-audit";
 
@@ -21,11 +21,18 @@ export interface CreateEntityInput {
   aliases?: string[];
   actor: string;
   owner: string;
+  // v2.7+ acceptance lifecycle. Omitting status defaults to "approved" so
+  // existing direct-API callers keep their current semantics.
+  status?: RecordStatus;
+  evidence_excerpt?: string;
+  proposed_by?: string;
+  derived_from?: string[];     // episode IDs that supported this entity (for evidence)
 }
 
 export function createEntity(vaultRoot: string, input: CreateEntityInput): Entity {
   const id = ulid();
   const now = new Date().toISOString();
+  const status: RecordStatus = input.status ?? "approved";
   const entity: Entity = {
     id,
     name: input.name,
@@ -34,6 +41,9 @@ export function createEntity(vaultRoot: string, input: CreateEntityInput): Entit
     first_seen: now,
     last_seen: now,
     owner: input.owner,
+    status,
+    ...(input.evidence_excerpt ? { evidence_excerpt: input.evidence_excerpt.slice(0, 500) } : {}),
+    ...(input.proposed_by ? { proposed_by: input.proposed_by, proposed_at: now } : {}),
   };
   const dir = join(vaultRoot, "v2-entities", input.owner);
   mkdirSync(dir, { recursive: true });
@@ -48,19 +58,96 @@ export function createEntity(vaultRoot: string, input: CreateEntityInput): Entit
     first_seen: entity.first_seen,
     last_seen: entity.last_seen,
     owner: entity.owner,
+    status: entity.status,
+    ...(entity.evidence_excerpt ? { evidence_excerpt: entity.evidence_excerpt } : {}),
+    ...(entity.proposed_by ? { proposed_by: entity.proposed_by, proposed_at: entity.proposed_at } : {}),
+    ...(input.derived_from && input.derived_from.length ? { derived_from: input.derived_from } : {}),
     links: [],
   });
   writeFileSync(join(dir, recordFilename(slug, id)), file, "utf8");
 
   appendAudit({
-    op: "EXTRACT",
+    op: status === "draft" ? "PROPOSE" : "EXTRACT",
     actor: input.actor,
     owner: input.owner,
     record_ids: [id],
-    reason: `entity_created:${entity.type}`,
+    reason: `entity_${status === "draft" ? "proposed" : "created"}:${entity.type}`,
   });
 
   return entity;
+}
+
+// v2.7+ acceptance lifecycle — approve a draft entity.
+export function approveEntity(
+  vaultRoot: string,
+  entityId: string,
+  owner: string,
+  actor: string,
+  reason?: string,
+): Entity | null {
+  const path = entityPath(vaultRoot, owner, entityId);
+  if (!path) return null;
+  const parsed = matter(readFileSync(path, "utf8"));
+  const fm = parsed.data as any;
+  if (fm.owner !== owner) return null;
+  if (fm.status === "approved") return fm as Entity;
+  fm.status = "approved";
+  fm.reviewed_by = actor;
+  fm.reviewed_at = new Date().toISOString();
+  if (reason) fm.review_reason = reason;
+  writeFileSync(path, matter.stringify(parsed.content, fm), "utf8");
+  appendAudit({
+    op: "APPROVE",
+    actor,
+    owner,
+    record_ids: [entityId],
+    reason,
+  });
+  return fm as Entity;
+}
+
+// v2.7+ acceptance lifecycle — reject a draft entity.
+export function rejectEntity(
+  vaultRoot: string,
+  entityId: string,
+  owner: string,
+  actor: string,
+  reason: string,
+): Entity | null {
+  const path = entityPath(vaultRoot, owner, entityId);
+  if (!path) return null;
+  const parsed = matter(readFileSync(path, "utf8"));
+  const fm = parsed.data as any;
+  if (fm.owner !== owner) return null;
+  if (fm.status === "rejected") return fm as Entity;
+  fm.status = "rejected";
+  fm.reviewed_by = actor;
+  fm.reviewed_at = new Date().toISOString();
+  fm.review_reason = reason;
+  writeFileSync(path, matter.stringify(parsed.content, fm), "utf8");
+  appendAudit({
+    op: "REJECT",
+    actor,
+    owner,
+    record_ids: [entityId],
+    reason,
+  });
+  return fm as Entity;
+}
+
+// v2.7+ list all drafts for an owner (used by review CLI + endpoints).
+export function listDraftEntities(vaultRoot: string, owner: string): Entity[] {
+  const dir = join(vaultRoot, "v2-entities", owner);
+  if (!existsSync(dir)) return [];
+  const out: Entity[] = [];
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith(".md")) continue;
+    try {
+      const parsed = matter(readFileSync(join(dir, f), "utf8"));
+      if (parsed.data.status === "draft") out.push(parsed.data as Entity);
+    } catch { /* skip malformed */ }
+  }
+  return out;
 }
 
 export function pathForEntity(vaultRoot: string, owner: string, id: string): string | null {
@@ -101,7 +188,15 @@ export function findEntityByName(vaultRoot: string, owner: string, query: string
   return null;
 }
 
-export function listEntities(vaultRoot: string, owner: string, type?: string): Entity[] {
+// v2.7+: by default excludes drafts and rejected entities. Set
+// includeDrafts=true to include drafts (review tools), or pass status
+// filter to scope.
+export function listEntities(
+  vaultRoot: string,
+  owner: string,
+  type?: string,
+  includeDrafts = false,
+): Entity[] {
   const dir = join(vaultRoot, "v2-entities", owner);
   if (!existsSync(dir)) return [];
   const out: Entity[] = [];
@@ -110,6 +205,10 @@ export function listEntities(vaultRoot: string, owner: string, type?: string): E
     try {
       const parsed = matter(readFileSync(join(dir, f), "utf8"));
       const e = parsed.data as Entity;
+      // Acceptance lifecycle filter. Missing status = approved (back-compat).
+      const status = e.status ?? "approved";
+      if (status === "rejected") continue;
+      if (status === "draft" && !includeDrafts) continue;
       if (type && e.type !== type) continue;
       out.push(e);
     } catch { /* skip malformed */ }
