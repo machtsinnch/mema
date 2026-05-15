@@ -1,0 +1,40 @@
+{
+  "_comment": "Copy this file to data/.obsidian/graph.json to enable mema layer coloring in Obsidian's graph view. Each colorGroup matches files by their vault path; mema's storage layout puts each layer in its own top-level directory, so path:episodes/, path:facts/, etc. cleanly map to layer colors.",
+  "_palette": {
+    "episodes":     "#66cccc (cyan)        — L1 raw episodes",
+    "facts":        "#ffcc66 (amber)       — L2 bi-temporal facts",
+    "cognitive":    "#cc99ff (purple)      — L3 experiences/observations/beliefs",
+    "v2-entities":  "#99cc99 (green)       — L2 entities (v2)",
+    "generalized":  "#daa520 (gold)        — v1 generalized hubs",
+    "users":        "#ffffff (white)       — v1 personal user notes",
+    "entities":     "#888888 (gray)        — v1 entity-scoped legacy"
+  },
+  "collapse-filter": true,
+  "search": "",
+  "showTags": false,
+  "showAttachments": false,
+  "hideUnresolved": false,
+  "showOrphans": true,
+  "collapse-color-groups": false,
+  "colorGroups": [
+    { "query": "path:episodes/",     "color": { "a": 1, "rgb": 6750924  } },
+    { "query": "path:facts/",        "color": { "a": 1, "rgb": 16763494 } },
+    { "query": "path:cognitive/",    "color": { "a": 1, "rgb": 13408767 } },
+    { "query": "path:v2-entities/",  "color": { "a": 1, "rgb": 10079385 } },
+    { "query": "path:generalized/",  "color": { "a": 1, "rgb": 14329120 } },
+    { "query": "path:users/",        "color": { "a": 1, "rgb": 16777215 } },
+    { "query": "path:entities/",     "color": { "a": 1, "rgb": 8947848  } }
+  ],
+  "collapse-display": true,
+  "showArrow": true,
+  "textFadeMultiplier": 0,
+  "nodeSizeMultiplier": 1.4,
+  "lineSizeMultiplier": 1,
+  "collapse-forces": true,
+  "centerStrength": 0.5,
+  "repelStrength": 10,
+  "linkStrength": 1,
+  "linkDistance": 250,
+  "scale": 0.5,
+  "close": false
+}

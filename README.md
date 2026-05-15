@@ -182,6 +182,48 @@ Add to `~/.claude.json` or `~/.cursor/mcp.json`:
 `memory_v2_reflect` · `memory_v2_audit_log` · `memory_v2_audit_verify` ·
 `memory_v2_erase` · `memory_v2_asset_wrap` · `memory_v2_asset_anchor`
 
+---
+
+## Graph view
+
+Three ways to see the network of memories:
+
+### Obsidian (with layer coloring)
+Open `data/` as an Obsidian vault, then install the layer-coloring config:
+
+```bash
+./scripts/install-obsidian-config.sh           # writes data/.obsidian/graph.json
+# or, by hand: cp docs/obsidian-graph.example.json data/.obsidian/graph.json
+```
+
+`Cmd+G` to open the graph. Each layer renders in its own colour:
+
+| Layer | Path | Colour |
+|---|---|---|
+| L1 episodes | `episodes/`     | cyan `#66cccc` |
+| L2 facts    | `facts/`        | amber `#ffcc66` |
+| L3 cognitive | `cognitive/`   | purple `#cc99ff` |
+| L2 v2 entities | `v2-entities/` | green `#99cc99` |
+| v1 generalized hubs | `generalized/` | gold `#daa520` |
+| v1 user notes | `users/`       | white `#ffffff` |
+| v1 entity-scoped | `entities/`  | gray `#888888` |
+
+The same palette is used by the built-in viewer below.
+
+### Built-in `/graph` viewer (zero-dependency)
+```
+http://localhost:3001/graph
+```
+Loads in any browser. Enter your API key in the form, click *Load graph*. Canvas
+force-directed layout with pan / zoom / drag / hover tooltips. Same colour
+palette as the Obsidian config.
+
+### Any external tool via JSON
+```bash
+curl 'http://localhost:3001/v2/graph?limit=2000' -H 'x-api-key: dev-ardin'
+```
+Returns `{nodes, edges, stats}` ready for cytoscape, vis-network, Gephi, D3.
+
 **v1 tools (preserved):** `memory_remember` · `memory_recall` · `memory_show`
 · `memory_forget` · `memory_promote` · `memory_stats` · `memory_health` ·
 `memory_log`
