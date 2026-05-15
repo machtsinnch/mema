@@ -59,8 +59,17 @@ bun scripts/extract-facts-llm.ts --owner ardin --limit 10
 bun scripts/extract-facts-llm.ts --owner ardin
 ```
 
-Per-episode ~3–5 seconds with llama3.1:8b. Full corpus of 357 episodes:
-~20–30 minutes.
+**Verified timing** (smoke-tested at session close on 5 episodes):
+**~28 seconds per episode** with `llama3.1:8b` on this machine.
+Full corpus of 357 episodes = **~2.5–3 hours**. Plan to run overnight,
+or use `--limit 50` for an incremental rollout.
+
+Faster alternatives if you don't want to wait:
+- `OLLAMA_MODEL=llama3.2:3b` — ~3× faster, slightly less precise
+- `OLLAMA_MODEL=qwen2.5:7b` — similar speed to llama3.1, often better at strict JSON
+- `MEMA_EXTRACTOR=anthropic` with `ANTHROPIC_API_KEY` set — fastest, but data leaves the machine
+
+**Smoke-test result at session close** (5 episodes, dry-run): 23 facts + 11 entities extracted, **0 LLM failures**. The framework is working.
 
 ### 4. Wire + reindex + verify
 
