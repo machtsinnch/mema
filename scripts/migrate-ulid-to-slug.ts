@@ -150,10 +150,9 @@ async function main() {
   }
 
   console.log(`Files to rename: ${renames.length}`);
-  if (renames.length === 0) {
-    console.log("Nothing to do.");
-    return;
-  }
+  // Don't early-return on 0 renames — pass 3 still needs to rewrite bare-ULID
+  // wikilinks to the current slug--ulid stems (writes since the last migration
+  // run may have produced bare links that orphan in Obsidian).
 
   // ── Pass 2: perform renames (unless dry-run) ─────────────────────
   const idMap = new Map<string, string>();    // old wikilink target → new wikilink target
@@ -168,6 +167,28 @@ async function main() {
     }
   }
   console.log(args.dryRun ? "  (dry-run: no files actually renamed)" : `  ${renames.length} files renamed`);
+
+  // ── Pass 2.5: also map bare-ULID wikilinks to current slug--ULID stems.
+  // New records may be written with `links: [[ulid]]` because the writer
+  // doesn't know the target's slug. Walk every v2 file, record (ulid → stem),
+  // and merge into idMap so the next pass rewrites those too.
+  const v2Dirs = [
+    join(args.vault, "episodes"),
+    join(args.vault, "facts"),
+    join(args.vault, "cognitive"),
+    join(args.vault, "v2-entities"),
+  ];
+  for (const dir of v2Dirs) {
+    for (const path of walk(dir)) {
+      const filename = basename(path, ".md");
+      const id = idFromFilename(basename(path));
+      if (!id) continue;
+      // Only add if not already mapped, and only when the stem actually
+      // differs from the bare ULID (i.e. the file is in slug--ulid form).
+      if (filename === id) continue;
+      if (!idMap.has(id)) idMap.set(id, filename);
+    }
+  }
 
   // ── Pass 3: rewrite wikilinks in all .md files (v2 + v1) ────────
   // Wikilinks now point to {slug}--{ulid}. Walk all .md files; for each,
