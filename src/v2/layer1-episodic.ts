@@ -6,7 +6,8 @@ import { writeFileSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { Episode, EpisodeKind } from "./types";
-import { toWikilinks } from "./types";
+import { toWikilinks, slugify, recordFilename, idFromFilename } from "./types";
+import { basename } from "node:path";
 import { appendAudit } from "./layer6-audit";
 
 export interface ObserveInput {
@@ -54,8 +55,21 @@ export function observe(vaultRoot: string, input: ObserveInput): Episode {
   if (input.source !== undefined) frontmatter.source = input.source;
 
   const body = input.content;
+  // Human-readable filename: `{slug}--{ulid}.md` so Obsidian's file
+  // explorer + graph view show meaningful labels. Slug derived from the
+  // source-document basename (when imported) or the first words of content.
+  let slugBase = "";
+  if (input.source) {
+    const m = input.source.match(/^v1-migrate:(.+)$/);
+    const sourcePath = m ? m[1] : input.source;
+    slugBase = basename(sourcePath, ".md");
+  }
+  if (!slugBase) slugBase = input.content.trim().split(/\s+/).slice(0, 8).join(" ");
+  const slug = slugify(slugBase, input.kind);
+  frontmatter.slug = slug;
+
   const file = matter.stringify(body, frontmatter);
-  const path = join(dir, `${id}.md`);
+  const path = join(dir, recordFilename(slug, id));
   writeFileSync(path, file, "utf8");
 
   appendAudit({
@@ -68,29 +82,51 @@ export function observe(vaultRoot: string, input: ObserveInput): Episode {
   return episode;
 }
 
-// Read an episode by ID, walking the date buckets for the owner.
+// Resolve the on-disk path for an episode by its ULID. Returns null when
+// the record isn't found. Used by tests and any caller that needs the
+// file path (e.g. /v2/asset/wrap, /v2/erase) without knowing whether the
+// file is on the new slug schema or the legacy ULID-only schema.
+export function pathForEpisode(vaultRoot: string, owner: string, id: string): string | null {
+  const ownerDir = join(vaultRoot, "episodes", owner);
+  try {
+    for (const bucket of readdirSync(ownerDir)) {
+      const bucketDir = join(ownerDir, bucket);
+      let files: string[];
+      try { files = readdirSync(bucketDir); } catch { continue; }
+      for (const f of files) {
+        if (idFromFilename(f) === id) return join(bucketDir, f);
+      }
+    }
+  } catch { /* dir missing */ }
+  return null;
+}
+
+// Read an episode by ID. Filenames are `{slug}--{ulid}.md` (v2.3+) or
+// legacy `{ulid}.md` (pre-v2.3). idFromFilename handles both.
 export function findEpisode(vaultRoot: string, owner: string, id: string): Episode | null {
-  // Episodes are ULID-prefixed by timestamp; for v2.0 we scan the owner's
-  // directory tree (small N). Imports are at the top of the module.
   const ownerDir = join(vaultRoot, "episodes", owner);
   try {
     const buckets = readdirSync(ownerDir);
     for (const b of buckets) {
-      const f = join(ownerDir, b, `${id}.md`);
-      try {
-        const raw = readFileSync(f, "utf8");
-        const parsed = matter(raw);
-        return {
-          id: parsed.data.id,
-          timestamp: parsed.data.timestamp,
-          actor: parsed.data.actor,
-          owner: parsed.data.owner,
-          kind: parsed.data.kind,
-          content: parsed.content.trim(),
-          source: parsed.data.source,
-          refs: parsed.data.refs,
-        };
-      } catch { /* not in this bucket */ }
+      const bucketDir = join(ownerDir, b);
+      let files: string[];
+      try { files = readdirSync(bucketDir); } catch { continue; }
+      for (const f of files) {
+        if (idFromFilename(f) !== id) continue;
+        try {
+          const parsed = matter(readFileSync(join(bucketDir, f), "utf8"));
+          return {
+            id: parsed.data.id,
+            timestamp: parsed.data.timestamp,
+            actor: parsed.data.actor,
+            owner: parsed.data.owner,
+            kind: parsed.data.kind,
+            content: parsed.content.trim(),
+            source: parsed.data.source,
+            refs: parsed.data.refs,
+          };
+        } catch { /* skip */ }
+      }
     }
   } catch { /* no episodes yet */ }
   return null;

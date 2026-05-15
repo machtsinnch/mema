@@ -9,6 +9,7 @@ import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { SemanticFact, CognitiveRecord, Episode } from "./types";
+import { idFromFilename } from "./types";
 
 export interface GraphNode {
   id: string;
@@ -27,27 +28,36 @@ export function walkDerivedFrom(
   const visited = new Set<string>();
   const out: GraphNode[] = [];
 
+  function findByIdInDir(dir: string, id: string): { path: string; fm: any } | null {
+    if (!existsSync(dir)) return null;
+    // Legacy: try `{id}.md` first (cheap stat) before scanning.
+    const legacy = join(dir, `${id}.md`);
+    if (existsSync(legacy)) {
+      try { return { path: legacy, fm: matter(readFileSync(legacy, "utf8")).data }; } catch { /* */ }
+    }
+    for (const f of readdirSync(dir)) {
+      if (idFromFilename(f) !== id) continue;
+      const p = join(dir, f);
+      try { return { path: p, fm: matter(readFileSync(p, "utf8")).data }; } catch { /* */ }
+    }
+    return null;
+  }
+
   function find(id: string): { path: string; fm: any } | null {
-    // Try cognitive
+    // Try cognitive (across all three kinds)
     for (const kind of ["belief", "observation", "experience"]) {
-      const p = join(vaultRoot, "cognitive", owner, kind, `${id}.md`);
-      if (existsSync(p)) {
-        try { return { path: p, fm: matter(readFileSync(p, "utf8")).data }; } catch { /* */ }
-      }
+      const hit = findByIdInDir(join(vaultRoot, "cognitive", owner, kind), id);
+      if (hit) return hit;
     }
     // Try fact
-    const fp = join(vaultRoot, "facts", owner, `${id}.md`);
-    if (existsSync(fp)) {
-      try { return { path: fp, fm: matter(readFileSync(fp, "utf8")).data }; } catch { /* */ }
-    }
+    const factHit = findByIdInDir(join(vaultRoot, "facts", owner), id);
+    if (factHit) return factHit;
     // Try episode (date bucket scan)
     const epOwnerDir = join(vaultRoot, "episodes", owner);
     if (existsSync(epOwnerDir)) {
       for (const bucket of readdirSync(epOwnerDir)) {
-        const p = join(epOwnerDir, bucket, `${id}.md`);
-        if (existsSync(p)) {
-          try { return { path: p, fm: matter(readFileSync(p, "utf8")).data }; } catch { /* */ }
-        }
+        const hit = findByIdInDir(join(epOwnerDir, bucket), id);
+        if (hit) return hit;
       }
     }
     return null;

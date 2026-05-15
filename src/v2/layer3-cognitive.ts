@@ -8,11 +8,27 @@
 //       episodes nightly.
 
 import { ulid } from "ulid";
-import { writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { CognitiveRecord, CognitiveKind } from "./types";
-import { clampConfidence, toWikilinks } from "./types";
+import { clampConfidence, toWikilinks, slugify, recordFilename, idFromFilename } from "./types";
+
+// Resolve a cognitive record's on-disk path by ULID, regardless of kind
+// (belief/observation/experience) and regardless of slug schema. Returns
+// null when not found.
+export function pathForCognitive(vaultRoot: string, owner: string, id: string): string | null {
+  for (const kind of ["belief", "observation", "experience"]) {
+    const kindDir = join(vaultRoot, "cognitive", owner, kind);
+    if (!existsSync(kindDir)) continue;
+    const legacy = join(kindDir, `${id}.md`);
+    if (existsSync(legacy)) return legacy;
+    for (const f of readdirSync(kindDir)) {
+      if (idFromFilename(f) === id) return join(kindDir, f);
+    }
+  }
+  return null;
+}
 import { appendAudit } from "./layer6-audit";
 
 export interface RecordCognitiveInput {
@@ -45,8 +61,12 @@ export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput):
     ...record.derived_from,
     ...(record.superseded_by ? [record.superseded_by] : []),
   ]);
+  // Readable filename: `{kind}-{first-words}--{ulid}.md`
+  const contentSlug = record.content.trim().split(/\s+/).slice(0, 8).join(" ");
+  const slug = slugify(`${record.kind}-${contentSlug}`, record.kind);
   const file = matter.stringify(body, {
     id: record.id,
+    slug,
     kind: record.kind,
     confidence: record.confidence,
     derived_from: record.derived_from,
@@ -55,7 +75,7 @@ export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput):
     owner: record.owner,
     links,
   });
-  writeFileSync(join(dir, `${id}.md`), file, "utf8");
+  writeFileSync(join(dir, recordFilename(slug, id)), file, "utf8");
 
   appendAudit({
     op: "REFLECT",
@@ -78,8 +98,17 @@ export function supersedeBelief(
   actor: string,
 ): CognitiveRecord | null {
   for (const kind of ["belief", "observation", "experience"] as const) {
-    const path = join(vaultRoot, "cognitive", owner, kind, `${oldId}.md`);
-    if (!existsSync(path)) continue;
+    const kindDir = join(vaultRoot, "cognitive", owner, kind);
+    if (!existsSync(kindDir)) continue;
+    let path: string | null = null;
+    const legacy = join(kindDir, `${oldId}.md`);
+    if (existsSync(legacy)) path = legacy;
+    else {
+      for (const f of readdirSync(kindDir)) {
+        if (idFromFilename(f) === oldId) { path = join(kindDir, f); break; }
+      }
+    }
+    if (!path) continue;
     const parsed = matter(readFileSync(path, "utf8"));
     parsed.data.superseded_by = newId;
     // Rebuild Obsidian links to include the new supersession edge.

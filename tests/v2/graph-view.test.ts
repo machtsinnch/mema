@@ -6,10 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import matter from "gray-matter";
 
-import { observe } from "../../src/v2/layer1-episodic";
-import { recordFact, invalidateFact } from "../../src/v2/layer2-semantic";
-import { createEntity, mergeEntities, touchEntity, readEntity } from "../../src/v2/layer2-entities";
-import { recordCognitive, supersedeBelief } from "../../src/v2/layer3-cognitive";
+import { observe, pathForEpisode } from "../../src/v2/layer1-episodic";
+import { recordFact, invalidateFact, pathForFact } from "../../src/v2/layer2-semantic";
+import { createEntity, mergeEntities, touchEntity, readEntity, pathForEntity } from "../../src/v2/layer2-entities";
+import { recordCognitive, supersedeBelief, pathForCognitive } from "../../src/v2/layer3-cognitive";
 import { initAudit } from "../../src/v2/layer6-audit";
 import { initVectorStore } from "../../src/v2/layer5-embeddings";
 import { initAnchorStore } from "../../src/v2/layer7-assets";
@@ -33,7 +33,7 @@ describe("Obsidian wikilink writers", () => {
       subject: "s", predicate: "p", object: "o",
       derived_from: [ep.id], confidence: 0.8, actor: "a", owner: "a",
     });
-    const fm = matter(readFileSync(join(v, "facts", "a", `${f.id}.md`), "utf8")).data;
+    const fm = matter(readFileSync(pathForFact(v, "a", f.id)!, "utf8")).data;
     expect(fm.links).toEqual([`[[${ep.id}]]`]);
     rmSync(v, { recursive: true, force: true });
   });
@@ -50,7 +50,7 @@ describe("Obsidian wikilink writers", () => {
       derived_from: [ep.id], confidence: 0.9, actor: "a", owner: "a",
     });
     invalidateFact(v, f1.id, "a", "a", f2.id);
-    const fm = matter(readFileSync(join(v, "facts", "a", `${f1.id}.md`), "utf8")).data;
+    const fm = matter(readFileSync(pathForFact(v, "a", f1.id)!, "utf8")).data;
     expect(fm.links).toContain(`[[${ep.id}]]`);
     expect(fm.links).toContain(`[[${f2.id}]]`);
     rmSync(v, { recursive: true, force: true });
@@ -63,7 +63,7 @@ describe("Obsidian wikilink writers", () => {
       kind: "belief", content: "b", confidence: 0.8,
       derived_from: [ep.id], actor: "a", owner: "a",
     });
-    const fm = matter(readFileSync(join(v, "cognitive", "a", "belief", `${c.id}.md`), "utf8")).data;
+    const fm = matter(readFileSync(pathForCognitive(v, "a", c.id)!, "utf8")).data;
     expect(fm.links).toEqual([`[[${ep.id}]]`]);
     rmSync(v, { recursive: true, force: true });
   });
@@ -80,7 +80,7 @@ describe("Obsidian wikilink writers", () => {
       derived_from: [ep.id], actor: "a", owner: "a",
     });
     supersedeBelief(v, oldB.id, newB.id, "a", "a");
-    const fm = matter(readFileSync(join(v, "cognitive", "a", "belief", `${oldB.id}.md`), "utf8")).data;
+    const fm = matter(readFileSync(pathForCognitive(v, "a", oldB.id)!, "utf8")).data;
     expect(fm.superseded_by).toBe(newB.id);
     expect(fm.links).toContain(`[[${newB.id}]]`);
     rmSync(v, { recursive: true, force: true });
@@ -90,10 +90,10 @@ describe("Obsidian wikilink writers", () => {
     const v = fresh();
     const e1 = createEntity(v, { name: "Marcel", type: "person", actor: "a", owner: "a" });
     const e2 = createEntity(v, { name: "M.", type: "person", actor: "a", owner: "a" });
-    const m1 = matter(readFileSync(join(v, "v2-entities", "a", `${e1.id}.md`), "utf8")).data;
+    const m1 = matter(readFileSync(pathForEntity(v, "a", e1.id)!, "utf8")).data;
     expect(m1.links).toEqual([]);
     mergeEntities(v, "a", "a", e1.id, e2.id);
-    const stub = matter(readFileSync(join(v, "v2-entities", "a", `${e2.id}.md`), "utf8")).data;
+    const stub = matter(readFileSync(pathForEntity(v, "a", e2.id)!, "utf8")).data;
     expect(stub.links).toEqual([`[[${e1.id}]]`]);
     rmSync(v, { recursive: true, force: true });
   });
@@ -104,7 +104,7 @@ describe("touchEntity preserves frontmatter (regression: drop-links bug)", () =>
     const v = fresh();
     const e = createEntity(v, { name: "Marcel", type: "person", actor: "a", owner: "a" });
     // Simulate a custom frontmatter field being added externally (e.g. by wrap-as-asset)
-    const path = join(v, "v2-entities", "a", `${e.id}.md`);
+    const path = pathForEntity(v, "a", e.id)!;
     const parsed = matter(readFileSync(path, "utf8"));
     parsed.data.content_hash = "sha256:abc";
     parsed.data.asset_version = 1;
@@ -212,7 +212,7 @@ describe("buildGraphView", () => {
     const v = fresh();
     const ep = observe(v, { kind: "document", content: "doomed", actor: "a", owner: "a" });
     // Hard-erase by mutating the tombstone flag directly (simulate hardErase result)
-    const epPath = join(v, "episodes", "a", ep.timestamp.slice(0, 10), `${ep.id}.md`);
+    const epPath = pathForEpisode(v, "a", ep.id)!;
     const parsed = matter(readFileSync(epPath, "utf8"));
     parsed.data.tombstone = true;
     writeFileSync(epPath, matter.stringify("erased", parsed.data), "utf8");

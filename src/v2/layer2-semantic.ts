@@ -12,7 +12,7 @@ import { writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync } from 
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { SemanticFact } from "./types";
-import { clampConfidence, toWikilinks } from "./types";
+import { clampConfidence, toWikilinks, slugify, recordFilename, idFromFilename } from "./types";
 import { appendAudit } from "./layer6-audit";
 
 export interface RecordFactInput {
@@ -54,8 +54,11 @@ export function recordFact(vaultRoot: string, input: RecordFactInput): SemanticF
     ...fact.derived_from,
     ...(fact.superseded_by ? [fact.superseded_by] : []),
   ]);
+  // Readable filename: `{subject}-{predicate}-{object}--{ulid}.md`
+  const slug = slugify(`${fact.subject}-${fact.predicate}-${fact.object}`, "fact");
   const file = matter.stringify(body, {
     id: fact.id,
+    slug,
     subject: fact.subject,
     predicate: fact.predicate,
     object: fact.object,
@@ -68,7 +71,7 @@ export function recordFact(vaultRoot: string, input: RecordFactInput): SemanticF
     owner: fact.owner,
     links,
   });
-  writeFileSync(join(dir, `${id}.md`), file, "utf8");
+  writeFileSync(join(dir, recordFilename(slug, id)), file, "utf8");
 
   appendAudit({
     op: "EXTRACT",
@@ -83,6 +86,23 @@ export function recordFact(vaultRoot: string, input: RecordFactInput): SemanticF
 
 // Mark a fact as invalidated (we now know it was wrong, or it's no longer true).
 // Optionally point to the fact that supersedes it.
+// Find a fact file path by ULID; tolerates legacy ULID-only filenames AND
+// the new slug--ulid filenames. Exported so tests + asset/erase callers
+// can find the file without knowing the naming schema.
+export function pathForFact(vaultRoot: string, owner: string, id: string): string | null {
+  return factPath(vaultRoot, owner, id);
+}
+function factPath(vaultRoot: string, owner: string, id: string): string | null {
+  const dir = join(vaultRoot, "facts", owner);
+  if (!existsSync(dir)) return null;
+  const legacy = join(dir, `${id}.md`);
+  if (existsSync(legacy)) return legacy;
+  for (const f of readdirSync(dir)) {
+    if (idFromFilename(f) === id) return join(dir, f);
+  }
+  return null;
+}
+
 export function invalidateFact(
   vaultRoot: string,
   factId: string,
@@ -90,8 +110,8 @@ export function invalidateFact(
   actor: string,
   supersededBy?: string,
 ): SemanticFact | null {
-  const path = join(vaultRoot, "facts", owner, `${factId}.md`);
-  if (!existsSync(path)) return null;
+  const path = factPath(vaultRoot, owner, factId);
+  if (!path) return null;
   const raw = readFileSync(path, "utf8");
   const parsed = matter(raw);
   parsed.data.invalidated_at = new Date().toISOString();
@@ -113,8 +133,8 @@ export function invalidateFact(
 }
 
 export function readFact(vaultRoot: string, owner: string, id: string): SemanticFact | null {
-  const path = join(vaultRoot, "facts", owner, `${id}.md`);
-  if (!existsSync(path)) return null;
+  const path = factPath(vaultRoot, owner, id);
+  if (!path) return null;
   const parsed = matter(readFileSync(path, "utf8"));
   return parsed.data as SemanticFact;
 }

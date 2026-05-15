@@ -18,7 +18,7 @@ import { Database } from "bun:sqlite";
 import { initAudit, appendAudit, verifyChain } from "../../src/v2/layer6-audit";
 import { initVectorStore } from "../../src/v2/layer5-embeddings";
 import { initAnchorStore, anchorAsset, listAnchors, wrapRecordAsAsset, parseUAL } from "../../src/v2/layer7-assets";
-import { observe } from "../../src/v2/layer1-episodic";
+import { observe, pathForEpisode } from "../../src/v2/layer1-episodic";
 import { recordFact } from "../../src/v2/layer2-semantic";
 import { recordCognitive } from "../../src/v2/layer3-cognitive";
 import { clampConfidence } from "../../src/v2/types";
@@ -37,13 +37,13 @@ describe("Round 2 — listAnchors is owner-scoped (no cross-tenant leak)", () =>
 
     // Tenant A creates and anchors an asset
     const epA = observe(v, { kind: "document", content: "tenant A secret data", actor: "alice", owner: "alice" });
-    const pathA = join(v, "episodes", "alice", epA.timestamp.slice(0, 10), `${epA.id}.md`);
+    const pathA = pathForEpisode(v, "alice", epA.id)!;
     wrapRecordAsAsset(pathA, { owner: "alice", kind: "episode", scope: "document", id: epA.id });
     anchorAsset({ vaultRoot: v, filePath: pathA, target: "local" });
 
     // Tenant B creates and anchors their own
     const epB = observe(v, { kind: "document", content: "tenant B data", actor: "bob", owner: "bob" });
-    const pathB = join(v, "episodes", "bob", epB.timestamp.slice(0, 10), `${epB.id}.md`);
+    const pathB = pathForEpisode(v, "bob", epB.id)!;
     wrapRecordAsAsset(pathB, { owner: "bob", kind: "episode", scope: "document", id: epB.id });
     anchorAsset({ vaultRoot: v, filePath: pathB, target: "local" });
 

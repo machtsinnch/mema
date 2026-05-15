@@ -17,12 +17,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
-import { observe } from "../../src/v2/layer1-episodic";
-import { recordFact, invalidateFact, getFactsValidAt } from "../../src/v2/layer2-semantic";
+import { observe, pathForEpisode } from "../../src/v2/layer1-episodic";
+import { recordFact, invalidateFact, getFactsValidAt, pathForFact } from "../../src/v2/layer2-semantic";
 import {
   createEntity, readEntity, findEntityByName, listEntities, mergeEntities,
 } from "../../src/v2/layer2-entities";
-import { recordCognitive } from "../../src/v2/layer3-cognitive";
+import { recordCognitive, pathForCognitive } from "../../src/v2/layer3-cognitive";
 import { reflect } from "../../src/v2/layer3-reflection";
 import { buildGovernance, policyCheck, hardErase } from "../../src/v2/layer4-governance";
 import { recall } from "../../src/v2/layer5-retrieval";
@@ -173,7 +173,7 @@ describe("Layer 5 — Vector indexing + search", () => {
     ];
     for (let i = 0; i < topics.length; i++) {
       const ep = observe(v, { kind: "document", content: topics[i], actor: "ardin", owner: "ardin" });
-      const path = join(v, "episodes", "ardin", ep.timestamp.slice(0, 10), `${ep.id}.md`);
+      const path = pathForEpisode(v, "ardin", ep.id)!;
       await indexRecord({ path, owner: "ardin", kind: "episode", record_id: ep.id, text: topics[i], embedder: emb });
     }
     // Query with a paraphrase of topic 1
@@ -312,7 +312,7 @@ describe("Layer 4 — Hard erase", () => {
       content: "Personally identifiable information that MUST be erased on DSAR request.",
       actor: "ardin", owner: "ardin",
     });
-    const path = join(v, "episodes", "ardin", ep.timestamp.slice(0, 10), `${ep.id}.md`);
+    const path = pathForEpisode(v, "ardin", ep.id)!;
     expect(existsSync(path)).toBe(true);
     const before = readFileSync(path, "utf8");
     expect(before).toContain("Personally identifiable information");
@@ -397,9 +397,9 @@ describe("End-to-end: full six-layer flow", () => {
     });
 
     // Index everything for vector retrieval
-    const epPath = join(v, "episodes", "ardin", ep.timestamp.slice(0, 10), `${ep.id}.md`);
-    const factPath = join(v, "facts", "ardin", `${fact.id}.md`);
-    const beliefPath = join(v, "cognitive", "ardin", "belief", `${belief.id}.md`);
+    const epPath = pathForEpisode(v, "ardin", ep.id)!;
+    const factPath = pathForFact(v, "ardin", fact.id)!;
+    const beliefPath = pathForCognitive(v, "ardin", belief.id)!;
     for (const [path, kind, id, text] of [
       [epPath, "episode", ep.id, ep.content],
       [factPath, "fact", fact.id, `${fact.subject} ${fact.predicate} ${fact.object}`],

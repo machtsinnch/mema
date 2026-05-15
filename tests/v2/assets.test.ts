@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import matter from "gray-matter";
 
-import { observe } from "../../src/v2/layer1-episodic";
+import { observe, pathForEpisode } from "../../src/v2/layer1-episodic";
 import { initAudit } from "../../src/v2/layer6-audit";
 import {
   computeAssetHashes, mintUAL, parseUAL,
@@ -76,7 +76,7 @@ describe("Layer 7 — Wrap & Verify Integrity", () => {
   test("wrapping a record stamps it with hashes + UAL + version 1", () => {
     const v = fresh();
     const ep = observe(v, { kind: "document", content: "verifiable body", actor: "ardin", owner: "ardin" });
-    const path = join(v, "episodes", "ardin", ep.timestamp.slice(0, 10), `${ep.id}.md`);
+    const path = pathForEpisode(v, "ardin", ep.id)!;
     const meta = wrapRecordAsAsset(path, { owner: "ardin", kind: "episode", scope: "document", id: ep.id });
     expect(meta.ual).toContain("mema://owner/ardin/episode/document/memory/");
     expect(meta.content_hash).toHaveLength(64);
@@ -89,7 +89,7 @@ describe("Layer 7 — Wrap & Verify Integrity", () => {
   test("integrity check passes on unmodified asset", () => {
     const v = fresh();
     const ep = observe(v, { kind: "document", content: "stable body", actor: "ardin", owner: "ardin" });
-    const path = join(v, "episodes", "ardin", ep.timestamp.slice(0, 10), `${ep.id}.md`);
+    const path = pathForEpisode(v, "ardin", ep.id)!;
     wrapRecordAsAsset(path, { owner: "ardin", kind: "episode", scope: "document", id: ep.id });
     const r = verifyAssetIntegrity(path);
     expect(r.valid).toBe(true);
@@ -101,7 +101,7 @@ describe("Layer 7 — Wrap & Verify Integrity", () => {
   test("integrity check FAILS when body is silently modified", () => {
     const v = fresh();
     const ep = observe(v, { kind: "document", content: "original content", actor: "ardin", owner: "ardin" });
-    const path = join(v, "episodes", "ardin", ep.timestamp.slice(0, 10), `${ep.id}.md`);
+    const path = pathForEpisode(v, "ardin", ep.id)!;
     wrapRecordAsAsset(path, { owner: "ardin", kind: "episode", scope: "document", id: ep.id });
 
     // Adversary modifies the body directly on disk
@@ -119,7 +119,7 @@ describe("Layer 7 — Wrap & Verify Integrity", () => {
   test("re-wrapping after a real change bumps asset_version", () => {
     const v = fresh();
     const ep = observe(v, { kind: "document", content: "v1 body", actor: "ardin", owner: "ardin" });
-    const path = join(v, "episodes", "ardin", ep.timestamp.slice(0, 10), `${ep.id}.md`);
+    const path = pathForEpisode(v, "ardin", ep.id)!;
     const m1 = wrapRecordAsAsset(path, { owner: "ardin", kind: "episode", scope: "document", id: ep.id });
     expect(m1.asset_version).toBe(1);
 
@@ -143,7 +143,7 @@ describe("Layer 7 — Anchor lifecycle", () => {
   test("anchorAsset writes a receipt and updates verification_status", () => {
     const v = fresh();
     const ep = observe(v, { kind: "document", content: "anchor me", actor: "ardin", owner: "ardin" });
-    const path = join(v, "episodes", "ardin", ep.timestamp.slice(0, 10), `${ep.id}.md`);
+    const path = pathForEpisode(v, "ardin", ep.id)!;
     wrapRecordAsAsset(path, { owner: "ardin", kind: "episode", scope: "document", id: ep.id });
 
     const a = anchorAsset({ vaultRoot: v, filePath: path, target: "local" });
@@ -170,7 +170,7 @@ describe("Layer 7 — Anchor lifecycle", () => {
   test("anchoring fails if record was not wrapped", () => {
     const v = fresh();
     const ep = observe(v, { kind: "document", content: "not wrapped", actor: "ardin", owner: "ardin" });
-    const path = join(v, "episodes", "ardin", ep.timestamp.slice(0, 10), `${ep.id}.md`);
+    const path = pathForEpisode(v, "ardin", ep.id)!;
     let threw = false;
     try { anchorAsset({ vaultRoot: v, filePath: path, target: "local" }); } catch { threw = true; }
     expect(threw).toBe(true);
@@ -180,7 +180,7 @@ describe("Layer 7 — Anchor lifecycle", () => {
   test("setVerificationStatus transitions the state", () => {
     const v = fresh();
     const ep = observe(v, { kind: "document", content: "review me", actor: "ardin", owner: "ardin" });
-    const path = join(v, "episodes", "ardin", ep.timestamp.slice(0, 10), `${ep.id}.md`);
+    const path = pathForEpisode(v, "ardin", ep.id)!;
     wrapRecordAsAsset(path, { owner: "ardin", kind: "episode", scope: "document", id: ep.id });
     setVerificationStatus(path, "verified");
     const after = matter(readFileSync(path, "utf8"));

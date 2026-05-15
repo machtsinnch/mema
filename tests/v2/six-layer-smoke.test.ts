@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { observe } from "../../src/v2/layer1-episodic";
+import { observe, pathForEpisode } from "../../src/v2/layer1-episodic";
 import { recordFact, invalidateFact, getFactsValidAt } from "../../src/v2/layer2-semantic";
 import { recordCognitive } from "../../src/v2/layer3-cognitive";
 import { buildGovernance, policyCheck, hardErase } from "../../src/v2/layer4-governance";
@@ -126,7 +126,7 @@ describe("Six-layer end-to-end", () => {
       owner: "ardin",
     });
     // Find its path
-    const path = `${vault}/episodes/ardin/${ep.timestamp.slice(0,10)}/${ep.id}.md`;
+    const path = pathForEpisode(vault, "ardin", ep.id)!;
     const r = hardErase({
       vaultRoot: vault,
       owner: "ardin",

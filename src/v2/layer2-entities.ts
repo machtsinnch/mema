@@ -12,6 +12,7 @@ import {
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { Entity } from "./types";
+import { slugify, recordFilename, idFromFilename } from "./types";
 import { appendAudit } from "./layer6-audit";
 
 export interface CreateEntityInput {
@@ -37,19 +38,19 @@ export function createEntity(vaultRoot: string, input: CreateEntityInput): Entit
   const dir = join(vaultRoot, "v2-entities", input.owner);
   mkdirSync(dir, { recursive: true });
   const body = `# ${entity.name}\n\nType: ${entity.type}\nAliases: ${entity.aliases.join(", ")}`;
+  const slug = slugify(`${entity.type}-${entity.name}`, "entity");
   const file = matter.stringify(body, {
     id: entity.id,
+    slug,
     name: entity.name,
     aliases: entity.aliases,
     type: entity.type,
     first_seen: entity.first_seen,
     last_seen: entity.last_seen,
     owner: entity.owner,
-    // Obsidian graph: entities have no outgoing edges until they're merged
-    // or referenced; merge operation appends the keeper-link below.
     links: [],
   });
-  writeFileSync(join(dir, `${id}.md`), file, "utf8");
+  writeFileSync(join(dir, recordFilename(slug, id)), file, "utf8");
 
   appendAudit({
     op: "EXTRACT",
@@ -62,9 +63,23 @@ export function createEntity(vaultRoot: string, input: CreateEntityInput): Entit
   return entity;
 }
 
+export function pathForEntity(vaultRoot: string, owner: string, id: string): string | null {
+  return entityPath(vaultRoot, owner, id);
+}
+function entityPath(vaultRoot: string, owner: string, id: string): string | null {
+  const dir = join(vaultRoot, "v2-entities", owner);
+  if (!existsSync(dir)) return null;
+  const legacy = join(dir, `${id}.md`);
+  if (existsSync(legacy)) return legacy;
+  for (const f of readdirSync(dir)) {
+    if (idFromFilename(f) === id) return join(dir, f);
+  }
+  return null;
+}
+
 export function readEntity(vaultRoot: string, owner: string, id: string): Entity | null {
-  const path = join(vaultRoot, "v2-entities", owner, `${id}.md`);
-  if (!existsSync(path)) return null;
+  const path = entityPath(vaultRoot, owner, id);
+  if (!path) return null;
   const parsed = matter(readFileSync(path, "utf8"));
   return parsed.data as Entity;
 }
@@ -123,7 +138,8 @@ export function mergeEntities(
     last_seen: new Date().toISOString(),
   };
   // Rewrite keeper
-  const keeperPath = join(vaultRoot, "v2-entities", owner, `${keeperId}.md`);
+  const keeperPath = entityPath(vaultRoot, owner, keeperId);
+  if (!keeperPath) return null;
   const keeperFile = matter.stringify(
     `# ${updated.name}\n\nType: ${updated.type}\nAliases: ${updated.aliases.join(", ")}`,
     updated,
@@ -131,7 +147,8 @@ export function mergeEntities(
   writeFileSync(keeperPath, keeperFile, "utf8");
 
   // Replace merged entity file with a redirect stub
-  const mergedPath = join(vaultRoot, "v2-entities", owner, `${mergedId}.md`);
+  const mergedPath = entityPath(vaultRoot, owner, mergedId);
+  if (!mergedPath) return null;
   const stubBody = `# ${merged.name} (merged)\n\nRedirected to entity ${keeperId} on ${new Date().toISOString()}.`;
   const stub = matter.stringify(stubBody, {
     id: mergedId,
@@ -165,8 +182,8 @@ export function mergeEntities(
 // asset metadata) not in the type. This regressed every entity that had been
 // backfilled with Obsidian links or wrapped as an asset.
 export function touchEntity(vaultRoot: string, owner: string, id: string): void {
-  const path = join(vaultRoot, "v2-entities", owner, `${id}.md`);
-  if (!existsSync(path)) return;
+  const path = entityPath(vaultRoot, owner, id);
+  if (!path) return;
   const raw = readFileSync(path, "utf8");
   const parsed = matter(raw);
   if (parsed.data.owner !== owner) return;        // owner check

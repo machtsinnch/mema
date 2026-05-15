@@ -12,6 +12,50 @@ export function clampConfidence(v: unknown): number {
   return n;
 }
 
+// Convert arbitrary text into a filesystem- and Obsidian-friendly slug.
+// Lowercase, ASCII, kebab-case, ≤80 chars. Empty/garbage input falls back to
+// the caller-provided default. CRITICAL: used in filenames AND in wikilinks,
+// so it must produce output that matches both SAFE_WIKILINK_ID and POSIX path
+// conventions.
+export function slugify(text: unknown, fallback = "item"): string {
+  const raw = String(text ?? "").trim();
+  if (!raw) return fallback;
+  // Normalize accented chars then strip diacritics for ASCII output.
+  const ascii = raw
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "")           // strip combining marks
+    .replace(/[äÄ]/g, "a").replace(/[öÖ]/g, "o").replace(/[üÜ]/g, "u")
+    .replace(/[ß]/g, "ss")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80)
+    .replace(/-+$/, "");                        // trim trailing - after slice
+  return ascii || fallback;
+}
+
+// Build a filename for a v2 record: `{slug}--{ulid}.md`. The `--` separator
+// is uncommon in slugs so we can reliably parse the ULID back out of the
+// filename (used by readers to look up records by ID).
+export function recordFilename(slug: string, id: string): string {
+  return `${slug || "item"}--${id}.md`;
+}
+
+// Extract the ULID from a record filename, or null if not in the expected
+// `{slug}--{ulid}.md` shape. Tolerates legacy `{ulid}.md` filenames for
+// backwards compatibility during migration.
+export function idFromFilename(filename: string): string | null {
+  if (!filename.endsWith(".md")) return null;
+  const stem = filename.slice(0, -3);
+  const sep = stem.lastIndexOf("--");
+  if (sep >= 0) {
+    const id = stem.slice(sep + 2);
+    return SAFE_WIKILINK_ID.test(id) ? id : null;
+  }
+  // Legacy: whole stem IS the ULID
+  return SAFE_WIKILINK_ID.test(stem) ? stem : null;
+}
+
 // Validate an ID string for safe inclusion in an Obsidian wikilink `[[id]]`.
 // Rejects path-traversal, pipe (alias-syntax), bracket-escape, empty, and
 // non-printable characters. Strict whitelist: ULID-like alphanumerics +
