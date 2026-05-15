@@ -8,12 +8,14 @@
 // a SEPARATE ingestion pipeline (NOT on every write — principle preserved).
 
 import { ulid } from "ulid";
-import { writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, existsSync } from "node:fs";
+import { atomicWriteFile } from "./atomic";
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { SemanticFact, RecordStatus } from "./types";
 import { clampConfidence, toWikilinks, slugify, recordFilename, idFromFilename } from "./types";
 import { appendAudit } from "./layer6-audit";
+import { factValidAt } from "./temporal";
 
 export interface RecordFactInput {
   subject: string;
@@ -84,7 +86,7 @@ export function recordFact(vaultRoot: string, input: RecordFactInput): SemanticF
     ...(fact.proposed_by ? { proposed_by: fact.proposed_by, proposed_at: fact.proposed_at } : {}),
     links,
   });
-  writeFileSync(join(dir, recordFilename(slug, id)), file, "utf8");
+  atomicWriteFile(join(dir, recordFilename(slug, id)), file);
 
   // Audit op: PROPOSE for drafts (untrusted), EXTRACT for approved (direct writes).
   appendAudit({
@@ -120,7 +122,7 @@ export function approveFact(
   fm.reviewed_by = actor;
   fm.reviewed_at = new Date().toISOString();
   if (reason) fm.review_reason = reason;
-  writeFileSync(path, matter.stringify(parsed.content, fm), "utf8");
+  atomicWriteFile(path, matter.stringify(parsed.content, fm));
   appendAudit({
     op: "APPROVE",
     actor,
@@ -152,7 +154,7 @@ export function rejectFact(
   fm.reviewed_by = actor;
   fm.reviewed_at = new Date().toISOString();
   fm.review_reason = reason;
-  writeFileSync(path, matter.stringify(parsed.content, fm), "utf8");
+  atomicWriteFile(path, matter.stringify(parsed.content, fm));
   appendAudit({
     op: "REJECT",
     actor,
@@ -201,7 +203,7 @@ export function invalidateFact(
     ...((parsed.data.derived_from ?? []) as string[]),
     ...(parsed.data.superseded_by ? [parsed.data.superseded_by] : []),
   ]);
-  writeFileSync(path, matter.stringify(parsed.content, parsed.data), "utf8");
+  atomicWriteFile(path, matter.stringify(parsed.content, parsed.data));
   appendAudit({
     op: "INVALIDATE",
     actor,
@@ -240,10 +242,10 @@ export function getFactsValidAt(
       const status = fact.status ?? "approved";
       if (status === "rejected") continue;
       if (status === "draft" && !includeDrafts) continue;
-      if (fact.valid_from > at) continue;
-      if (fact.valid_to && fact.valid_to < at) continue;
-      // <= : if invalidated AT the query timestamp, we already knew it was wrong
-      if (fact.invalidated_at && fact.invalidated_at <= at) continue;
+      // v2.7.4+ epoch-ms temporal comparison (W8). Uses "lte" semantics for
+      // invalidated_at: a fact invalidated AT the query timestamp is treated
+      // as already-known-wrong by then — same as the prior string-compare.
+      if (!factValidAt(fact, at, "lte")) continue;
       out.push(fact);
     } catch { /* skip malformed */ }
   }

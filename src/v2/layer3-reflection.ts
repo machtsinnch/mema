@@ -21,6 +21,7 @@ import { join } from "node:path";
 import matter from "gray-matter";
 import type { Episode, SemanticFact, CognitiveRecord } from "./types";
 import { recordCognitive } from "./layer3-cognitive";
+import { factValidSince } from "./temporal";
 
 export interface ReflectInput {
   vaultRoot: string;
@@ -69,7 +70,8 @@ function loadFacts(vaultRoot: string, owner: string, since: string): SemanticFac
     try {
       const parsed = matter(readFileSync(join(dir, f), "utf8"));
       const fact = parsed.data as SemanticFact;
-      if ((fact as any).valid_from >= since) out.push(fact);
+      // v2.7.4+ epoch-ms temporal comparison (W8).
+      if (factValidSince(fact, since)) out.push(fact);
     } catch { /* skip */ }
   }
   return out;

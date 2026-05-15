@@ -121,3 +121,43 @@ export function buildEvidenceChain(
   }
   return [...all];
 }
+
+// v2.7.5+ P7 — Build the in-degree support index for an owner's vault:
+// recordId → how many other records cite it via derived_from. This is the
+// "graph support count" signal the reviewer asked for; ranking treats a
+// record cited by many other records as more grounded than an orphan.
+//
+// One pass scans facts/, cognitive/, and v2-entities/ for an owner. The
+// result is cached in-memory by caller responsibility — typically computed
+// once per recall() invocation and reused for all hits.
+export function buildSupportIndex(vaultRoot: string, owner: string): Map<string, number> {
+  const out = new Map<string, number>();
+  const dirs = [
+    join(vaultRoot, "facts", owner),
+    join(vaultRoot, "v2-entities", owner),
+  ];
+  // Cognitive has three subdirectories (belief, observation, experience).
+  for (const kind of ["belief", "observation", "experience"]) {
+    dirs.push(join(vaultRoot, "cognitive", owner, kind));
+  }
+  for (const dir of dirs) {
+    if (!existsSync(dir)) continue;
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith(".md")) continue;
+      try {
+        const parsed = matter(readFileSync(join(dir, f), "utf8"));
+        const fm = parsed.data as any;
+        const refs: string[] = [
+          ...((fm.derived_from ?? []) as string[]),
+          ...(fm.superseded_by ? [String(fm.superseded_by)] : []),
+        ];
+        for (const r of refs) {
+          if (typeof r === "string" && r.length > 0) {
+            out.set(r, (out.get(r) ?? 0) + 1);
+          }
+        }
+      } catch { /* skip */ }
+    }
+  }
+  return out;
+}

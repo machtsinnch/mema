@@ -582,6 +582,16 @@ export function mountV2(app: Hono, cfg: V2Config): void {
       temporal?: { valid_at?: string };
       limit?: number;
       use_vector?: boolean;
+      // v2.7.3+ policy-routing context (P4 + P5).
+      jurisdiction?: string;
+      model?: {
+        model?: string;
+        model_region?: string;
+        deployment?: "local" | "cloud";
+        human_review?: boolean;
+        approved_models?: string[];
+      };
+      policy_mode?: "permissive" | "strict";
     }>(c);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");

@@ -8,7 +8,8 @@
 //       episodes nightly.
 
 import { ulid } from "ulid";
-import { writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync } from "node:fs";
+import { mkdirSync, readFileSync, existsSync, readdirSync } from "node:fs";
+import { atomicWriteFile } from "./atomic";
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { CognitiveRecord, CognitiveKind } from "./types";
@@ -75,7 +76,7 @@ export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput):
     owner: record.owner,
     links,
   });
-  writeFileSync(join(dir, recordFilename(slug, id)), file, "utf8");
+  atomicWriteFile(join(dir, recordFilename(slug, id)), file);
 
   appendAudit({
     op: "REFLECT",
@@ -117,7 +118,7 @@ export function addDerivedFrom(
   for (const k of Object.keys(parsed.data)) {
     if (parsed.data[k] === undefined) delete parsed.data[k];
   }
-  writeFileSync(path, matter.stringify(parsed.content.trim(), parsed.data), "utf8");
+  atomicWriteFile(path, matter.stringify(parsed.content.trim(), parsed.data));
   appendAudit({
     op: "REFLECT",
     actor,
@@ -157,7 +158,7 @@ export function supersedeBelief(
       ...((parsed.data.derived_from ?? []) as string[]),
       newId,
     ]);
-    writeFileSync(path, matter.stringify(parsed.content, parsed.data), "utf8");
+    atomicWriteFile(path, matter.stringify(parsed.content, parsed.data));
     appendAudit({
       op: "REFLECT",
       actor,

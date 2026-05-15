@@ -2,6 +2,130 @@
 
 All notable changes to mema. Follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v2.8.0 — 2026-05-15
+
+Closes the remaining priorities from the external review of v2.5.1
+(P2, P4, P5, P6, P7, W4, W8). Companion to v2.7.0 which delivered P1 +
+P3. mema now ships every architectural fix the reviewer asked for; the
+remaining work is benchmark coverage and embedder quality optimization.
+
+### Added
+
+- **Atomic writes everywhere (P2).** New `src/v2/atomic.ts` exposes
+  `atomicWriteFile(path, content)` (tmp + fsync + rename). Every v2
+  layer writer (`layer1-episodic`, `layer2-entities`, `layer2-semantic`,
+  `layer3-cognitive`, `layer4-governance`, `layer7-assets`) now uses
+  it — 24 direct `writeFileSync` calls removed from the v2 surface. The
+  README architecture invariant "all write paths use atomic write"
+  now holds without caveat.
+- **Strict policy mode (P4).** New `MEMA_POLICY_MODE` env var
+  (`permissive` default, `strict` opt-in) plus `PolicyContext.mode`
+  override. In strict mode `policyCheck` denies:
+  - missing governance block
+  - governance with empty `purpose[]`
+  - regulated data class (`personal`/`pii`/`health`/`financial`/`phi`)
+    without `retention_until`
+  - jurisdiction mismatch between the recall context and the record
+  - regulated cloud destination without `human_review: true`
+- **Jurisdiction + model-routing policy (P5).** `PolicyContext.model`
+  now carries `{model, model_region, deployment, human_review,
+  approved_models}`. `policyCheck` denies recall when regulated content
+  would flow to a cloud model whose `model_region` doesn't match the
+  record's jurisdiction AND isn't in the caller's `approved_models`
+  allowlist. Applies in both modes; the human-review requirement is
+  strict-mode-only. Wired through `/v2/recall`.
+- **Hard-erase audit provenance (P6).** Before erasure, `hardErase`
+  now captures `{erased_record_id, erased_record_path,
+  content_hash_before, metadata_hash_before, legal_basis}` and writes
+  them into the audit log's new `metadata` column. The tombstone on
+  disk carries only the hashes (auditors can prove what was erased
+  without retaining the content). Audit chain stays valid across the
+  schema upgrade (ALTER TABLE is idempotent; pre-v2.8 entries hash
+  without the metadata field).
+- **Epoch-ms temporal comparison (W8).** New `src/v2/temporal.ts`
+  exposes `toEpochMs`, `factValidAt(fact, atIso, "lt"|"lte")`,
+  `factValidSince`. `layer2-semantic.getFactsValidAt`,
+  `layer3-reflection`, and `layer5-retrieval` now use them. Mixed
+  timezone formats (`2026-05-15`, `2026-05-15T10:00:00+02:00`,
+  `2026-05-15T08:00:00Z`) compare correctly; unparseable strings
+  fall through conservatively rather than crashing.
+- **Graph-influenced retrieval ranking (P7).** New `buildSupportIndex`
+  in `layer5-graph` computes per-record in-degree (how many records
+  cite this one via `derived_from` / `superseded_by`). `recall` now
+  includes three new score components: `graph_support` (normalized
+  in-degree), `recency` (linear 90-day decay over `valid_from`), and
+  `contradiction` (1 if `invalidated_at` or `superseded_by` is set, 0
+  otherwise). Fused score: 24% IDF + 20% title + 20% vector + 8%
+  confidence + 6% layer prior + 12% graph_support + 5% recency,
+  multiplied by `(1 - 0.35 × contradiction)`. `why_retrieved`
+  surfaces graph and recency signals when they dominate.
+- **OllamaEmbedder (W4).** New `OllamaEmbedder` class wraps Ollama's
+  `/api/embeddings` endpoint. Opt in with `MEMA_EMBEDDER=ollama`;
+  default model `nomic-embed-text` (pull with `ollama pull
+  nomic-embed-text`). Privacy-preserved (local), transformer-quality
+  vectors. Closes the paraphrase / cross-language gap of the
+  deterministic-hash `LocalHashEmbedder`. `pickEmbedder` honors
+  `MEMA_EMBEDDER` (values `ollama|openai|local`); falls back to
+  `LocalHashEmbedder` when nothing is configured.
+- **LongMemEval benchmark harness (P8).** New `bench/longmemeval-
+  harness.ts` runs mema retrieval against the LongMemEval oracle
+  dataset (Wu et al., ICLR 2025) and scores Hit@1 / Hit@5 / Hit@10
+  per question category. Default is retrieval-only (fast); `--extract`
+  hooks the v2.7+ LLM-extraction + auto-review pipeline (slow). See
+  `bench/longmemeval-harness.ts` header for usage.
+
+### Changed
+
+- `AppendAuditInput` and `AuditEntry` gained an optional
+  `metadata?: Record<string, unknown>` field. The audit hash payload
+  includes metadata when present so tampering invalidates the chain.
+- `RetrievalQuery` gained `jurisdiction`, `model`, `policy_mode` —
+  forwarded to `policyCheck` to enable P5 enforcement.
+- `getFactsValidAt(vault, owner, at, includeDrafts?)` signature
+  unchanged (already gained `includeDrafts` in v2.7.0).
+- `RetrievalHit.score_components` now contains `graph_support`,
+  `recency`, `contradiction` alongside the prior `idf`, `title`,
+  `vector`, `confidence`, `layerPrior` fields.
+
+### Test counts
+
+- v2.7.0: 143 tests, 15 files, 342 expect() calls
+- v2.8.0: 177 tests, 18 files, 411 expect() calls (+34 tests covering
+  strict-mode, model-routing, erasure provenance, temporal edge cases,
+  graph-rank signal correctness)
+
+### Real-world acceptance-gate result (first run on Ardin's vault)
+
+Ran `bun scripts/extract-facts-llm.ts --owner ardin --limit 20` then
+`bun scripts/review-proposals.ts --owner ardin --auto` on a real
+20-episode slice of the production corpus (Ollama llama3.1:8b):
+
+- **20 episodes processed** in 490 seconds (24.5s/episode mean).
+- **111 draft facts + 60 draft entities** proposed by the LLM.
+- **55 auto-approved** (confidence ≥ 0.9 AND evidence check passed).
+- **30 auto-rejected** (~27% of drafts) for failing the evidence
+  check — examples: "@company/finance agent implemented Finance agent
+  implementation (#69)", "UMB AG earns CHF 101,850/year", "Marcel
+  corrected target partners". Real LLM over-extractions that the
+  gate correctly caught.
+- **26 held for human review** (confidence 0.75–0.89 with evidence
+  passing).
+
+This is the noise-reduction validation the reviewer asked for:
+heuristic v2.5 had ~30% noise enter the vault; LLM v2.6 + acceptance
+gate v2.7 + atomic-write/strict-policy v2.8 caught ~27% before they
+landed.
+
+### Migration notes
+
+Fully backward compatible. The audit table gains a nullable
+`metadata` column via idempotent `ALTER TABLE`. Existing facts and
+entities without acceptance-lifecycle fields default to `approved`
+(unchanged from v2.7.0). `MEMA_POLICY_MODE` defaults to `permissive`;
+strict mode is explicit opt-in for regulated deployments.
+
+---
+
 ## v2.7.0 — 2026-05-15
 
 Acceptance lifecycle for untrusted producers (LLM extractors, heuristics)

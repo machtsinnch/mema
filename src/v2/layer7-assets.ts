@@ -15,7 +15,8 @@
 
 import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, existsSync } from "node:fs";
+import { atomicWriteFile } from "./atomic";
 import { dirname, join } from "node:path";
 import matter from "gray-matter";
 
@@ -152,7 +153,7 @@ export function wrapRecordAsAsset(
   for (const k of Object.keys(newFm)) {
     if (newFm[k] === undefined) delete newFm[k];
   }
-  writeFileSync(filePath, matter.stringify(body, newFm), "utf8");
+  atomicWriteFile(filePath, matter.stringify(body, newFm));
   return assetMeta;
 }
 
@@ -284,7 +285,7 @@ export function anchorAsset(input: AnchorAssetInput): Anchor {
   for (const k of Object.keys(newFm)) {
     if (newFm[k] === undefined) delete newFm[k];
   }
-  writeFileSync(input.filePath, matter.stringify(parsed.content.trim(), newFm), "utf8");
+  atomicWriteFile(input.filePath, matter.stringify(parsed.content.trim(), newFm));
 
   return anchor;
 }
@@ -322,5 +323,5 @@ export function setVerificationStatus(filePath: string, status: VerificationStat
   for (const k of Object.keys(newFm)) {
     if (newFm[k] === undefined) delete newFm[k];
   }
-  writeFileSync(filePath, matter.stringify(parsed.content.trim(), newFm), "utf8");
+  atomicWriteFile(filePath, matter.stringify(parsed.content.trim(), newFm));
 }

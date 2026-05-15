@@ -12,8 +12,8 @@ services, healthcare, public sector — where audit replay, hard erasure,
 multi-tenant isolation, jurisdiction-aware governance, and inspectable
 storage matter as much as benchmark recall.
 
-[![v2.7.0](https://img.shields.io/badge/release-v2.7.0-blue)](https://github.com/machtsinnch/mema/releases/tag/v2.7.0)
-[![tests](https://img.shields.io/badge/tests-143_passing-green)](https://github.com/machtsinnch/mema/blob/main/tests/)
+[![v2.8.0](https://img.shields.io/badge/release-v2.8.0-blue)](https://github.com/machtsinnch/mema/releases/tag/v2.8.0)
+[![tests](https://img.shields.io/badge/tests-177_passing-green)](https://github.com/machtsinnch/mema/blob/main/tests/)
 [![benchmark](https://img.shields.io/badge/Precision@1-96.0%25-green)](https://github.com/machtsinnch/mema/blob/main/bench/recall-benchmark-v2.py)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -21,24 +21,32 @@ storage matter as much as benchmark recall.
 
 ## Status
 
-**v2.7.0** — Seven-layer verifiable memory architecture with an
-**acceptance lifecycle** for untrusted producers. LLM extractors and
-other heuristics now propose draft facts/entities that are gated by an
-evidence check and explicit approve/reject decisions before they enter
-the retrieval surface. Heuristic extraction (v2.5) is deprecated in
-favor of LLM-assisted extraction (v2.6+, local Ollama by default).
-Multiple rounds of adversarial review applied; critical findings fixed
-and regression-tested.
+**v2.8.0** — Seven-layer verifiable memory architecture, fully aligned
+with the v2.5.1 external review priorities. Acceptance lifecycle gates
+LLM-extracted facts; strict governance mode enforces jurisdiction +
+model-routing policy; atomic writes everywhere; epoch-ms temporal
+compare; graph in-degree influences retrieval ranking. First
+LongMemEval harness shipped.
 
-- **143 tests passing** across 15 test files (342 `expect()` assertions)
+- **177 tests passing** across 18 test files (411 `expect()` assertions)
 - **96.0% Precision@1** on a 25-query retrieval benchmark over a real
   347-document corpus (vs 44.0% for the v1 baseline — **+52 percentage
-  points**). This benchmark measures retrieval on a Markdown corpus —
-  long-horizon memory benchmarks (LongMemEval, LoCoMo) are planned.
-- **Draft → approved/rejected lifecycle** on L2 facts and entities. LLM
-  extractors write `status: "draft"`; retrieval excludes drafts by
-  default; approve/reject endpoints run an evidence-check guard and
-  emit `APPROVE` / `REJECT` audit entries.
+  points**). External harness for LongMemEval included in `bench/`.
+- **Acceptance gate caught ~27% LLM hallucinations** on a real
+  20-episode smoke run of Ardin's vault (111 drafts → 55 approved /
+  30 rejected for evidence-check failure / 26 held for human review).
+- **Draft → approved/rejected lifecycle** on L2 facts and entities,
+  with `PROPOSE`/`APPROVE`/`REJECT` audit ops in the hash chain.
+- **Strict policy mode** (`MEMA_POLICY_MODE=strict`) denies missing
+  governance, jurisdiction mismatches, and regulated-cloud routing
+  without human review — Swiss enterprise mode.
+- **Hard-erase audit provenance** captures pre-erasure record_id +
+  content/metadata hashes + legal_basis without retaining content.
+- **Atomic writes everywhere** in v2 — tmp + fsync + rename via
+  `src/v2/atomic.ts`. The README invariant now holds.
+- **Graph-influenced ranking** — derived_from in-degree, temporal
+  recency, contradiction penalty added to score components.
+- **Ollama embedder** — opt-in transformer-quality local embeddings.
 - **MCP v2 surface live** — 9 tools for Claude Code / Cursor / any MCP client
 - Full architecture documented in [`docs/WHITEPAPER.md`](docs/WHITEPAPER.md)
 
@@ -162,9 +170,10 @@ fully backward-compatible with existing vaults.
 1. **Filesystem is the source of truth.** SQLite (audit, vectors, anchors)
    and any future index is derived state, rebuildable from the markdown
    vault.
-2. **All write paths use atomic write** (temp + rename). *Note: as of
-   v2.7.0 the helper exists in `src/storage.ts` but v2 layer writers
-   are still being migrated; see roadmap.*
+2. **All write paths use atomic write** (temp + rename + fsync). As
+   of v2.8.0 every v2 layer writer uses `atomicWriteFile` from
+   `src/v2/atomic.ts` — no direct `writeFileSync` remains in the v2
+   surface.
 3. **All read endpoints filter through `canRead` (v1) or `owner !==
    query.owner → deny` (v2).** No exceptions.
 4. **Uniform 404** for not-found vs not-readable.

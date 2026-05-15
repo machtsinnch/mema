@@ -2,7 +2,8 @@
 // Filesystem-truth invariant preserved: each episode is a .md file the user can read.
 
 import { ulid } from "ulid";
-import { writeFileSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { atomicWriteFile } from "./atomic";
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { Episode, EpisodeKind } from "./types";
@@ -70,7 +71,7 @@ export function observe(vaultRoot: string, input: ObserveInput): Episode {
 
   const file = matter.stringify(body, frontmatter);
   const path = join(dir, recordFilename(slug, id));
-  writeFileSync(path, file, "utf8");
+  atomicWriteFile(path, file);
 
   appendAudit({
     op: "OBSERVE",

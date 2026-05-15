@@ -7,8 +7,9 @@
 
 import { ulid } from "ulid";
 import {
-  writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync,
+  mkdirSync, readFileSync, existsSync, readdirSync,
 } from "node:fs";
+import { atomicWriteFile } from "./atomic";
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { Entity, RecordStatus } from "./types";
@@ -64,7 +65,7 @@ export function createEntity(vaultRoot: string, input: CreateEntityInput): Entit
     ...(input.derived_from && input.derived_from.length ? { derived_from: input.derived_from } : {}),
     links: [],
   });
-  writeFileSync(join(dir, recordFilename(slug, id)), file, "utf8");
+  atomicWriteFile(join(dir, recordFilename(slug, id)), file);
 
   appendAudit({
     op: status === "draft" ? "PROPOSE" : "EXTRACT",
@@ -95,7 +96,7 @@ export function approveEntity(
   fm.reviewed_by = actor;
   fm.reviewed_at = new Date().toISOString();
   if (reason) fm.review_reason = reason;
-  writeFileSync(path, matter.stringify(parsed.content, fm), "utf8");
+  atomicWriteFile(path, matter.stringify(parsed.content, fm));
   appendAudit({
     op: "APPROVE",
     actor,
@@ -124,7 +125,7 @@ export function rejectEntity(
   fm.reviewed_by = actor;
   fm.reviewed_at = new Date().toISOString();
   fm.review_reason = reason;
-  writeFileSync(path, matter.stringify(parsed.content, fm), "utf8");
+  atomicWriteFile(path, matter.stringify(parsed.content, fm));
   appendAudit({
     op: "REJECT",
     actor,
@@ -243,7 +244,7 @@ export function mergeEntities(
     `# ${updated.name}\n\nType: ${updated.type}\nAliases: ${updated.aliases.join(", ")}`,
     updated,
   );
-  writeFileSync(keeperPath, keeperFile, "utf8");
+  atomicWriteFile(keeperPath, keeperFile);
 
   // Replace merged entity file with a redirect stub
   const mergedPath = entityPath(vaultRoot, owner, mergedId);
@@ -261,7 +262,7 @@ export function mergeEntities(
     // Obsidian graph: redirect stub links to its keeper.
     links: [`[[${keeperId}]]`],
   });
-  writeFileSync(mergedPath, stub, "utf8");
+  atomicWriteFile(mergedPath, stub);
 
   appendAudit({
     op: "EXTRACT",
@@ -290,5 +291,5 @@ export function touchEntity(vaultRoot: string, owner: string, id: string): void 
   for (const k of Object.keys(parsed.data)) {
     if (parsed.data[k] === undefined) delete parsed.data[k];
   }
-  writeFileSync(path, matter.stringify(parsed.content.trim(), parsed.data), "utf8");
+  atomicWriteFile(path, matter.stringify(parsed.content.trim(), parsed.data));
 }

@@ -199,6 +199,16 @@ export interface RetrievalQuery {
   temporal?: { valid_at?: string };  // facts valid at this time
   limit?: number;
   use_vector?: boolean;        // stubbed in v2.0; real in v2.1
+  // v2.7.3+ policy-routing inputs forwarded to policyCheck.
+  jurisdiction?: string;       // recall-side jurisdiction (e.g. "CH")
+  model?: {                    // where the recalled content will flow
+    model?: string;
+    model_region?: string;
+    deployment?: "local" | "cloud";
+    human_review?: boolean;
+    approved_models?: string[];
+  };
+  policy_mode?: "permissive" | "strict";  // override env var per-call
 }
 
 export interface RetrievalHit {
@@ -251,6 +261,11 @@ export interface AuditEntry {
   record_ids: string[];        // what was touched
   evidence_chain?: string[];   // for RECALL: what supported the hits
   reason?: string;
+  // v2.7.2+ op-specific structured metadata. For ERASE this carries the
+  // pre-erasure provenance ({erased_record_id, erased_record_path,
+  // content_hash_before, metadata_hash_before, legal_basis}). Included
+  // in the chained hash payload.
+  metadata?: Record<string, unknown>;
   prev_hash: string | null;    // hash chain
   curr_hash: string;
 }

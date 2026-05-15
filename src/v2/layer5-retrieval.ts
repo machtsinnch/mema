@@ -22,7 +22,8 @@ import type {
 import { policyCheck } from "./layer4-governance";
 import { appendAudit } from "./layer6-audit";
 import { pickEmbedder, vectorSearch, type Embedder } from "./layer5-embeddings";
-import { buildEvidenceChain } from "./layer5-graph";
+import { buildEvidenceChain, buildSupportIndex } from "./layer5-graph";
+import { factValidAt, toEpochMs } from "./temporal";
 
 // Module-level cached embedder — initialized once per process.
 let _embedder: Embedder | null = null;
@@ -142,6 +143,18 @@ export async function recall(
   const evidenceChain: string[] = [];
   const validAt = query.temporal?.valid_at ?? new Date().toISOString();
 
+  // v2.7.5+ P7 graph signals. One pass over the owner's vault to build the
+  // in-degree map; we'll consult it per hit below. Max observed support is
+  // used to normalize the per-record signal into [0,1].
+  const supportIndex = buildSupportIndex(vaultRoot, query.owner);
+  let maxSupport = 1;
+  for (const v of supportIndex.values()) if (v > maxSupport) maxSupport = v;
+  // Recency normalization: linear decay over ~90 days. Records older than
+  // that get recency_score=0; records from today get 1. Cheap, deterministic,
+  // doesn't require knowing the corpus age distribution.
+  const nowMs = toEpochMs(validAt) ?? Date.now();
+  const RECENCY_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
+
   for (const [path, { matches: mCount, firstLine, tokensMatched }] of matches) {
     const kind = classifyPath(path);
     const rec = loadRecord(path);
@@ -159,12 +172,13 @@ export async function recall(
       if (!query.kinds.includes(kind as RetrievalKind)) continue;
     }
 
-    // Temporal filter for facts
+    // v2.7.4+ epoch-ms temporal filter (W8). Retrieval uses "lt" semantics
+    // on invalidated_at — a fact invalidated AT the query timestamp is
+    // still considered queryable for that instant (subtle difference from
+    // getFactsValidAt's "lte"; preserves the pre-v2.7.4 contract).
     if (kind === "fact") {
       const f = rec.frontmatter as SemanticFact;
-      if (f.valid_from > validAt) continue;
-      if (f.valid_to && f.valid_to < validAt) continue;
-      if (f.invalidated_at && f.invalidated_at < validAt) continue;
+      if (!factValidAt(f, validAt, "lt")) continue;
     }
 
     // v2.7+ acceptance lifecycle filter (applies to fact + entity).
@@ -181,9 +195,17 @@ export async function recall(
     // Skip v1 soft-forgotten
     if (rec.frontmatter.forgotten === true) continue;
 
-    // Governance policy check
+    // Governance policy check. v2.7.3+: forward jurisdiction + model
+    // routing context + per-call policy mode if the caller supplied them.
     const gov = rec.frontmatter.governance as Governance | undefined;
-    const policy = policyCheck(gov, { actor: query.actor, purpose: query.purpose, now: validAt });
+    const policy = policyCheck(gov, {
+      actor: query.actor,
+      purpose: query.purpose,
+      now: validAt,
+      mode: query.policy_mode,
+      jurisdiction: query.jurisdiction,
+      model: query.model,
+    });
     if (!policy.allowed) {
       // record the denial in audit but don't surface
       appendAudit({
@@ -229,11 +251,53 @@ export async function recall(
       ? Math.max(0, Math.min(1, rawConfidence))
       : 0.5;
     const vectorScore = vectorByPath.get(path) ?? 0;
-    // Fused score: keyword-IDF (30%) + title hit (25%) + vector cosine (25%) +
-    // confidence (10%) + layer prior (10%). Vector lifts paraphrase queries where
-    // keyword fails; keyword/title still anchor when the exact words appear.
-    const score = idfNorm * 0.30 + titleBoost * 0.25 + vectorScore * 0.25
-                + confidence * 0.10 + layerPrior * 0.10;
+
+    // v2.7.5+ P7 graph signals.
+    //   graph_support: in-degree (other records citing this one). Normalized
+    //     to [0,1] by the corpus max. A record cited by many is more grounded.
+    //   recency: linear decay over 90 days from valid_from / first_seen / created.
+    //     Newer records get a small ranking bump.
+    //   contradiction_penalty: facts with invalidated_at set OR superseded_by set
+    //     lose a chunk of score even when temporally "still valid" — surfaces a
+    //     contradicted claim less aggressively than a clean one.
+    const recordId = rec.frontmatter.id as string | undefined;
+    const supportCount = recordId ? (supportIndex.get(recordId) ?? 0) : 0;
+    const graphSupport = Math.min(supportCount / maxSupport, 1);
+
+    const recordTime = rec.frontmatter.valid_from
+      ?? rec.frontmatter.first_seen
+      ?? rec.frontmatter.created
+      ?? rec.frontmatter.reflected_at
+      ?? null;
+    const recordMs = recordTime ? toEpochMs(String(recordTime)) : null;
+    const recency = recordMs !== null
+      ? Math.max(0, Math.min(1, 1 - (nowMs - recordMs) / RECENCY_WINDOW_MS))
+      : 0;
+
+    const contradiction = rec.frontmatter.invalidated_at || rec.frontmatter.superseded_by
+      ? 1 : 0;
+    // 35% reduction for contradicted records — still recallable but de-ranked.
+    const contradictionPenalty = contradiction * 0.35;
+
+    // v2.7.5+ fused score with graph signals.
+    //   keyword IDF        24%
+    //   title/alias match  20%
+    //   vector cosine      20%
+    //   confidence          8%
+    //   layer prior         6%
+    //   graph support      12%   (new — derived_from in-degree)
+    //   temporal recency    5%   (new — newer records bump slightly)
+    //   contradiction      -5%×0..1 (new — invalidated/superseded penalized)
+    //   contradiction_pen  applied as a multiplier (1 - 0.35*contradiction)
+    //
+    // Weights chosen so existing keyword/title/vector still dominate (64%);
+    // graph + recency add 17% without flipping result orderings on simple
+    // queries. The contradiction penalty is a multiplier, not a component,
+    // so a contradicted record can never out-rank an equivalent clean one.
+    const baseScore = idfNorm * 0.24 + titleBoost * 0.20 + vectorScore * 0.20
+                    + confidence * 0.08 + layerPrior * 0.06
+                    + graphSupport * 0.12 + recency * 0.05;
+    const score = baseScore * (1 - contradictionPenalty);
 
     // Excerpt prefers the doc's own title/alias over the first matched line (which
     // is often a table-of-contents or boilerplate match).
@@ -246,6 +310,9 @@ export async function recall(
     if (idfNorm > 0.5) parts.push("rare-term keyword match");
     if (vectorScore > 0.3) parts.push(`semantic similarity (${vectorScore.toFixed(2)})`);
     if (confidence > 0.8) parts.push(`high source confidence`);
+    if (graphSupport > 0.5) parts.push(`graph-supported by ${supportCount} record(s)`);
+    if (recency > 0.7) parts.push("recent");
+    if (contradiction === 1) parts.push("contradicted (de-ranked)");
     if (parts.length === 0) parts.push("weak signal");
     const why = parts.join(" + ");
 
@@ -253,7 +320,11 @@ export async function recall(
       kind: kind === "v1_memory" ? "episode" : kind,
       id: rec.frontmatter.id ?? path,
       score,
-      score_components: { idf: idfNorm, title: titleBoost, vector: vectorScore, confidence, layerPrior },
+      score_components: {
+        idf: idfNorm, title: titleBoost, vector: vectorScore,
+        confidence, layerPrior,
+        graph_support: graphSupport, recency, contradiction,
+      },
       excerpt,
       governance: policy,
       // Verifiable-asset fields — populated when the record has been wrapped as an asset

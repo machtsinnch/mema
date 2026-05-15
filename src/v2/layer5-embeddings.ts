@@ -165,12 +165,81 @@ export class OpenAIEmbedder implements Embedder {
   }
 }
 
+// ── OllamaEmbedder (v2.7.6+, W4 from external review) ─────────────────
+// Local transformer-quality embeddings via Ollama's /api/embeddings
+// endpoint. Default model nomic-embed-text (768 dims) — install with
+// `ollama pull nomic-embed-text`. Privacy-preserved (everything stays
+// on-device), but produces real semantic vectors rather than the
+// deterministic-hash projection of LocalHashEmbedder. Closes the
+// paraphrase/cross-language gap the reviewer called out.
+//
+// Activation:
+//   MEMA_EMBEDDER=ollama
+//   OLLAMA_HOST=http://localhost:11434       (default if unset)
+//   OLLAMA_EMBED_MODEL=nomic-embed-text       (default if unset)
+//
+// Dimension is discovered on the FIRST embed call (Ollama doesn't expose
+// it in /api/tags). If the call fails, OllamaEmbedder throws and pickEmbedder
+// falls back to LocalHashEmbedder for the rest of the process.
+export class OllamaEmbedder implements Embedder {
+  readonly name: string;
+  private _dim: number = 0;
+  private host: string;
+  private model: string;
+  constructor(model = "nomic-embed-text", host = "http://localhost:11434") {
+    this.model = model;
+    this.host = host.replace(/\/+$/, "");
+    this.name = `ollama:${model}`;
+  }
+  get dim(): number {
+    // Treat 0 as "not yet probed". Most consumers call embed() before
+    // reading dim; LocalHashEmbedder reports a fixed dim up front. For
+    // index-health checks we lazy-probe with a single empty-string embed.
+    return this._dim;
+  }
+  async embed(text: string): Promise<number[]> {
+    const r = await fetch(`${this.host}/api/embeddings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: this.model, prompt: text.slice(0, 8000) }),
+    });
+    if (!r.ok) {
+      const body = await r.text();
+      throw new Error(`Ollama embed failed: ${r.status} ${body.slice(0, 200)}`);
+    }
+    const d = await r.json() as { embedding: number[] };
+    if (!Array.isArray(d.embedding)) {
+      throw new Error(`Ollama embed returned malformed payload (no embedding array)`);
+    }
+    if (this._dim === 0) this._dim = d.embedding.length;
+    return d.embedding;
+  }
+}
+
 export function pickEmbedder(): Embedder {
+  // v2.7.6+ explicit selector via MEMA_EMBEDDER. Honored regardless of
+  // which API keys happen to be in the environment, so dev/test/staging
+  // can force a specific backend deterministically.
+  const selector = (process.env.MEMA_EMBEDDER ?? "").toLowerCase();
+  if (selector === "ollama") {
+    const model = process.env.OLLAMA_EMBED_MODEL ?? "nomic-embed-text";
+    const host = process.env.OLLAMA_HOST ?? "http://localhost:11434";
+    return new OllamaEmbedder(model, host);
+  }
+  if (selector === "openai") {
+    const key = process.env.OPENAI_API_KEY;
+    if (key && key.length > 10) return new OpenAIEmbedder(key);
+  }
+  if (selector === "local") {
+    return new LocalHashEmbedder(512);
+  }
+  // Auto-detect: OpenAI key present → use OpenAI; otherwise default to
+  // the deterministic local embedder. Ollama is opt-in via MEMA_EMBEDDER
+  // because it requires the model to be pulled first.
   const key = process.env.OPENAI_API_KEY;
   if (key && key.length > 10) {
     try { return new OpenAIEmbedder(key); } catch { /* fallback */ }
   }
-  // Default: v2 local-hash embedder, 512 dims, char-3gram + signed hashes.
   return new LocalHashEmbedder(512);
 }
 

@@ -43,6 +43,13 @@ export function initAudit(vaultRoot: string): void {
     CREATE INDEX IF NOT EXISTS idx_audit_owner ON audit(owner, ts);
     CREATE INDEX IF NOT EXISTS idx_audit_op ON audit(op, ts);
   `);
+  // v2.7.2+ metadata column for ERASE provenance, APPROVE/REJECT context,
+  // and other op-specific structured payloads. Added via ALTER TABLE so
+  // existing v2.0-v2.7.1 databases upgrade cleanly without losing the chain.
+  const cols = db.prepare(`PRAGMA table_info(audit)`).all() as Array<{ name: string }>;
+  if (!cols.some(c => c.name === "metadata")) {
+    db.exec(`ALTER TABLE audit ADD COLUMN metadata TEXT`);  // JSON object, nullable
+  }
   _db = db;
 }
 
@@ -67,6 +74,11 @@ export interface AppendAuditInput {
   record_ids: string[];
   evidence_chain?: string[];
   reason?: string;
+  // v2.7.2+ op-specific structured metadata. For ERASE this carries the
+  // pre-erasure provenance ({erased_record_id, erased_record_path,
+  // content_hash_before, metadata_hash_before, legal_basis}). Included in
+  // the hash chain, so tampering with metadata invalidates the chain.
+  metadata?: Record<string, unknown>;
 }
 
 export function appendAudit(input: AppendAuditInput): AuditEntry {
@@ -86,19 +98,25 @@ export function appendAudit(input: AppendAuditInput): AuditEntry {
     reason: input.reason,
   };
 
+  // Metadata is part of the hashed payload so tampering with it invalidates
+  // the chain — critical for the ERASE op's auditable provenance.
+  const payloadWithMeta = input.metadata
+    ? { ...payloadBase, metadata: input.metadata }
+    : payloadBase;
   const txn = db().transaction(() => {
     const last = db().prepare(`SELECT curr_hash FROM audit ORDER BY seq DESC LIMIT 1`).get() as { curr_hash: string } | undefined;
     const prev = last?.curr_hash ?? null;
-    const curr = computeHash(prev, payloadBase);
+    const curr = computeHash(prev, payloadWithMeta);
     const r = db().prepare(`
-      INSERT INTO audit (ts, op, actor, owner, purpose, record_ids, evidence_chain, reason, prev_hash, curr_hash)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO audit (ts, op, actor, owner, purpose, record_ids, evidence_chain, reason, metadata, prev_hash, curr_hash)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       ts, input.op, input.actor, input.owner,
       input.purpose ?? null,
       JSON.stringify(input.record_ids),
       input.evidence_chain ? JSON.stringify(input.evidence_chain) : null,
       input.reason ?? null,
+      input.metadata ? JSON.stringify(input.metadata) : null,
       prev, curr,
     );
     return { seq: Number(r.lastInsertRowid), prev, curr };
@@ -125,6 +143,7 @@ export function appendAudit(input: AppendAuditInput): AuditEntry {
     record_ids: input.record_ids,
     evidence_chain: input.evidence_chain,
     reason: input.reason,
+    metadata: input.metadata,
     prev_hash: prev,
     curr_hash: curr,
   };
@@ -151,6 +170,7 @@ export function queryAudit(filter?: {
     ...r,
     record_ids: JSON.parse(r.record_ids),
     evidence_chain: r.evidence_chain ? JSON.parse(r.evidence_chain) : undefined,
+    metadata: r.metadata ? JSON.parse(r.metadata) : undefined,
   }));
 }
 
@@ -182,13 +202,20 @@ export function verifyChain(): {
     }
     expectedSeq++;
 
-    const payload = {
+    const payload: Record<string, unknown> = {
       ts: r.ts, op: r.op, actor: r.actor, owner: r.owner,
       purpose: r.purpose ?? undefined,
       record_ids: JSON.parse(r.record_ids),
       evidence_chain: r.evidence_chain ? JSON.parse(r.evidence_chain) : undefined,
       reason: r.reason ?? undefined,
     };
+    // v2.7.2+ metadata is included in the hash payload only when present —
+    // pre-v2.7.2 entries did not have this column, so their hash payload
+    // omitted it. Adding metadata for older entries would invalidate the
+    // chain; only include it when the row actually carries non-null metadata.
+    if (r.metadata !== null && r.metadata !== undefined) {
+      payload.metadata = JSON.parse(r.metadata);
+    }
     const expected = computeHash(prev, payload);
     if (expected !== r.curr_hash || (r.prev_hash ?? null) !== prev) {
       return {
