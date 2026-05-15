@@ -130,6 +130,118 @@ const tools = [
       properties: { limit: { type: "number", description: "Default 20" } },
     },
   },
+  // ── v2 tools: six-layer architecture + verifiable assets ─────────────
+  {
+    name: "memory_v2_observe",
+    description: "v2 L1: ingest a raw episode (conversation turn, document, tool call, observation) into the episodic layer.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["conversation", "document", "tool_call", "observation"] },
+        content: { type: "string" },
+        source: { type: "string", description: "Optional origin reference" },
+      },
+      required: ["kind", "content"],
+    },
+  },
+  {
+    name: "memory_v2_fact",
+    description: "v2 L2: record a semantic fact (subject-predicate-object) with bi-temporal validity. Use derived_from to cite source episode IDs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        subject: { type: "string" },
+        predicate: { type: "string" },
+        object: { type: "string" },
+        valid_from: { type: "string", description: "ISO timestamp; defaults to now" },
+        valid_to: { type: "string", description: "ISO timestamp; null means still-valid" },
+        derived_from: { type: "array", items: { type: "string" } },
+        confidence: { type: "number", description: "0.0-1.0" },
+      },
+      required: ["subject", "predicate", "object", "derived_from"],
+    },
+  },
+  {
+    name: "memory_v2_recall",
+    description: "v2 L5: hybrid retrieval (keyword + IDF + vector + graph + temporal + policy). Returns verifiable packets with UAL + content hash + governance decision + why_retrieved.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        purpose: { type: "string", description: "Why this recall (used for policy + audit, e.g. 'customer-support')" },
+        kinds: { type: "array", items: { type: "string", enum: ["episode", "fact", "cognitive"] } },
+        limit: { type: "number" },
+        use_vector: { type: "boolean" },
+      },
+      required: ["query", "purpose"],
+    },
+  },
+  {
+    name: "memory_v2_reflect",
+    description: "v2 L3: run rule-based reflection over recent episodes/facts, producing cognitive records (experiences, observations, beliefs).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        since: { type: "string", description: "ISO timestamp; defaults to last 7 days" },
+        min_support: { type: "number", description: "Minimum convergent evidence count, default 3" },
+      },
+    },
+  },
+  {
+    name: "memory_v2_audit_log",
+    description: "v2 L6: query the hash-chained audit log for the caller's tenant.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        op: { type: "string", enum: ["OBSERVE", "EXTRACT", "INVALIDATE", "REFLECT", "RECALL", "POLICY_DENY", "ERASE"] },
+        since: { type: "string" },
+        limit: { type: "number" },
+      },
+    },
+  },
+  {
+    name: "memory_v2_audit_verify",
+    description: "v2 L6: verify the audit hash chain integrity. Returns valid:false with broken_at_seq + reason if tampering is detected.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "memory_v2_erase",
+    description: "v2 L4: HARD-erase a record by path — overwrites content with a tombstone, audit entry preserved. Required for GDPR/nFADP DSAR.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        record_path: { type: "string" },
+        reason: { type: "string" },
+      },
+      required: ["record_path", "reason"],
+    },
+  },
+  {
+    name: "memory_v2_asset_wrap",
+    description: "v2 L7: wrap a record as a verifiable Memory Asset (computes content_hash + metadata_hash, mints UAL, sets verification_status=unverified).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        kind: { type: "string" },
+        scope: { type: "string" },
+        id: { type: "string" },
+      },
+      required: ["path", "kind", "scope", "id"],
+    },
+  },
+  {
+    name: "memory_v2_asset_anchor",
+    description: "v2 L7: anchor an asset to a target sink (local | customer-audit-bundle | origintrail | custom).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        target: { type: "string" },
+      },
+      required: ["path", "target"],
+    },
+  },
 ] as const;
 
 const server = new Server(
@@ -167,6 +279,40 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         break;
       case "memory_log":
         result = await api("GET", `/v1/log?limit=${(args as any).limit ?? 20}`);
+        break;
+      // ── v2 dispatch ─────────────────────────────────────────────────
+      case "memory_v2_observe":
+        result = await api("POST", "/v2/observe", args);
+        break;
+      case "memory_v2_fact":
+        result = await api("POST", "/v2/fact", args);
+        break;
+      case "memory_v2_recall":
+        result = await api("POST", "/v2/recall", args);
+        break;
+      case "memory_v2_reflect":
+        result = await api("POST", "/v2/reflect", args);
+        break;
+      case "memory_v2_audit_log": {
+        const a = args as any;
+        const qs = new URLSearchParams();
+        if (a.op) qs.set("op", a.op);
+        if (a.since) qs.set("since", a.since);
+        if (a.limit) qs.set("limit", String(a.limit));
+        result = await api("GET", `/v2/audit/log${qs.toString() ? "?" + qs : ""}`);
+        break;
+      }
+      case "memory_v2_audit_verify":
+        result = await api("GET", "/v2/audit/verify");
+        break;
+      case "memory_v2_erase":
+        result = await api("POST", "/v2/erase", args);
+        break;
+      case "memory_v2_asset_wrap":
+        result = await api("POST", "/v2/asset/wrap", args);
+        break;
+      case "memory_v2_asset_anchor":
+        result = await api("POST", "/v2/asset/anchor", args);
         break;
       default:
         throw new Error(`unknown tool: ${name}`);

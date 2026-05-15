@@ -21,6 +21,7 @@ import { scoreHits } from "./scoring";
 import { logOp, queryLog } from "./db";
 import type { RememberInput, RecallInput, ForgetInput, UpdateInput } from "./types";
 import type { VaultConfig } from "./storage";
+import { mountV2 } from "./v2/api";
 
 type AppEnv = {
   Variables: {
@@ -721,6 +722,9 @@ export function buildApi(cfg: { vaultRoot: string; apiKeys: Record<string, strin
       warning: maxSpokes >= 30 ? `super-hub bulging (${maxSpokes} spokes) — consider split` : null,
     });
   });
+
+  // ── v2: Six-layer memory architecture (episodic / semantic / cognitive / governance / retrieval / audit)
+  mountV2(app as any, { vaultRoot: cfg.vaultRoot });
 
   return app;
 }
