@@ -32,6 +32,21 @@ interface Args {
   api: string;
   key: string;
   dryRun: boolean;
+  userSkipPatterns: RegExp[];   // additional skip patterns from CLI / env
+}
+
+// Parse comma-separated regex strings into RegExp[]. Bad patterns are
+// reported on stderr and skipped (a typo shouldn't abort the import).
+function parseSkipPatternList(raw: string | undefined): RegExp[] {
+  if (!raw) return [];
+  const out: RegExp[] = [];
+  for (const p of raw.split(",").map(s => s.trim()).filter(Boolean)) {
+    try { out.push(new RegExp(p)); }
+    catch (e: any) {
+      console.error(`  skip-pattern ignored (bad regex): ${p} — ${e.message}`);
+    }
+  }
+  return out;
 }
 
 function parseArgs(): Args {
@@ -48,15 +63,26 @@ function parseArgs(): Args {
     } else positional.push(a);
   }
   if (!positional[0]) {
-    console.error("usage: bun scripts/import-tree.ts <source-root> [--api URL] [--key KEY] [--dry-run]");
+    console.error("usage: bun scripts/import-tree.ts <source-root> [--api URL] [--key KEY] [--dry-run] [--skip-patterns REGEX,REGEX,...]");
+    console.error("");
+    console.error("  --skip-patterns   Comma-separated JS regex strings. Files whose absolute");
+    console.error("                    path matches any pattern are skipped at import time.");
+    console.error("                    Also honors MACHTSINN_IMPORT_SKIP_PATTERNS env var.");
+    console.error("                    Example: --skip-patterns '/MEMORY/WORK/.*PRD\\.md$,/\\.aider/.*$'");
     process.exit(1);
   }
+  // Merge env-supplied + flag-supplied user patterns.
+  const userSkipPatterns = [
+    ...parseSkipPatternList(process.env.MACHTSINN_IMPORT_SKIP_PATTERNS),
+    ...parseSkipPatternList(typeof flags["skip-patterns"] === "string" ? flags["skip-patterns"] : undefined),
+  ];
   return {
     source: positional[0],
     entityOverride: flags.entity ? String(flags.entity) : undefined,
     api: String(flags.api ?? process.env.MACHTSINN_URL ?? "http://localhost:3001"),
     key: String(flags.key ?? process.env.MACHTSINN_KEY ?? "dev-ardin"),
     dryRun: !!flags["dry-run"],
+    userSkipPatterns,
   };
 }
 
@@ -94,37 +120,39 @@ const HARD_SKIP_DIRS = new Set([
   ".terragrunt-cache",
 ]);
 
+// Built-in path skip patterns — strictly **general** repository-convention
+// files and widely-recognized agent-framework config files. For ANY
+// workflow-specific, corpus-specific, or personal-workflow skip pattern,
+// use the --skip-patterns CLI flag or the MACHTSINN_IMPORT_SKIP_PATTERNS env
+// var — those are merged with this list at runtime.
+//
+// Anti-pattern: hardcoding paths that only apply to one user's setup
+// (e.g. `/machtsinn/ai/Packs/`, `/memory-investigation/cognee/`,
+// `/MEMORY/WORK/.../PRD.md`). Those have been removed; ship them as user
+// config instead.
 const PATH_SKIP_PATTERNS = [
-  /\/machtsinn\/ai\/Packs(\/|$)/,
-  /\/machtsinn\/ai\/Releases(\/|$)/,
-  /\/memory-investigation\/cognee\/(?!README|cognee-mcp\/README|docs\/)/,
-  /\/memory-investigation\/memory-graph\/(?!README|CHANGELOG|RELEASE_NOTES|docs\/)/,
-  // Agent-session work products — PAI / Claude Code PRDs that live alongside
-  // the user's real knowledge but are agent-generated process artefacts.
-  // These pollute recall because they often contain the very query terms
-  // ("PRD", "ISC", task descriptions) without being canonical knowledge.
-  /\/MEMORY\/WORK\/[^\/]+\/PRD\.md$/,
-  /\/\.algorithm\/[^\/]+\/PRD\.md$/,
-  /\/memory-investigation\/EverOS\/(?!README|methods\/EverCore\/README|methods\/EverCore\/docs\/)/,
-  /\/SKILL\.md$/,        // skill definition files
-  /\/AGENTS?\.md$/,      // agent registry
-  /\/CLAUDE\.md$/,       // claude project config
-  /\/GEMINI\.md$/,       // gemini config
-  /\/CHANGELOG\.md$/i,   // changelogs aren't knowledge
+  // Agent-framework config files — universal across any agent project
+  /\/SKILL\.md$/,
+  /\/AGENTS?\.md$/,
+  /\/CLAUDE\.md$/,
+  /\/GEMINI\.md$/,
+  // Repository-convention files — universal across any git project
+  /\/CHANGELOG\.md$/i,
   /\/CONTRIBUTING\.md$/i,
   /\/LICENSE/,
   /\/SECURITY\.md$/,
   /\/CODE_OF_CONDUCT\.md$/i,
 ];
 
-function shouldSkip(absPath: string): boolean {
+function shouldSkip(absPath: string, userPatterns: RegExp[] = []): boolean {
   const parts = absPath.split("/");
   for (const p of parts) if (HARD_SKIP_DIRS.has(p)) return true;
   for (const re of PATH_SKIP_PATTERNS) if (re.test(absPath)) return true;
+  for (const re of userPatterns) if (re.test(absPath)) return true;
   return false;
 }
 
-function walk(root: string): string[] {
+function walk(root: string, userPatterns: RegExp[] = []): string[] {
   const results: string[] = [];
   const stack: string[] = [root];
   while (stack.length) {
@@ -134,7 +162,7 @@ function walk(root: string): string[] {
     catch { continue; }
     for (const e of entries) {
       const full = join(cur, e.name);
-      if (shouldSkip(full)) continue;
+      if (shouldSkip(full, userPatterns)) continue;
       if (e.isDirectory()) stack.push(full);
       else if (e.isFile() && e.name.endsWith(".md")) results.push(full);
     }
@@ -179,7 +207,10 @@ async function main() {
   console.log(`API:          ${args.api}`);
   console.log(`Dry run:      ${args.dryRun ? "yes" : "no"}\n`);
 
-  const files = walk(args.source);
+  if (args.userSkipPatterns.length > 0) {
+    console.log(`User skip-patterns (${args.userSkipPatterns.length}): ${args.userSkipPatterns.map(r => r.source).join(", ")}`);
+  }
+  const files = walk(args.source, args.userSkipPatterns);
   console.log(`Found ${files.length} .md files after filters.\n`);
 
   const byEntity: Record<string, number> = {};
