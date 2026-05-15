@@ -12,6 +12,26 @@ export function clampConfidence(v: unknown): number {
   return n;
 }
 
+// Validate an ID string for safe inclusion in an Obsidian wikilink `[[id]]`.
+// Rejects path-traversal, pipe (alias-syntax), bracket-escape, empty, and
+// non-printable characters. Strict whitelist: ULID-like alphanumerics +
+// hyphen + underscore + dot, ≤128 chars.
+const SAFE_WIKILINK_ID = /^[A-Za-z0-9._-]{1,128}$/;
+export function isWikilinkSafeId(id: unknown): id is string {
+  return typeof id === "string" && SAFE_WIKILINK_ID.test(id);
+}
+export function toWikilinks(ids: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const id of ids) {
+    if (!isWikilinkSafeId(id)) continue;   // drop malformed IDs silently
+    if (seen.has(id)) continue;             // dedup
+    seen.add(id);
+    out.push(`[[${id}]]`);
+  }
+  return out;
+}
+
 // ─── Layer 1: Episodic ──────────────────────────────────────────────
 // Raw events as they happen: conversations, documents ingested, tool calls,
 // observations made by an agent. The substrate for everything else.

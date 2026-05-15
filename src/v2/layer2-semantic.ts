@@ -12,7 +12,7 @@ import { writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync } from 
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { SemanticFact } from "./types";
-import { clampConfidence } from "./types";
+import { clampConfidence, toWikilinks } from "./types";
 import { appendAudit } from "./layer6-audit";
 
 export interface RecordFactInput {
@@ -47,6 +47,13 @@ export function recordFact(vaultRoot: string, input: RecordFactInput): SemanticF
   const dir = join(vaultRoot, "facts", input.owner);
   mkdirSync(dir, { recursive: true });
   const body = `# ${fact.subject} ${fact.predicate} ${fact.object}\n\nFact derived from ${fact.derived_from.length} episode(s).`;
+  // Obsidian graph: wikilinks for every supporting episode + supersession edge.
+  // toWikilinks validates and dedupes — caller errors (dup IDs in derived_from)
+  // don't propagate to disk.
+  const links = toWikilinks([
+    ...fact.derived_from,
+    ...(fact.superseded_by ? [fact.superseded_by] : []),
+  ]);
   const file = matter.stringify(body, {
     id: fact.id,
     subject: fact.subject,
@@ -59,6 +66,7 @@ export function recordFact(vaultRoot: string, input: RecordFactInput): SemanticF
     derived_from: fact.derived_from,
     confidence: fact.confidence,
     owner: fact.owner,
+    links,
   });
   writeFileSync(join(dir, `${id}.md`), file, "utf8");
 
@@ -88,6 +96,11 @@ export function invalidateFact(
   const parsed = matter(raw);
   parsed.data.invalidated_at = new Date().toISOString();
   if (supersededBy) parsed.data.superseded_by = supersededBy;
+  // Rebuild Obsidian links to include the new supersession edge.
+  parsed.data.links = toWikilinks([
+    ...((parsed.data.derived_from ?? []) as string[]),
+    ...(parsed.data.superseded_by ? [parsed.data.superseded_by] : []),
+  ]);
   writeFileSync(path, matter.stringify(parsed.content, parsed.data), "utf8");
   appendAudit({
     op: "INVALIDATE",

@@ -12,7 +12,7 @@ import { writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { CognitiveRecord, CognitiveKind } from "./types";
-import { clampConfidence } from "./types";
+import { clampConfidence, toWikilinks } from "./types";
 import { appendAudit } from "./layer6-audit";
 
 export interface RecordCognitiveInput {
@@ -40,6 +40,11 @@ export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput):
   const dir = join(vaultRoot, "cognitive", input.owner, input.kind);
   mkdirSync(dir, { recursive: true });
   const body = record.content;
+  // Obsidian graph: wikilinks for derived_from chain + supersession edge.
+  const links = toWikilinks([
+    ...record.derived_from,
+    ...(record.superseded_by ? [record.superseded_by] : []),
+  ]);
   const file = matter.stringify(body, {
     id: record.id,
     kind: record.kind,
@@ -48,6 +53,7 @@ export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput):
     reflected_at: record.reflected_at,
     superseded_by: record.superseded_by,
     owner: record.owner,
+    links,
   });
   writeFileSync(join(dir, `${id}.md`), file, "utf8");
 
@@ -76,6 +82,11 @@ export function supersedeBelief(
     if (!existsSync(path)) continue;
     const parsed = matter(readFileSync(path, "utf8"));
     parsed.data.superseded_by = newId;
+    // Rebuild Obsidian links to include the new supersession edge.
+    parsed.data.links = toWikilinks([
+      ...((parsed.data.derived_from ?? []) as string[]),
+      newId,
+    ]);
     writeFileSync(path, matter.stringify(parsed.content, parsed.data), "utf8");
     appendAudit({
       op: "REFLECT",

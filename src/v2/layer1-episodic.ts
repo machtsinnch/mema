@@ -2,10 +2,11 @@
 // Filesystem-truth invariant preserved: each episode is a .md file the user can read.
 
 import { ulid } from "ulid";
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { Episode, EpisodeKind } from "./types";
+import { toWikilinks } from "./types";
 import { appendAudit } from "./layer6-audit";
 
 export interface ObserveInput {
@@ -37,13 +38,18 @@ export function observe(vaultRoot: string, input: ObserveInput): Episode {
   const dir = join(vaultRoot, "episodes", input.owner, dateBucket);
   mkdirSync(dir, { recursive: true });
 
+  // Obsidian graph compatibility: surface every cross-record reference as a
+  // wikilink in `links:`. toWikilinks validates each ID against a strict
+  // whitelist (closes pipe/bracket/traversal injection) and dedupes.
+  const refs = input.refs ?? [];
   const frontmatter: Record<string, unknown> = {
     id,
     timestamp: ts,
     actor: input.actor,
     owner: input.owner,
     kind: input.kind,
-    refs: input.refs ?? [],
+    refs,
+    links: toWikilinks(refs),
   };
   if (input.source !== undefined) frontmatter.source = input.source;
 
@@ -64,9 +70,8 @@ export function observe(vaultRoot: string, input: ObserveInput): Episode {
 
 // Read an episode by ID, walking the date buckets for the owner.
 export function findEpisode(vaultRoot: string, owner: string, id: string): Episode | null {
-  // Episodes are ULID-prefixed by timestamp; the date can be derived from ULID's
-  // timestamp bits, but for v2.0 we scan the owner's directory tree (small N).
-  const { readdirSync, readFileSync, statSync } = require("node:fs");
+  // Episodes are ULID-prefixed by timestamp; for v2.0 we scan the owner's
+  // directory tree (small N). Imports are at the top of the module.
   const ownerDir = join(vaultRoot, "episodes", owner);
   try {
     const buckets = readdirSync(ownerDir);

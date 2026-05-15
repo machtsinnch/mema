@@ -45,6 +45,9 @@ export function createEntity(vaultRoot: string, input: CreateEntityInput): Entit
     first_seen: entity.first_seen,
     last_seen: entity.last_seen,
     owner: entity.owner,
+    // Obsidian graph: entities have no outgoing edges until they're merged
+    // or referenced; merge operation appends the keeper-link below.
+    links: [],
   });
   writeFileSync(join(dir, `${id}.md`), file, "utf8");
 
@@ -139,6 +142,8 @@ export function mergeEntities(
     last_seen: new Date().toISOString(),
     owner: merged.owner,
     merged_into: keeperId,
+    // Obsidian graph: redirect stub links to its keeper.
+    links: [`[[${keeperId}]]`],
   });
   writeFileSync(mergedPath, stub, "utf8");
 
@@ -154,11 +159,20 @@ export function mergeEntities(
 }
 
 // Bump last_seen on an entity (e.g., when a new fact references it).
+// CRITICAL: reads raw frontmatter and merges only `last_seen` in place. The
+// previous implementation reconstructed the entity from the typed Entity
+// interface, silently dropping any frontmatter fields (links, merged_into,
+// asset metadata) not in the type. This regressed every entity that had been
+// backfilled with Obsidian links or wrapped as an asset.
 export function touchEntity(vaultRoot: string, owner: string, id: string): void {
-  const e = readEntity(vaultRoot, owner, id);
-  if (!e) return;
-  e.last_seen = new Date().toISOString();
   const path = join(vaultRoot, "v2-entities", owner, `${id}.md`);
-  const body = `# ${e.name}\n\nType: ${e.type}\nAliases: ${e.aliases.join(", ")}`;
-  writeFileSync(path, matter.stringify(body, e), "utf8");
+  if (!existsSync(path)) return;
+  const raw = readFileSync(path, "utf8");
+  const parsed = matter(raw);
+  if (parsed.data.owner !== owner) return;        // owner check
+  parsed.data.last_seen = new Date().toISOString();
+  for (const k of Object.keys(parsed.data)) {
+    if (parsed.data[k] === undefined) delete parsed.data[k];
+  }
+  writeFileSync(path, matter.stringify(parsed.content.trim(), parsed.data), "utf8");
 }

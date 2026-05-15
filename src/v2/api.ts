@@ -16,10 +16,192 @@ import {
   wrapRecordAsAsset, verifyAssetIntegrity, parseUAL,
   anchorAsset, listAnchors, setVerificationStatus, initAnchorStore,
 } from "./layer7-assets";
+import { buildGraphView } from "./layer5-graph-view";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
 export interface V2Config { vaultRoot: string; }
+
+// Zero-dependency canvas viewer. Served at /graph. Loads /v2/graph on
+// submit. Force-directed layout with Barnes-Hut-ish approximation for
+// reasonable performance up to ~2000 nodes. No CDN, no external JS.
+const GRAPH_VIEWER_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>mema — graph view</title>
+<style>
+  body { margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:#0a0a0a; color:#e5e5e5; }
+  header { padding: 8px 12px; background:#111; border-bottom:1px solid #222; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  input, button { background:#1a1a1a; color:#e5e5e5; border:1px solid #333; padding:6px 10px; border-radius:4px; font: inherit; }
+  button { cursor:pointer; }
+  button:hover { background:#222; }
+  #stats { color:#888; font-size:12px; }
+  #legend { display:flex; gap:8px; font-size:11px; color:#aaa; }
+  .swatch { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:3px; vertical-align: middle; }
+  canvas { display:block; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  #tooltip { position:absolute; background:#1a1a1a; border:1px solid #333; padding:6px 8px; border-radius:4px; font-size:12px; pointer-events:none; display:none; max-width:340px; }
+</style></head><body>
+<header>
+  <input id="apiKey" type="password" placeholder="x-api-key" size="20" />
+  <button id="load">Load graph</button>
+  <span id="stats"></span>
+  <span id="legend">
+    <span><span class="swatch" style="background:#6cc"></span>episode</span>
+    <span><span class="swatch" style="background:#fc6"></span>fact</span>
+    <span><span class="swatch" style="background:#c9f"></span>cognitive</span>
+    <span><span class="swatch" style="background:#9c9"></span>entity</span>
+    <span><span class="swatch" style="background:#888"></span>v1</span>
+  </span>
+</header>
+<canvas id="cv"></canvas>
+<div id="tooltip"></div>
+<script>
+const COLORS = { episode:'#6cc', fact:'#fc6', cognitive:'#c9f', entity:'#9c9', v1_memory:'#888' };
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const tip = document.getElementById('tooltip');
+let nodes = [], edges = [], idIndex = new Map();
+let camera = { x: 0, y: 0, zoom: 1 };
+let dragging = null, panning = null;
+
+function resize() { cv.width = innerWidth; cv.height = innerHeight - 44; }
+addEventListener('resize', resize); resize();
+
+async function load() {
+  const k = document.getElementById('apiKey').value.trim();
+  try {
+    const r = await fetch('/v2/graph', { headers: { 'x-api-key': k } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    nodes = data.nodes.map(n => ({
+      ...n, x: (Math.random()-0.5)*1200, y: (Math.random()-0.5)*1200, vx: 0, vy: 0,
+    }));
+    edges = data.edges;
+    idIndex = new Map(nodes.map(n => [n.id, n]));
+    const s = data.stats;
+    document.getElementById('stats').textContent =
+      \`\${s.nodes_total} nodes · \${s.edges_total} edges · \` +
+      Object.entries(s.by_kind).filter(([,v])=>v>0).map(([k,v])=>\`\${k}:\${v}\`).join(' · ');
+  } catch (e) { alert('load failed: ' + e.message); }
+}
+document.getElementById('load').onclick = load;
+load();
+
+// ── Force-directed layout (basic spring-electrical, ticked each frame) ──
+function tick() {
+  if (nodes.length === 0) return;
+  const REPEL = 1600, SPRING = 0.012, REST_LEN = 80, DAMP = 0.86;
+  // Pairwise repulsion (O(n²); fine up to ~1500 nodes)
+  for (let i = 0; i < nodes.length; i++) {
+    const a = nodes[i];
+    for (let j = i+1; j < nodes.length; j++) {
+      const b = nodes[j];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const d2 = dx*dx + dy*dy + 1;
+      const f = REPEL / d2;
+      const d = Math.sqrt(d2);
+      const fx = (dx/d) * f, fy = (dy/d) * f;
+      a.vx -= fx; a.vy -= fy;
+      b.vx += fx; b.vy += fy;
+    }
+  }
+  // Spring on edges
+  for (const e of edges) {
+    const a = idIndex.get(e.source), b = idIndex.get(e.target);
+    if (!a || !b) continue;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const d = Math.sqrt(dx*dx + dy*dy) + 0.01;
+    const f = SPRING * (d - REST_LEN);
+    a.vx += (dx/d) * f; a.vy += (dy/d) * f;
+    b.vx -= (dx/d) * f; b.vy -= (dy/d) * f;
+  }
+  // Integrate
+  for (const n of nodes) {
+    if (n === dragging) continue;
+    n.vx *= DAMP; n.vy *= DAMP;
+    n.x += n.vx; n.y += n.vy;
+  }
+}
+
+function draw() {
+  ctx.fillStyle = '#0a0a0a';
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.save();
+  ctx.translate(cv.width/2 + camera.x, cv.height/2 + camera.y);
+  ctx.scale(camera.zoom, camera.zoom);
+  // Edges
+  ctx.strokeStyle = '#333';
+  ctx.lineWidth = 0.6;
+  ctx.beginPath();
+  for (const e of edges) {
+    const a = idIndex.get(e.source), b = idIndex.get(e.target);
+    if (!a || !b) continue;
+    ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+  }
+  ctx.stroke();
+  // Nodes
+  for (const n of nodes) {
+    ctx.fillStyle = COLORS[n.kind] || '#aaa';
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, n.kind === 'cognitive' ? 5 : 3.5, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function worldFromScreen(sx, sy) {
+  return {
+    x: (sx - cv.width/2 - camera.x) / camera.zoom,
+    y: (sy - cv.height/2 - camera.y) / camera.zoom,
+  };
+}
+function nodeAt(sx, sy) {
+  const w = worldFromScreen(sx, sy);
+  for (const n of nodes) {
+    const dx = n.x - w.x, dy = n.y - w.y;
+    if (dx*dx + dy*dy < 36) return n;
+  }
+  return null;
+}
+
+cv.addEventListener('mousedown', ev => {
+  const n = nodeAt(ev.offsetX, ev.offsetY);
+  if (n) dragging = n;
+  else panning = { x: ev.offsetX, y: ev.offsetY };
+});
+cv.addEventListener('mousemove', ev => {
+  if (dragging) {
+    const w = worldFromScreen(ev.offsetX, ev.offsetY);
+    dragging.x = w.x; dragging.y = w.y; dragging.vx = 0; dragging.vy = 0;
+  } else if (panning) {
+    camera.x += ev.offsetX - panning.x;
+    camera.y += ev.offsetY - panning.y;
+    panning = { x: ev.offsetX, y: ev.offsetY };
+  } else {
+    const n = nodeAt(ev.offsetX, ev.offsetY);
+    if (n) {
+      tip.style.display = 'block';
+      tip.style.left = (ev.clientX + 12) + 'px';
+      tip.style.top = (ev.clientY + 12) + 'px';
+      const m = n.meta || {};
+      const esc = s => (s||'').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]));
+      tip.innerHTML = '<b>' + esc(n.kind) + '</b><br>' +
+        esc(n.label) +
+        '<br><span style="color:#888">' + esc(n.id) + '</span>' +
+        (m.confidence != null ? '<br>confidence: ' + m.confidence.toFixed(2) : '') +
+        (m.verification_status ? '<br>status: ' + m.verification_status : '');
+    } else tip.style.display = 'none';
+  }
+});
+cv.addEventListener('mouseup', () => { dragging = null; panning = null; });
+cv.addEventListener('wheel', ev => {
+  ev.preventDefault();
+  const factor = ev.deltaY > 0 ? 0.92 : 1.08;
+  camera.zoom = Math.max(0.1, Math.min(8, camera.zoom * factor));
+}, { passive: false });
+
+(function loop() { tick(); draw(); requestAnimationFrame(loop); })();
+</script></body></html>`;
 
 // CRITICAL: per-request body cap. Without this, a single tenant can write a
 // 1 GB string via /v2/observe and fill the disk. Default 2 MB, overridable
@@ -246,10 +428,26 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
+    const p = parsed.body.record_path.startsWith("/")
+      ? parsed.body.record_path
+      : join(cfg.vaultRoot, parsed.body.record_path);
+    // CRITICAL: owner-of-path check. Without this, any authenticated tenant
+    // could pass another tenant's path and tombstone their data. (Codex
+    // finding C2 — pre-existing bug since v2.0.0.) Symmetric with the
+    // checks on /v2/asset/wrap, /v2/asset/verify-integrity, etc.
+    if (!existsSync(p)) return c.json({ error: "not found" }, 404);
+    const matterMod = (await import("gray-matter")).default;
+    let rec;
+    try { rec = matterMod(readFileSync(p, "utf8")); }
+    catch { return c.json({ error: "not found" }, 404); }
+    if (rec.data.owner && rec.data.owner !== owner) {
+      // Uniform 404 instead of 403 — no existence oracle for cross-tenant probes.
+      return c.json({ error: "not found" }, 404);
+    }
     const r = hardErase({
       vaultRoot: cfg.vaultRoot,
       owner, actor,
-      record_path: parsed.body.record_path,
+      record_path: p,
       reason: parsed.body.reason,
     });
     return c.json(r);
@@ -355,6 +553,36 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     if (rec.data.owner && rec.data.owner !== owner) return c.json({ error: "not found" }, 404);
     setVerificationStatus(p, parsed.body.status);
     return c.json({ ok: true, status: parsed.body.status });
+  });
+
+  // ── Layer 5 (companion): Graph view ──────────────────────────────
+  // JSON endpoint — drives any external graph viewer (cytoscape, vis-network,
+  // Gephi, the bundled /graph HTML page). Supports ?limit=N (default 2000,
+  // max 10000) to bound response size on large vaults.
+  app.get("/v2/graph", async c => {
+    const owner = c.get("owner");
+    const limitQ = c.req.query("limit");
+    let limit: number | undefined = undefined;
+    if (limitQ) {
+      const n = Number(limitQ);
+      if (!Number.isFinite(n) || n < 1) {
+        return c.json({ error: "limit must be a positive integer" }, 400);
+      }
+      if (n > 10000) {
+        return c.json({ error: "limit exceeds max (10000)", max: 10000 }, 413);
+      }
+      limit = n;
+    }
+    const view = buildGraphView(cfg.vaultRoot, owner, { limit });
+    return c.json(view);
+  });
+
+  // Bundled HTML viewer — zero-dependency canvas force-directed layout.
+  // Served unauthenticated from /graph so it can be opened directly in a
+  // browser; the JS inside calls /v2/graph with whatever key the user
+  // supplies in the input box.
+  app.get("/graph", async c => {
+    return c.html(GRAPH_VIEWER_HTML);
   });
 
   // ── Layer 6: Audit ───────────────────────────────────────────────

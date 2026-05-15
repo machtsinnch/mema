@@ -69,7 +69,11 @@ export function buildApi(cfg: { vaultRoot: string; apiKeys: Record<string, strin
   // another owner. Format is "<owner>:<label>" or just "<label>" (prefix is added automatically).
   app.use("*", async (c, next) => {
     const url = new URL(c.req.url);
-    if (url.pathname === "/health") return next();
+    // /health is unauthenticated. /graph serves the static HTML viewer
+    // (no data); the JS inside it authenticates to /v2/graph with whatever
+    // key the user supplies in the form. Loading the page itself doesn't
+    // expose any vault content.
+    if (url.pathname === "/health" || url.pathname === "/graph") return next();
     const key = c.req.header("x-api-key") ?? "";
     const owner = cfg.apiKeys[key];
     if (!owner) return c.json({ error: "invalid api key" }, 401);
