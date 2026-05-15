@@ -9,7 +9,7 @@ import { recordCognitive, supersedeBelief } from "./layer3-cognitive";
 import { reflect } from "./layer3-reflection";
 import { buildGovernance, hardErase } from "./layer4-governance";
 import { recall } from "./layer5-retrieval";
-import { initVectorStore, pickEmbedder, indexRecord, reindexAll } from "./layer5-embeddings";
+import { initVectorStore, pickEmbedder, indexRecord, reindexAll, vectorIndexHealth } from "./layer5-embeddings";
 import { walkDerivedFrom, walkSiblingFacts } from "./layer5-graph";
 import { queryAudit, verifyChain, initAudit } from "./layer6-audit";
 import {
@@ -193,6 +193,22 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     const owner = c.get("owner");
     const result = await reindexAll(cfg.vaultRoot, pickEmbedder(), { owner });
     return c.json({ indexed: result.indexed, skipped: result.skipped, embedder: pickEmbedder().name });
+  });
+
+  // Vector-index health — surfaces stale rows from a previous embedder version
+  // so operators see a clear "reindex needed" after an upgrade.
+  app.get("/v2/vector/health", async c => {
+    const emb = pickEmbedder();
+    const h = vectorIndexHealth(emb);
+    return c.json({
+      embedder: { name: emb.name, dim: emb.dim },
+      ...h,
+      recommendation: h.needs_reindex
+        ? "Run POST /v2/vector/reindex — the active embedder differs from the stored vectors."
+        : h.stale_rows > 0
+          ? `Mixed state: ${h.current_rows} current, ${h.stale_rows} stale. Reindex to clean up.`
+          : "ok",
+    });
   });
 
   // ── Layer 5: Graph walks (read-only) ─────────────────────────────

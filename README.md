@@ -204,26 +204,41 @@ anchored_at: 2026-05-15T14:32:11Z
 anchor_targets: [local, customer-audit-bundle]
 ```
 
-`/v2/recall` returns each hit as a **verifiable packet**:
+### What recall returns
+
+`/v2/recall` always returns `score`, `score_components`, `governance`,
+`why_retrieved`, and `excerpt` for every hit. **Cryptographic asset
+metadata is opt-in** — `ual`, `content_hash`, `metadata_hash`,
+`asset_version`, and `verification_status` are populated only after the
+record has been wrapped via `/v2/asset/wrap`:
 
 ```json
 {
   "kind": "fact",
   "score": 0.86,
+  "score_components": { "idf": 0.72, "title": 0.80, "vector": 0.41, ... },
+  "why_retrieved": "rare-term keyword match + title match + semantic similarity (0.41)",
+  "governance": { "allowed": true, "reason": "policy_pass" },
+  "excerpt": "Pillar 3a tax optimization strategy — ...",
+
+  // Present only when the record was wrapped:
   "ual": "mema://owner/ardin/fact/marcel-r/memory/01KR...",
   "content_hash": "sha256:abc...",
   "metadata_hash": "sha256:def...",
   "asset_version": 1,
-  "verification_status": "anchored",
-  "why_retrieved": "rare-term keyword match + title match + semantic similarity (0.41)",
-  "governance": { "allowed": true, "reason": "policy_pass" },
-  "excerpt": "..."
+  "verification_status": "anchored"
 }
 ```
 
-A downstream consumer can independently verify the hit by re-hashing the
-file at `ual` and comparing to `content_hash`. Inspired by OriginTrail's
-DKG Knowledge Asset model, **without** the blockchain dependency.
+The **system-wide verifiability guarantee** lives in the L6 audit log —
+every recall is hash-chained with `prev_hash` / `curr_hash` + external
+sealed witness. The L7 per-record verifiability is the upgrade for
+records you want to expose externally with provenance.
+
+A downstream consumer of a wrapped record can independently verify the
+hit by re-hashing the file at `ual` and comparing to `content_hash`.
+Inspired by OriginTrail's DKG Knowledge Asset model, **without** the
+blockchain dependency.
 
 ---
 

@@ -62,11 +62,18 @@ function parseArgs(): Args {
 
 // Top-level path → entity name. We use the first segment after the source root
 // as the entity unless it's an excluded location.
+//
+// Files at the source root (HOME.md, _TAXONOMY.md, etc.) would otherwise become
+// their own entities, polluting the entity list. Map them all to "_root" so
+// they share one synthetic entity that's clearly marked as "not from a folder."
 function entityFor(absPath: string, sourceRoot: string, override?: string): string | null {
   if (override) return override;
   const rel = relative(sourceRoot, absPath);
   if (!rel || rel.startsWith("..")) return null;
-  const top = rel.split("/")[0];
+  const parts = rel.split("/");
+  // Root-level files (no subdirectory) → "_root" entity.
+  if (parts.length === 1) return "_root";
+  const top = parts[0];
   if (!top || top.startsWith(".")) return null;
   return top;
 }
@@ -77,6 +84,14 @@ const HARD_SKIP_DIRS = new Set([
   ".turbo", ".pytest_cache", "__pycache__", "site-packages",
   ".claude",            // Claude Code infrastructure (SKILL.md etc.) — not user content
   ".github",            // CI workflows — not user content
+  ".terraform",         // Terraform module cache — vendored READMEs, breaks path validator
+  ".gradle", ".mvn",    // Build tool caches
+  ".nx", ".rush",       // Monorepo build caches
+  ".ruff_cache", ".mypy_cache",
+  "vendor",             // Go/PHP/Ruby vendored deps
+  "bower_components",
+  "Pods",               // CocoaPods (iOS)
+  ".terragrunt-cache",
 ]);
 
 const PATH_SKIP_PATTERNS = [
@@ -84,6 +99,12 @@ const PATH_SKIP_PATTERNS = [
   /\/machtsinn\/ai\/Releases(\/|$)/,
   /\/memory-investigation\/cognee\/(?!README|cognee-mcp\/README|docs\/)/,
   /\/memory-investigation\/memory-graph\/(?!README|CHANGELOG|RELEASE_NOTES|docs\/)/,
+  // Agent-session work products — PAI / Claude Code PRDs that live alongside
+  // the user's real knowledge but are agent-generated process artefacts.
+  // These pollute recall because they often contain the very query terms
+  // ("PRD", "ISC", task descriptions) without being canonical knowledge.
+  /\/MEMORY\/WORK\/[^\/]+\/PRD\.md$/,
+  /\/\.algorithm\/[^\/]+\/PRD\.md$/,
   /\/memory-investigation\/EverOS\/(?!README|methods\/EverCore\/README|methods\/EverCore\/docs\/)/,
   /\/SKILL\.md$/,        // skill definition files
   /\/AGENTS?\.md$/,      // agent registry

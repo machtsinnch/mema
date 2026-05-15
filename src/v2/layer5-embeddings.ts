@@ -26,12 +26,23 @@ export interface Embedder {
 // ── LocalHashEmbedder ─────────────────────────────────────────────────
 // Deterministic, hash-based projection. Not "semantic" in the
 // transformer-embedding sense, but discriminating enough that two documents
-// sharing the same rare tokens get closer than two sharing only stopwords.
+// sharing the same rare lexical surface (tokens AND character n-grams) get
+// closer than two sharing only stopwords.
 //
-// Method: tokenize → for each token, hash to D buckets, increment bucket by
-// IDF-ish weight (log(1 + 1/df) approximated as 1/sqrt(token_count_in_doc)).
-// Normalize. This is essentially a sparse character-shingled bag-of-words
-// projected to a fixed-dim dense vector via the hashing trick.
+// Method:
+//   1. Tokenize → drop stopwords → keep word tokens (length 2..32)
+//   2. Also extract character 3-grams from each token (catches acronyms,
+//      partial matches, identifier suffixes like "NCPCS-3041")
+//   3. For each feature (token + each 3-gram), hash to D buckets using THREE
+//      signed hash functions (catches collisions that 2-hash misses)
+//   4. Weight word-token features higher than n-gram features (signal density)
+//   5. Normalize to unit length for cosine similarity
+//
+// Bumped from 256 → 512 dims to halve collision rate at the cost of 2× index
+// size (still tiny — 4 KB per record at float32).
+//
+// Schema-versioned: increment EMBEDDER_VERSION on any change to the projection
+// so vectorSearch can reject stale rows and warn the operator to reindex.
 
 const STOPWORDS = new Set([
   "the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "at",
@@ -47,13 +58,26 @@ const STOPWORDS = new Set([
 function tokenize(text: string): string[] {
   return text
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s\-]/gu, " ")
+    .replace(/[^\p{L}\p{N}\s\-_.]/gu, " ")    // keep dots/underscores in identifiers
     .split(/\s+/)
-    .filter(t => t.length >= 2 && t.length <= 32 && !STOPWORDS.has(t));
+    .filter(t => t.length >= 2 && t.length <= 64 && !STOPWORDS.has(t));
 }
 
-function hashTo(buckets: number, token: string): number {
-  const h = createHash("md5").update(token).digest();
+// Character n-grams from a single token. n=3 default — catches acronym
+// substrings like "NCP", "PCS", "CS-", etc. We pad with sentinel "^" and "$"
+// so first/last n-grams of short tokens are still meaningful.
+function charNgrams(token: string, n = 3): string[] {
+  const padded = `^${token}$`;
+  if (padded.length < n) return [padded];
+  const out: string[] = [];
+  for (let i = 0; i <= padded.length - n; i++) {
+    out.push(padded.slice(i, i + n));
+  }
+  return out;
+}
+
+function hashTo(buckets: number, token: string, salt: string): number {
+  const h = createHash("md5").update(salt + ":" + token).digest();
   const combined = (((h[0] << 24) | (h[1] << 16) | (h[2] << 8) | h[3]) >>> 0);
   return combined % buckets;
 }
@@ -66,24 +90,53 @@ function norm(v: number[]): number[] {
   return v.map(x => x / n);
 }
 
+// Bump this when changing the projection (dims, n-gram size, hash count,
+// weight ratio). vectorSearch will skip rows whose embedder field doesn't
+// match the current name + version, prompting a reindex.
+export const EMBEDDER_VERSION = 2;
+
 export class LocalHashEmbedder implements Embedder {
-  readonly name = "local-hash";
+  readonly name = `local-hash-v${EMBEDDER_VERSION}`;
   readonly dim: number;
-  constructor(dim = 256) { this.dim = dim; }
+  // Word-token weight vs character-3-gram weight. Words carry more signal
+  // (whole-meaning) so they dominate; n-grams add lexical fuzziness.
+  private readonly TOKEN_WEIGHT = 1.0;
+  private readonly NGRAM_WEIGHT = 0.35;
+  constructor(dim = 512) { this.dim = dim; }
   async embed(text: string): Promise<number[]> {
     const tokens = tokenize(text);
     if (tokens.length === 0) return new Array(this.dim).fill(0);
+
+    const v = new Array<number>(this.dim).fill(0);
+
+    // Track term frequency over WORDS for log-tf scaling
     const tf = new Map<string, number>();
     for (const t of tokens) tf.set(t, (tf.get(t) ?? 0) + 1);
-    const v = new Array<number>(this.dim).fill(0);
+    const docLen = Math.max(1, tokens.length);
+
+    // ── Word-token features ─────────────────────────────────────────
     for (const [tok, c] of tf) {
-      // Two hash buckets per token (reduces collisions on small dim)
-      const b1 = hashTo(this.dim, tok);
-      const b2 = hashTo(this.dim, tok + ":signed");
-      const weight = (1 + Math.log(c)) / Math.sqrt(tokens.length);
-      v[b1] += weight;
-      v[b2] -= weight * 0.5;
+      const weight = this.TOKEN_WEIGHT * (1 + Math.log(c)) / Math.sqrt(docLen);
+      // Three signed hash functions reduce collision lifetime in cosine.
+      v[hashTo(this.dim, tok, "h1")] += weight;
+      v[hashTo(this.dim, tok, "h2")] -= weight * 0.6;
+      v[hashTo(this.dim, tok, "h3")] += weight * 0.4;
     }
+
+    // ── Character-3gram features (catches partial / acronym matches) ──
+    const ngramTf = new Map<string, number>();
+    for (const tok of tokens) {
+      for (const ng of charNgrams(tok, 3)) {
+        ngramTf.set(ng, (ngramTf.get(ng) ?? 0) + 1);
+      }
+    }
+    const ngramDocLen = Math.max(1, [...ngramTf.values()].reduce((a, b) => a + b, 0));
+    for (const [ng, c] of ngramTf) {
+      const weight = this.NGRAM_WEIGHT * (1 + Math.log(c)) / Math.sqrt(ngramDocLen);
+      v[hashTo(this.dim, ng, "n1")] += weight;
+      v[hashTo(this.dim, ng, "n2")] -= weight * 0.5;
+    }
+
     return norm(v);
   }
 }
@@ -117,7 +170,8 @@ export function pickEmbedder(): Embedder {
   if (key && key.length > 10) {
     try { return new OpenAIEmbedder(key); } catch { /* fallback */ }
   }
-  return new LocalHashEmbedder(256);
+  // Default: v2 local-hash embedder, 512 dims, char-3gram + signed hashes.
+  return new LocalHashEmbedder(512);
 }
 
 // ── Vector store (sqlite) ─────────────────────────────────────────────
@@ -210,9 +264,12 @@ export async function vectorSearch(
   limit = 20,
 ): Promise<VectorSearchHit[]> {
   const qv = await embedder.embed(query);
-  // Pull all rows for this owner (small N for v2.0; sqlite-vec arrives v2.1 if needed)
-  const rows = vdb().prepare(`SELECT * FROM vectors WHERE owner = ? AND embedder = ?`)
-    .all(owner, embedder.name) as any[];
+  // Filter by current embedder name + dim. If rows exist under a different
+  // embedder name (i.e. the user upgraded mema without reindexing), the query
+  // will return 0 — but countStaleVectors() surfaces the mismatch via the
+  // /v2/vector/health endpoint so operators see a clear "reindex needed" signal.
+  const rows = vdb().prepare(`SELECT * FROM vectors WHERE owner = ? AND embedder = ? AND dim = ?`)
+    .all(owner, embedder.name, embedder.dim) as any[];
   const scored: VectorSearchHit[] = [];
   for (const r of rows) {
     const v: number[] = JSON.parse(r.vec);
@@ -221,6 +278,30 @@ export async function vectorSearch(
   }
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, limit);
+}
+
+// Detect stale vectors from a previous embedder. Used to warn operators after
+// an upgrade that they should run /v2/vector/reindex before relying on
+// semantic recall.
+export function vectorIndexHealth(currentEmbedder: Embedder): {
+  current_rows: number;
+  stale_rows: number;
+  stale_embedders: string[];
+  needs_reindex: boolean;
+} {
+  const current = vdb().prepare(
+    `SELECT COUNT(*) as n FROM vectors WHERE embedder = ? AND dim = ?`
+  ).get(currentEmbedder.name, currentEmbedder.dim) as { n: number };
+  const stale = vdb().prepare(
+    `SELECT embedder, COUNT(*) as n FROM vectors WHERE NOT (embedder = ? AND dim = ?) GROUP BY embedder`
+  ).all(currentEmbedder.name, currentEmbedder.dim) as { embedder: string; n: number }[];
+  const stale_rows = stale.reduce((s, r) => s + r.n, 0);
+  return {
+    current_rows: current.n,
+    stale_rows,
+    stale_embedders: stale.map(s => s.embedder),
+    needs_reindex: stale_rows > 0 && current.n === 0,
+  };
 }
 
 // Reindex the entire vault. Walks v2 storage directories + v1 vault. Idempotent.
