@@ -17,8 +17,8 @@
   "showOrphans": true,
   "collapse-color-groups": false,
   "colorGroups": [
-    { "query": "path:episodes/",     "color": { "a": 1, "rgb": 6750924  } },
-    { "query": "path:facts/",        "color": { "a": 1, "rgb": 16763494 } },
+    { "query": "path:episodes/",     "color": { "a": 1, "rgb": 6737100  } },
+    { "query": "path:facts/",        "color": { "a": 1, "rgb": 16764006 } },
     { "query": "path:cognitive/",    "color": { "a": 1, "rgb": 13408767 } },
     { "query": "path:v2-entities/",  "color": { "a": 1, "rgb": 10079385 } },
     { "query": "path:generalized/",  "color": { "a": 1, "rgb": 14329120 } },
