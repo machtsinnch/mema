@@ -832,6 +832,68 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     return c.json(result);
   });
 
+  // v2.11.0+ — Two-channel recall for Memory Packet Compiler consumers.
+  //
+  // Returns evidence_channel (episodes only) and memory_channel
+  // (facts + cognitive + entities) as SEPARATE retrieval pools. The
+  // fundamental v2.10.6 ablation bug was that a single shared top-K pool
+  // let fact/cognitive hits displace gold episodes from the answer
+  // context. Two-channel retrieval forbids that displacement by design.
+  //
+  // The downstream MemoryPacket compiler (src/v2/memory-packet.ts)
+  // consumes this shape directly. Callers that want the legacy single-
+  // pool behavior keep using /v2/recall.
+  app.post("/v2/recall/packet", async c => {
+    const parsed = await parseBody<{
+      query: string;
+      purpose: string;
+      temporal?: { valid_at?: string };
+      limit_evidence?: number;  // top-K episodes (default 10)
+      limit_memory?: number;    // top-K facts+cognitive+entities (default 20)
+      use_vector?: boolean;
+      jurisdiction?: string;
+      model?: {
+        model?: string;
+        model_region?: string;
+        deployment?: "local" | "cloud";
+        human_review?: boolean;
+        approved_models?: string[];
+      };
+      policy_mode?: "permissive" | "strict";
+      fusion?: "weighted" | "rrf";
+    }>(c);
+    if (!parsed.ok) return parsed.response;
+    const owner = c.get("owner");
+    const actor = c.get("actor");
+    const base = { ...parsed.body, owner, actor };
+    const evidenceLimit = parsed.body.limit_evidence ?? 10;
+    const memoryLimit = parsed.body.limit_memory ?? 20;
+
+    // Two independent recall calls — no shared top-K, no displacement.
+    const [evidenceResult, memoryResult] = await Promise.all([
+      recall(cfg.vaultRoot, {
+        ...base,
+        kinds: ["episode"],
+        limit: evidenceLimit,
+      }),
+      recall(cfg.vaultRoot, {
+        ...base,
+        kinds: ["fact", "cognitive", "entity"],
+        limit: memoryLimit,
+      }),
+    ]);
+
+    return c.json({
+      query: parsed.body.query,
+      actor,
+      purpose: parsed.body.purpose,
+      evidence_channel: evidenceResult.hits,
+      memory_channel: memoryResult.hits,
+      evidence_audit_id: evidenceResult.audit_id,
+      memory_audit_id: memoryResult.audit_id,
+    });
+  });
+
   // ── Layer 7: Verifiable Memory Assets ────────────────────────────
   // Wrap a record file as an asset (compute hashes, mint UAL, version it).
   app.post("/v2/asset/wrap", async c => {
