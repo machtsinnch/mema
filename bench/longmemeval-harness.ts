@@ -139,7 +139,17 @@ function parseArgs(): Args {
     judgeModel: String(flags["judge-model"] ?? process.env.OLLAMA_JUDGE_MODEL ?? "llama3.1:8b"),
     ollamaHost: String(flags["ollama-host"] ?? process.env.OLLAMA_HOST ?? "http://localhost:11434"),
     topK: flags["top-k"] ? Number(flags["top-k"]) : 10,
-    contextChars: flags["context-chars"] ? Number(flags["context-chars"]) : 4000,
+    // v2.10.3+ — DEFAULT bumped from 6,000 → 200,000 chars (~50K tokens).
+    // Root-causing the 8% multi-session collapse on the v2.10.0 baseline
+    // showed the prior 6K cap was throwing away 81% of the haystack on
+    // multi-session/temporal-reasoning categories (median haystacks are
+    // 30K+ chars). The LongMemEval paper recommends 20K+ tokens for
+    // GPT-4o-class readers; the official harness uses ~126K tokens for
+    // GPT-4o. We were 80x below the recommended budget, hobbling Claude
+    // Opus 4.7 (which has a 1M-token context window). 200K chars ≈ 50K
+    // tokens — comfortably above the paper's recommendation, comfortably
+    // below Claude's window.
+    contextChars: flags["context-chars"] ? Number(flags["context-chars"]) : 200000,
     retrievalMode: (flags["retrieval-mode"] ? String(flags["retrieval-mode"]) : "hybrid") as Args["retrievalMode"],
     fusion: (flags["fusion"] ? String(flags["fusion"]) : "weighted") as Args["fusion"],
     answerBackend: (flags["answer-backend"] ? String(flags["answer-backend"]) : "ollama") as AnswerBackend,
