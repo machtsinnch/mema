@@ -68,6 +68,10 @@ interface Args {
   // already authenticated.
   answerBackend: AnswerBackend;
   judgeBackend: AnswerBackend;
+  // v2.10.1+ — sample balanced across categories instead of taking the
+  // first N from the file (the LongMemEval oracle is ordered by category,
+  // so a plain --limit N=100 misses 5 of 6 categories).
+  balanced: boolean;
 }
 
 interface ChatTurn { role: string; content: string }
@@ -135,6 +139,7 @@ function parseArgs(): Args {
     fusion: (flags["fusion"] ? String(flags["fusion"]) : "weighted") as Args["fusion"],
     answerBackend: (flags["answer-backend"] ? String(flags["answer-backend"]) : "ollama") as AnswerBackend,
     judgeBackend: (flags["judge-backend"] ? String(flags["judge-backend"]) : (flags["answer-backend"] ? String(flags["answer-backend"]) : "ollama")) as AnswerBackend,
+    balanced: !!flags["balanced"],
   };
 }
 
@@ -650,7 +655,23 @@ async function main() {
   const raw = JSON.parse(readFileSync(args.data, "utf8")) as LMERecord[];
   let questions = raw;
   if (args.category) questions = questions.filter(q => q.question_type === args.category);
-  questions = questions.slice(0, args.limit);
+  if (args.balanced && !args.category) {
+    // Group by category, take ceil(limit/categoryCount) from each, then
+    // truncate to exactly args.limit (preserving even spread).
+    const byCat = new Map<string, LMERecord[]>();
+    for (const q of questions) {
+      const arr = byCat.get(q.question_type) ?? [];
+      arr.push(q);
+      byCat.set(q.question_type, arr);
+    }
+    const cats = [...byCat.keys()];
+    const perCat = Math.ceil(args.limit / cats.length);
+    const picked: LMERecord[] = [];
+    for (const c of cats) picked.push(...(byCat.get(c) ?? []).slice(0, perCat));
+    questions = picked.slice(0, args.limit);
+  } else {
+    questions = questions.slice(0, args.limit);
+  }
   console.log(`Running ${questions.length} question(s)...`);
 
   const results: ScoredQuestion[] = [];
