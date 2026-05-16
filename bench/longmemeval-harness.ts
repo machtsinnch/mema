@@ -43,6 +43,8 @@
 import { readFileSync, existsSync } from "node:fs";
 import { pickExtractor } from "../src/v2/llm-extractor";
 
+type AnswerBackend = "ollama" | "claude" | "codex";
+
 interface Args {
   data: string;
   api: string;
@@ -56,16 +58,16 @@ interface Args {
   ollamaHost: string;
   topK: number;
   contextChars: number;     // truncate context packet for the answer prompt
-  // v2.10.0+ ablation switches (NEW — closes v3.0 comparison criterion).
-  // retrieval mode toggles how the recall context is built per question:
-  //   - hybrid      : current mema /v2/recall (keyword + vector + graph + ...)
-  //   - bm25        : keyword-only baseline (mema with use_vector=false)
-  //   - vector      : vector-only baseline (no keyword/title/graph signals)
-  //   - full-context: dump ALL haystack sessions into the answer prompt
-  //                   (oracle upper bound on answer accuracy; tests pure
-  //                   reading/reasoning capability of the judge LLM)
   retrievalMode: "hybrid" | "bm25" | "vector" | "full-context";
-  fusion: "weighted" | "rrf";   // forwarded to /v2/recall as query.fusion
+  fusion: "weighted" | "rrf";
+  // v2.10.1+ answer/judge LLM backend (NEW — closes "apples-to-apples vs
+  // Zep/Hindsight" gap). Default backends remain ollama (free, slow,
+  // weaker reasoning). claude shells out to the locally-authenticated
+  // claude CLI (Claude Opus by default); codex shells out to the codex
+  // CLI (GPT-5.x by default). No API keys needed when the CLIs are
+  // already authenticated.
+  answerBackend: AnswerBackend;
+  judgeBackend: AnswerBackend;
 }
 
 interface ChatTurn { role: string; content: string }
@@ -131,6 +133,8 @@ function parseArgs(): Args {
     contextChars: flags["context-chars"] ? Number(flags["context-chars"]) : 4000,
     retrievalMode: (flags["retrieval-mode"] ? String(flags["retrieval-mode"]) : "hybrid") as Args["retrievalMode"],
     fusion: (flags["fusion"] ? String(flags["fusion"]) : "weighted") as Args["fusion"],
+    answerBackend: (flags["answer-backend"] ? String(flags["answer-backend"]) : "ollama") as AnswerBackend,
+    judgeBackend: (flags["judge-backend"] ? String(flags["judge-backend"]) : (flags["answer-backend"] ? String(flags["answer-backend"]) : "ollama")) as AnswerBackend,
   };
 }
 
@@ -226,13 +230,77 @@ async function callOllama(host: string, model: string, prompt: string, timeoutMs
   finally { clearTimeout(t); }
 }
 
+// v2.10.1+ — shell out to the locally-authenticated Claude Code CLI.
+// Uses `--print` (-p) for non-interactive mode. Hook errors are emitted
+// to stderr (some hooks lack +x); we redirect them so they don't pollute
+// the answer. No API key required if the CLI is already logged in.
+async function callClaudeCLI(prompt: string, timeoutMs = 120000): Promise<string | null> {
+  try {
+    const proc = Bun.spawn(["claude", "-p", prompt], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: process.env,
+    });
+    const decoder = new TextDecoder();
+    // Race against timeout; kill the process if it stalls.
+    const watchdog = setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs);
+    const [out] = await Promise.all([
+      (async () => decoder.decode(await new Response(proc.stdout).arrayBuffer()))(),
+      proc.exited,
+    ]);
+    clearTimeout(watchdog);
+    // Strip post-response hook noise lines if any made it into stdout.
+    const cleaned = out
+      .split("\n")
+      .filter(l => !l.includes("hook [") && !l.includes("Permission denied"))
+      .join("\n")
+      .trim();
+    return cleaned || null;
+  } catch { return null; }
+}
+
+// v2.10.1+ — shell out to the codex CLI. `--output-last-message <file>`
+// writes ONLY the final assistant text to a file, so we don't have to
+// parse the formatted session log. --skip-git-repo-check avoids the
+// trust-directory prompt for non-interactive runs.
+async function callCodexCLI(prompt: string, timeoutMs = 180000): Promise<string | null> {
+  const outPath = `/tmp/codex-out-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    const proc = Bun.spawn([
+      "codex", "exec",
+      "--skip-git-repo-check",
+      "--output-last-message", outPath,
+      prompt,
+    ], {
+      stdout: "ignore",
+      stderr: "pipe",
+      env: process.env,
+    });
+    const watchdog = setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs);
+    await proc.exited;
+    clearTimeout(watchdog);
+    try {
+      const text = await Bun.file(outPath).text();
+      return text.trim() || null;
+    } finally {
+      try { await Bun.file(outPath).unlink(); } catch {}
+    }
+  } catch { return null; }
+}
+
+async function callBackend(backend: AnswerBackend, args: Args, model: string, prompt: string, timeoutMs?: number): Promise<string | null> {
+  if (backend === "claude") return callClaudeCLI(prompt, timeoutMs ?? 120000);
+  if (backend === "codex") return callCodexCLI(prompt, timeoutMs ?? 180000);
+  return callOllama(args.ollamaHost, model, prompt, timeoutMs ?? 60000);
+}
+
 async function generateAnswer(
   args: Args,
   question: string,
   context: string,
 ): Promise<{ answer: string; ms: number }> {
   const t = Date.now();
-  const a = await callOllama(args.ollamaHost, args.judgeModel, ANSWER_PROMPT(question, context), 60000);
+  const a = await callBackend(args.answerBackend, args, args.judgeModel, ANSWER_PROMPT(question, context));
   return { answer: (a ?? "no answer").slice(0, 500), ms: Date.now() - t };
 }
 
@@ -250,7 +318,7 @@ async function judgeAnswer(
     return { score: ok ? 1 : 0, reason: ok ? "substring-match" : "substring-miss", ms: Date.now() - t };
   }
   if (args.judge === "llm") {
-    const verdict = await callOllama(args.ollamaHost, args.judgeModel, JUDGE_PROMPT(question, gold, predicted), 60000);
+    const verdict = await callBackend(args.judgeBackend, args, args.judgeModel, JUDGE_PROMPT(question, gold, predicted));
     const v = (verdict ?? "").toUpperCase();
     const correct = v.startsWith("CORRECT");
     return { score: correct ? 1 : 0, reason: (verdict ?? "judge-no-response").slice(0, 200), ms: Date.now() - t };
@@ -535,7 +603,7 @@ async function main() {
   console.log(`  top-K:    ${args.topK}`);
   console.log(`  Mode:     retrieval=${args.retrievalMode}  fusion=${args.fusion}`);
   console.log(`  Extract:  ${args.extract ? "yes (LLM-extracted drafts then auto-review)" : "no (retrieval-only)"}`);
-  console.log(`  Judge:    ${args.judge}${args.judge !== "none" ? ` (model=${args.judgeModel})` : ""}`);
+  console.log(`  Judge:    ${args.judge}${args.judge !== "none" ? ` answer-backend=${args.answerBackend} judge-backend=${args.judgeBackend}` : ""}`);
   console.log("");
 
   if (!existsSync(args.data)) {
