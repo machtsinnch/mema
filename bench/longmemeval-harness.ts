@@ -42,6 +42,13 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { pickExtractor } from "../src/v2/llm-extractor";
+import {
+  buildMemoryPacket,
+  compilePacketToPrompt,
+  compilePacketAsZepFormat,
+  type TwoChannelHits,
+} from "../src/v2/memory-packet";
+import type { RetrievalHit } from "../src/v2/types";
 
 // v2.10.6+ — Claude/Codex CLI extractors for bench runs (Ollama
 // llama3.1:8b at ~30s/session is too slow and quality-bottlenecks the
@@ -128,6 +135,28 @@ interface Args {
   // ablation asks for "episode-only vs episode+fact+cognitive" so the
   // gain from extraction + reflection is measurable separately.
   kinds: ("episode" | "fact" | "cognitive" | "entity")[];
+  // Pre-2.11 fields previously set by parseArgs but missing from this
+  // interface — declared here for type completeness.
+  saveResults: string | null;
+  extractorBackend: "ollama" | "claude" | "codex";
+  // v2.11.0+ — context-compilation mode for the answer prompt.
+  //   episode-only    — only the evidence channel reaches the answer LLM.
+  //                     Matches v2.10.5 baseline (83.0% LongMemEval).
+  //   flat-mixed      — sectioned packet from iter-1 (markdown headers,
+  //                     no two-channel separation). The "current bad
+  //                     architecture" reference for the bench.
+  //   memory-packet   — MemoryPacket compiler + two-channel retrieval +
+  //                     XML/inline-hints renderer + mema extensions
+  //                     (CURRENT_STATE, CONFLICTS, UNCERTAINTY, INSTRUCTIONS).
+  //                     The headline v2.11 mode.
+  //   routed-packet   — memory-packet with answer-strategy classifier
+  //                     applied per question (v2.11 routing is rule-based;
+  //                     LLM classifier deferred to v2.12).
+  //   zep-format      — same hits, Zep's exact format (FACTS / ENTITIES /
+  //                     EPISODES) with NO mema extensions. The control
+  //                     variant — if memory-packet >= zep-format on bench,
+  //                     our extensions earn their keep.
+  contextMode: "episode-only" | "flat-mixed" | "memory-packet" | "routed-packet" | "zep-format";
 }
 
 // v2.11.0+ — recall response hit, mirroring src/v2/types.ts RetrievalHit.
@@ -236,6 +265,10 @@ function parseArgs(): Args {
     kinds: (flags["kinds"] ? String(flags["kinds"]).split(",") : ["episode"]) as Args["kinds"],
     saveResults: flags["save-results"] ? String(flags["save-results"]) : null,
     extractorBackend: (flags["extractor-backend"] ? String(flags["extractor-backend"]) : "ollama") as Args["extractorBackend"],
+    // v2.11.0+ context-compilation mode. Default "flat-mixed" keeps the
+    // iter-1 v2.11.0-rc.1 behavior for back-compat. The new headline mode
+    // is "memory-packet" (compiler + two-channel retrieval + XML format).
+    contextMode: (flags["context-mode"] ? String(flags["context-mode"]) : "flat-mixed") as Args["contextMode"],
   };
 }
 
@@ -571,34 +604,68 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
     }
   }
 
-  // 3. Recall — v2.10.0+ ablation-aware. The retrieval-mode switch
-  //    routes the question through one of four pipelines so we can
-  //    publish apples-to-apples ablations alongside the mema number.
-  // v2.11.0+ — capture the FULL hit objects (kind + id + payload + excerpt)
-  //    instead of throwing away everything but the id. The pre-2.11 harness
-  //    silently dropped fact/cognitive/entity hits from the context packet:
-  //    the `idToSession` map only had episode→session mappings, so non-episode
-  //    hit IDs returned `undefined` from sidToContent and `continue`-d out.
-  //    That made the v2.10.6 "architecture ablation" methodologically
-  //    invalid — the answer LLM only ever saw episode session text even when
-  //    --kinds episode,fact,cognitive was requested. Fix: keep per-kind hits
-  //    separately and build a proper sectioned context packet below.
+  // 3. Recall — v2.11.0+ mode-aware dispatch.
+  //
+  // contextMode dictates retrieval shape:
+  //   episode-only     — single /v2/recall, kinds=["episode"]
+  //   flat-mixed       — single /v2/recall, kinds=args.kinds (the iter-1
+  //                      sectioned-packet baseline; the "bad architecture"
+  //                      reference for the bench)
+  //   memory-packet    — /v2/recall/packet (two channels, no displacement)
+  //   routed-packet    — /v2/recall/packet + answer-strategy routing
+  //   zep-format       — /v2/recall/packet (same hits, Zep-format render)
   const t1 = Date.now();
   let retrievedSessions: string[] = [];
   let factHits: RecallHit[] = [];
   let cognitiveHits: RecallHit[] = [];
   let entityHits: RecallHit[] = [];
+  let twoChannelHits: TwoChannelHits | null = null;
+
+  const useTwoChannel =
+    args.contextMode === "memory-packet" ||
+    args.contextMode === "routed-packet" ||
+    args.contextMode === "zep-format";
 
   if (args.retrievalMode === "full-context") {
     // Oracle upper bound: every haystack session in order is "retrieved".
-    // The answer-generation step still gets capped by --context-chars.
     retrievedSessions = [...rec.haystack_session_ids];
+  } else if (useTwoChannel) {
+    // Two-channel retrieval — evidence (episodes) + memory (facts/cog/ent)
+    // returned as independent pools. No shared top-K, no displacement.
+    const useVector = args.retrievalMode === "vector" || args.retrievalMode === "hybrid";
+    const recallRes = await apiOwner("/v2/recall/packet", {
+      query: rec.question,
+      purpose: `longmemeval_${args.contextMode}_${args.fusion}`,
+      limit_evidence: args.topK,
+      limit_memory: Math.max(args.topK * 2, 20),
+      use_vector: useVector,
+      fusion: args.fusion,
+    });
+    if (recallRes.ok) {
+      const rj = await recallRes.json() as {
+        evidence_channel: RetrievalHit[];
+        memory_channel: RetrievalHit[];
+      };
+      twoChannelHits = {
+        evidence_channel: rj.evidence_channel,
+        memory_channel: rj.memory_channel,
+      };
+      // Map episode hits → session IDs for the Hit@K scoring.
+      const idToSession = new Map<string, string>();
+      for (const [sid, eid] of sessionToEpisode) idToSession.set(eid, sid);
+      retrievedSessions = rj.evidence_channel
+        .filter(h => h.kind === "episode")
+        .map(h => idToSession.get(h.id) ?? h.id);
+    }
   } else {
+    // Single-pool recall (episode-only or flat-mixed modes).
+    const effectiveKinds =
+      args.contextMode === "episode-only" ? ["episode"] : args.kinds;
     const useVector = args.retrievalMode === "vector" || args.retrievalMode === "hybrid";
     const recallRes = await apiOwner("/v2/recall", {
       query: rec.question,
-      purpose: `longmemeval_${args.retrievalMode}_${args.fusion}_${args.kinds.join("+")}`,
-      kinds: args.kinds,
+      purpose: `longmemeval_${args.contextMode}_${args.fusion}_${effectiveKinds.join("+")}`,
+      kinds: effectiveKinds,
       limit: args.topK,
       use_vector: useVector,
       fusion: args.fusion,
@@ -607,23 +674,12 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
       const rj = await recallRes.json() as { hits: RecallHit[] };
       const idToSession = new Map<string, string>();
       for (const [sid, eid] of sessionToEpisode) idToSession.set(eid, sid);
-      // Episode hits → session IDs (for scoreHits against gold answer_session_ids).
-      // Non-episode hits cannot map to sessions; they're rendered into their
-      // own packet sections below and do NOT participate in Hit@K scoring
-      // (which is correct — gold is defined as the answer-bearing sessions).
       retrievedSessions = rj.hits
         .filter(h => h.kind === "episode")
         .map(h => idToSession.get(h.id) ?? h.id);
       factHits = rj.hits.filter(h => h.kind === "fact" && h.payload);
       cognitiveHits = rj.hits.filter(h => h.kind === "cognitive" && h.payload?.content);
       entityHits = rj.hits.filter(h => h.kind === "entity" && h.payload);
-    }
-    if (args.retrievalMode === "vector") {
-      // Vector-only ablation: drop keyword-anchored hits by re-querying
-      // with a vector-only purpose label — recall() doesn't currently
-      // expose a pure-vector mode, so this is best-effort. Marked
-      // explicitly in the output so the reader knows the caveat.
-      // (Pure-vector ablation requires a future query.vector_only flag.)
     }
   }
   const recallMs = Date.now() - t1;
@@ -639,25 +695,18 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
   let answerMs: number | undefined;
   let judgeMs: number | undefined;
 
-  // v2.10.4+ (per third-party troubleshoot diagnostic):
-  //   - Sort retrieved sessions by haystack_date ASCENDING (chronological)
-  //     instead of retrieval-rank order. Temporal + multi-session reasoning
-  //     requires a timeline, not a relevance ranking.
-  //   - Pass question_date through to the answer prompt so temporal "now"
-  //     questions are answerable.
-  // v2.11.0+ — proper memory-packet construction. Four sections:
-  //   1. # APPROVED FACTS — facts sorted by valid_from, invalidations inline
-  //   2. # COGNITIVE BELIEFS — cognitive content with kind label
-  //   3. # ENTITIES — name (type), aliases
-  //   4. # EVIDENCE TIMELINE — episode session text, chronological
-  // The non-episode sections share ~25% of contextChars (any unused budget
-  // rolls back to the evidence timeline). This is the fix for the silent-drop
-  // bug that invalidated the v2.10.6 ablation.
+  // v2.10.4+: chronological ordering by haystack_date for the evidence
+  // timeline. v2.11.0+: contextMode dispatches the rendering strategy.
   const hasAnyContent =
     retrievedSessions.length > 0 ||
     factHits.length > 0 ||
     cognitiveHits.length > 0 ||
-    entityHits.length > 0;
+    entityHits.length > 0 ||
+    (twoChannelHits !== null && (
+      twoChannelHits.evidence_channel.length > 0 ||
+      twoChannelHits.memory_channel.length > 0
+    ));
+
   if (args.judge !== "none" && hasAnyContent) {
     const sidToContent = new Map<string, string>();
     const sidToDate = new Map<string, string>();
@@ -667,15 +716,78 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
       sidToDate.set(sid, rec.haystack_dates[i] ?? "");
     }
 
-    const ctxParts: string[] = [];
-    const totalBudget = args.contextChars;
-    // Reserve up to 25% of context for non-episode sections. If fewer
-    // chars are used, the remainder rolls back to the evidence timeline.
-    const nonEpisodeReserve = Math.floor(totalBudget * 0.25);
-    let nonEpUsed = 0;
+    let ctx = "";
 
-    // ── Section 1: APPROVED FACTS ─────────────────────────────────
-    if (factHits.length > 0) {
+    // ── modes memory-packet / routed-packet / zep-format ─────────────
+    if (twoChannelHits !== null && (
+      args.contextMode === "memory-packet" ||
+      args.contextMode === "routed-packet" ||
+      args.contextMode === "zep-format"
+    )) {
+      // Map episode hit id → session content + date for the raw-excerpts section.
+      const idToSession = new Map<string, string>();
+      for (const [sid, eid] of sessionToEpisode) idToSession.set(eid, sid);
+      const rawSessionText = new Map<string, { date?: string; text: string }>();
+      for (const h of twoChannelHits.evidence_channel) {
+        const sid = idToSession.get(h.id);
+        if (!sid) continue;
+        const text = sidToContent.get(sid);
+        const date = sidToDate.get(sid);
+        if (text) rawSessionText.set(h.id, { ...(date ? { date } : {}), text });
+      }
+
+      const packet = buildMemoryPacket({
+        query: rec.question,
+        question_date: rec.question_date,
+        // routed-packet uses the LongMemEval category to pick a strategy.
+        // memory-packet and zep-format use the rule classifier (or default).
+        ...(args.contextMode === "routed-packet"
+          ? { question_type: rec.question_type }
+          : {}),
+        hits: twoChannelHits,
+        raw_session_text: rawSessionText,
+      });
+
+      // mode E (zep-format) renders the SAME packet without mema extensions.
+      ctx = args.contextMode === "zep-format"
+        ? compilePacketAsZepFormat(packet)
+        : compilePacketToPrompt(packet, { budget: args.contextChars });
+
+      // Defensive cap for the zep-format renderer (which doesn't budget itself).
+      if (ctx.length > args.contextChars) ctx = ctx.slice(0, args.contextChars);
+    }
+
+    // ── mode episode-only ────────────────────────────────────────────
+    else if (args.contextMode === "episode-only") {
+      const ctxParts: string[] = [];
+      const topKRetrieved = retrievedSessions.slice(0, args.topK);
+      const chronological = [...topKRetrieved].sort((a, b) => {
+        const da = sidToDate.get(a) ?? "";
+        const db = sidToDate.get(b) ?? "";
+        return da.localeCompare(db);
+      });
+      let budget = args.contextChars;
+      for (const sid of chronological) {
+        const part = sidToContent.get(sid);
+        if (!part) continue;
+        const slice = part.slice(0, Math.max(0, budget));
+        if (!slice) break;
+        ctxParts.push(slice);
+        budget -= slice.length;
+        if (budget <= 0) break;
+      }
+      ctx = ctxParts.join("\n\n---\n\n");
+    }
+
+    // ── mode flat-mixed (iter-1 sectioned packet, the "bad architecture" ref) ─
+    else {
+      const ctxParts: string[] = [];
+      const totalBudget = args.contextChars;
+      const nonEpisodeReserve = Math.floor(totalBudget * 0.25);
+      let nonEpUsed = 0;
+
+      // ── Section 1: APPROVED FACTS ─────────────────────────────────
+      if (factHits.length > 0) {
       const sorted = [...factHits].sort((a, b) => {
         const va = a.payload?.valid_from ?? "";
         const vb = b.payload?.valid_from ?? "";
@@ -738,33 +850,35 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
       }
     }
 
-    // ── Section 4: EVIDENCE TIMELINE (episodes, chronological) ────
-    // Episode budget = full budget MINUS what non-episode sections actually used.
-    // (Unused non-episode reserve rolls back to episodes.)
-    if (retrievedSessions.length > 0) {
-      const topKRetrieved = retrievedSessions.slice(0, args.topK);
-      const chronological = [...topKRetrieved].sort((a, b) => {
-        const da = sidToDate.get(a) ?? "";
-        const db = sidToDate.get(b) ?? "";
-        return da.localeCompare(db);
-      });
-      const header = "# EVIDENCE TIMELINE";
-      let epBudget = totalBudget - nonEpUsed - header.length;
-      if (epBudget > 0) {
-        ctxParts.push(header);
-        for (const sid of chronological) {
-          const part = sidToContent.get(sid);
-          if (!part) continue;
-          const slice = part.slice(0, Math.max(0, epBudget));
-          if (!slice) break;
-          ctxParts.push(slice);
-          epBudget -= slice.length;
-          if (epBudget <= 0) break;
+      // ── Section 4: EVIDENCE TIMELINE (episodes, chronological) ────
+      // Episode budget = full budget MINUS what non-episode sections actually used.
+      // (Unused non-episode reserve rolls back to episodes.)
+      if (retrievedSessions.length > 0) {
+        const topKRetrieved = retrievedSessions.slice(0, args.topK);
+        const chronological = [...topKRetrieved].sort((a, b) => {
+          const da = sidToDate.get(a) ?? "";
+          const db = sidToDate.get(b) ?? "";
+          return da.localeCompare(db);
+        });
+        const header = "# EVIDENCE TIMELINE";
+        let epBudget = totalBudget - nonEpUsed - header.length;
+        if (epBudget > 0) {
+          ctxParts.push(header);
+          for (const sid of chronological) {
+            const part = sidToContent.get(sid);
+            if (!part) continue;
+            const slice = part.slice(0, Math.max(0, epBudget));
+            if (!slice) break;
+            ctxParts.push(slice);
+            epBudget -= slice.length;
+            if (epBudget <= 0) break;
+          }
         }
       }
+
+      ctx = ctxParts.join("\n\n---\n\n");
     }
 
-    const ctx = ctxParts.join("\n\n---\n\n");
     const gen = await generateAnswer(args, rec.question, ctx || "(no retrieved context)", rec.question_date);
     predictedAnswer = gen.answer;
     answerMs = gen.ms;
@@ -857,7 +971,7 @@ async function main() {
   console.log(`  Owner:    ${args.owner}_<question_id>`);
   console.log(`  Limit:    ${args.limit}${args.category ? ` (category=${args.category})` : ""}`);
   console.log(`  top-K:    ${args.topK}`);
-  console.log(`  Mode:     retrieval=${args.retrievalMode}  fusion=${args.fusion}  kinds=${args.kinds.join("+")}`);
+  console.log(`  Mode:     retrieval=${args.retrievalMode}  fusion=${args.fusion}  kinds=${args.kinds.join("+")}  context=${args.contextMode}`);
   console.log(`  Extract:  ${args.extract ? `yes (extractor-backend=${args.extractorBackend}, drafts then auto-review)` : "no (retrieval-only)"}`);
   console.log(`  Judge:    ${args.judge}${args.judge !== "none" ? ` answer-backend=${args.answerBackend} judge-backend=${args.judgeBackend}` : ""}`);
   console.log("");
