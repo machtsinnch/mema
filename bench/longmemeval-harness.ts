@@ -43,6 +43,57 @@
 import { readFileSync, existsSync } from "node:fs";
 import { pickExtractor } from "../src/v2/llm-extractor";
 
+// v2.10.6+ — Claude/Codex CLI extractors for bench runs (Ollama
+// llama3.1:8b at ~30s/session is too slow and quality-bottlenecks the
+// architecture ablation; CLI extractors do ~5-10s per session at much
+// higher precision/recall).
+const EXTRACTOR_SYSTEM = `You are a strict structured-fact extractor. You read a markdown document and extract:
+
+1. FACTS — explicit subject-predicate-object claims that the text directly states.
+2. ENTITIES — named referents (people, organizations, products, technical systems, places, important concepts).
+
+Rules:
+- Only extract claims explicit and verifiable from the text. Reject vague/hypothetical, metaphors, opinions-as-facts, fragments.
+- Predicates must be specific verbs: founded, owns, uses, rejected, supersedes, deploys_to, depends_on, is_a, located_in, reports_to, manages, supports, integrates_with, built_on. NEVER use is/has/at — too generic.
+- Subjects and objects must be ENTITIES (proper nouns / products / orgs), not pronouns or articles.
+- Reject facts where subject or object is a currency amount (CHF 22), a number/date alone, or a fragment.
+- Entity type ∈ {person, organization, product, system, place, concept, event}.
+- Confidence: 0.95 explicit, 0.85 clearly implied, ≤0.75 → don't emit.
+
+Output ONLY valid JSON, no prose, no markdown fences. Schema:
+{"facts": [{"subject":"...","predicate":"...","object":"...","confidence":0.95}], "entities": [{"name":"...","type":"..."}]}
+
+If zero extractable facts, return {"facts": [], "entities": []}.`;
+
+async function extractViaClaude(text: string): Promise<{ facts: any[]; entities: any[] }> {
+  const prompt = `${EXTRACTOR_SYSTEM}\n\nText:\n${text}`;
+  const r = await callClaudeCLI(prompt, 120000);
+  return parseExtractorJSON(r ?? "");
+}
+
+async function extractViaCodex(text: string): Promise<{ facts: any[]; entities: any[] }> {
+  const prompt = `${EXTRACTOR_SYSTEM}\n\nText:\n${text}`;
+  const r = await callCodexCLI(prompt, 180000);
+  return parseExtractorJSON(r ?? "");
+}
+
+function parseExtractorJSON(raw: string): { facts: any[]; entities: any[] } {
+  const stripped = raw.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+  try {
+    const j = JSON.parse(stripped);
+    if (j && Array.isArray(j.facts) && Array.isArray(j.entities)) return j;
+  } catch { /* fall through */ }
+  // Try to find a JSON object in the response
+  const m = raw.match(/\{[\s\S]*"facts"[\s\S]*"entities"[\s\S]*\}/);
+  if (m) {
+    try {
+      const j = JSON.parse(m[0]);
+      if (j && Array.isArray(j.facts) && Array.isArray(j.entities)) return j;
+    } catch { /* fall through */ }
+  }
+  return { facts: [], entities: [] };
+}
+
 type AnswerBackend = "ollama" | "claude" | "codex";
 
 interface Args {
@@ -159,6 +210,7 @@ function parseArgs(): Args {
     balanced: !!flags["balanced"],
     kinds: (flags["kinds"] ? String(flags["kinds"]).split(",") : ["episode"]) as Args["kinds"],
     saveResults: flags["save-results"] ? String(flags["save-results"]) : null,
+    extractorBackend: (flags["extractor-backend"] ? String(flags["extractor-backend"]) : "ollama") as Args["extractorBackend"],
   };
 }
 
@@ -426,13 +478,23 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
   let extractedFacts = 0, extractedEntities = 0;
   let approvedFacts = 0, rejectedFacts = 0;
   if (args.extract) {
-    const extractor = await pickExtractor();
+    // v2.10.6+ extractor-backend selection.
+    const ollamaExtractor = args.extractorBackend === "ollama" ? await pickExtractor() : null;
+    const extractorName = args.extractorBackend === "claude" ? "claude-cli"
+      : args.extractorBackend === "codex" ? "codex-cli"
+      : ollamaExtractor!.name;
     const AUTO_APPROVE_THRESHOLD = 0.9;
     for (const [sid, epId] of sessionToEpisode) {
       const body = sessionToContent(rec.haystack_sessions[rec.haystack_session_ids.indexOf(sid)], sid, "");
       let result;
       try {
-        result = await extractor.extract(body);
+        if (args.extractorBackend === "claude") {
+          result = await extractViaClaude(body);
+        } else if (args.extractorBackend === "codex") {
+          result = await extractViaCodex(body);
+        } else {
+          result = await ollamaExtractor!.extract(body);
+        }
       } catch { continue; }
       // Write entity drafts first.
       for (const e of result.entities) {
@@ -443,7 +505,7 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
             name, type: String(e.type ?? "concept"),
             status: "draft", derived_from: [epId],
             evidence_excerpt: body.slice(0, 400),
-            proposed_by: `lmebench:${extractor.name}`,
+            proposed_by: `lmebench:${extractorName}`,
           });
           extractedEntities++;
         } catch { /* dedup/etc */ }
@@ -463,7 +525,7 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
             confidence: Math.min(Math.max(conf, 0), 1),
             status: "draft",
             evidence_excerpt: body.slice(0, 500),
-            proposed_by: `lmebench:${extractor.name}`,
+            proposed_by: `lmebench:${extractorName}`,
           });
           if (r.ok) {
             const j = await r.json() as { fact: { id: string } };
@@ -658,7 +720,7 @@ async function main() {
   console.log(`  Limit:    ${args.limit}${args.category ? ` (category=${args.category})` : ""}`);
   console.log(`  top-K:    ${args.topK}`);
   console.log(`  Mode:     retrieval=${args.retrievalMode}  fusion=${args.fusion}  kinds=${args.kinds.join("+")}`);
-  console.log(`  Extract:  ${args.extract ? "yes (LLM-extracted drafts then auto-review)" : "no (retrieval-only)"}`);
+  console.log(`  Extract:  ${args.extract ? `yes (extractor-backend=${args.extractorBackend}, drafts then auto-review)` : "no (retrieval-only)"}`);
   console.log(`  Judge:    ${args.judge}${args.judge !== "none" ? ` answer-backend=${args.answerBackend} judge-backend=${args.judgeBackend}` : ""}`);
   console.log("");
 
