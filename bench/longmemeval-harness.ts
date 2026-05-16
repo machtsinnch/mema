@@ -410,7 +410,9 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
   let answerMs: number | undefined;
   let judgeMs: number | undefined;
 
-  if (args.judge !== "none" && recallRes.ok) {
+  // v2.10.0+ judge runs whenever we have retrieved (or oracle full-context)
+  // sessions — recallRes only existed when we went through the API path.
+  if (args.judge !== "none" && retrievedSessions.length > 0) {
     // Pull the retrieved sessions' content from rec.haystack_sessions by
     // session_id — no extra HTTP round-trip needed.
     const sidToContent = new Map<string, string>();
