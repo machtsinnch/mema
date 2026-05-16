@@ -102,15 +102,17 @@ interface ScoredQuestion {
   hit_at_1: boolean;
   hit_at_5: boolean;
   hit_at_10: boolean;
+  // v2.10.4+ stronger retrieval metrics (per diagnostic root cause #1).
+  all_gold_at_10: boolean;
+  coverage_at_10: number;
   ingest_ms: number;
   recall_ms: number;
   extracted_facts: number;
   extracted_entities: number;
   approved_facts: number;
   rejected_facts: number;
-  // v2.9.0+ answer-level scoring (P1 — judge layer).
   predicted_answer?: string;
-  judge_score?: number;     // 1 if judged correct, 0 otherwise
+  judge_score?: number;
   judge_reason?: string;
   answer_ms?: number;
   judge_ms?: number;
@@ -187,15 +189,28 @@ function sessionToContent(turns: ChatTurn[], sessionId: string, date: string): s
 // LongMemEval's evaluation uses session-level recall: retrieval succeeds when
 // any of the gold sessions are returned. We mirror that semantics: a hit is
 // any retrieved episode whose source session_id matches the gold list.
+// v2.10.4+ scoring (per third-party diagnostic root cause #1).
+// Hit@k = "any gold retrieved" is too weak for multi-session questions
+// where answering requires ALL gold sessions. We additionally report:
+//   - all_gold@k: did the top-k include EVERY gold session?
+//   - coverage@k: fraction of gold sessions retrieved in top-k (0..1)
+// Both expose the real metric for multi-session reasoning.
 function scoreHits(retrievedSessionIds: string[], gold: string[]): {
   hit_at_1: boolean; hit_at_5: boolean; hit_at_10: boolean;
+  all_gold_at_10: boolean;
+  coverage_at_10: number;
 } {
   const goldSet = new Set(gold);
-  const isHit = (slice: string[]) => slice.some(id => goldSet.has(id));
+  const isAnyHit = (slice: string[]) => slice.some(id => goldSet.has(id));
+  const top10 = retrievedSessionIds.slice(0, 10);
+  const top10Set = new Set(top10);
+  const goldInTop10 = gold.filter(g => top10Set.has(g)).length;
   return {
-    hit_at_1: isHit(retrievedSessionIds.slice(0, 1)),
-    hit_at_5: isHit(retrievedSessionIds.slice(0, 5)),
-    hit_at_10: isHit(retrievedSessionIds.slice(0, 10)),
+    hit_at_1: isAnyHit(retrievedSessionIds.slice(0, 1)),
+    hit_at_5: isAnyHit(retrievedSessionIds.slice(0, 5)),
+    hit_at_10: isAnyHit(top10),
+    all_gold_at_10: gold.length > 0 && goldInTop10 === gold.length,
+    coverage_at_10: gold.length > 0 ? goldInTop10 / gold.length : 0,
   };
 }
 
@@ -212,15 +227,30 @@ function scoreHits(retrievedSessionIds: string[], gold: string[]): {
 //   - llm: ask another model to score (predicted == gold semantically).
 //     Closer to LongMemEval's official protocol.
 
-const ANSWER_PROMPT = (question: string, context: string) =>
-  `You are a memory assistant. Use ONLY the context below to answer the question. If the context doesn't support an answer, say "no answer".
+// v2.10.4+ — prompt rewritten per third-party troubleshooting report.
+// Adds: (1) QUESTION_DATE so temporal questions have a reference point,
+// (2) explicit timeline-reasoning instruction for multi-session questions,
+// (3) chronological-context invariant so the model can trust the order.
+const ANSWER_PROMPT = (question: string, context: string, questionDate?: string) =>
+  `You are a long-term-memory assistant answering a question about past conversations.
+Use ONLY the context below. The context is a TIMELINE of past sessions, sorted CHRONOLOGICALLY (oldest first).
 
-CONTEXT:
+${questionDate ? `QUESTION_DATE: ${questionDate}
+Answer questions about "now" or "current" as of this date. Treat sessions after this date as future / not yet known.
+
+` : ""}CONTEXT (chronological timeline):
 ${context}
 
 QUESTION: ${question}
 
-Answer in one short sentence, or say "no answer".`;
+Reason internally using this structure (do NOT output the steps):
+  1. Identify which sessions / turns contain evidence.
+  2. For temporal or "current state" questions: pick the LATEST relevant statement AT OR BEFORE the QUESTION_DATE.
+  3. For multi-session counting / aggregation questions: enumerate every relevant item across all sessions.
+  4. For preference questions: infer the durable pattern from one or more concrete statements.
+  5. For knowledge-update questions: prefer the most recent statement over older contradicting statements.
+
+Return ONLY the final answer as a single short sentence, or say "no answer" if the context truly doesn't support one.`;
 
 const JUDGE_PROMPT = (question: string, gold: string, predicted: string) =>
   `You are a strict grading assistant for the LongMemEval benchmark. Decide if the predicted answer matches the gold answer SEMANTICALLY for the given question.
@@ -319,9 +349,10 @@ async function generateAnswer(
   args: Args,
   question: string,
   context: string,
+  questionDate?: string,
 ): Promise<{ answer: string; ms: number }> {
   const t = Date.now();
-  const a = await callBackend(args.answerBackend, args, args.judgeModel, ANSWER_PROMPT(question, context));
+  const a = await callBackend(args.answerBackend, args, args.judgeModel, ANSWER_PROMPT(question, context, questionDate));
   return { answer: (a ?? "no answer").slice(0, 500), ms: Date.now() - t };
 }
 
@@ -499,18 +530,31 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
   let answerMs: number | undefined;
   let judgeMs: number | undefined;
 
-  // v2.10.0+ judge runs whenever we have retrieved (or oracle full-context)
-  // sessions — recallRes only existed when we went through the API path.
+  // v2.10.4+ (per third-party troubleshoot diagnostic):
+  //   - Sort retrieved sessions by haystack_date ASCENDING (chronological)
+  //     instead of retrieval-rank order. Temporal + multi-session reasoning
+  //     requires a timeline, not a relevance ranking.
+  //   - Pass question_date through to the answer prompt so temporal "now"
+  //     questions are answerable.
+  //   - Same content-budget as before, just better ordered.
   if (args.judge !== "none" && retrievedSessions.length > 0) {
-    // Pull the retrieved sessions' content from rec.haystack_sessions by
-    // session_id — no extra HTTP round-trip needed.
     const sidToContent = new Map<string, string>();
+    const sidToDate = new Map<string, string>();
     for (let i = 0; i < rec.haystack_session_ids.length; i++) {
-      sidToContent.set(rec.haystack_session_ids[i], sessionToContent(rec.haystack_sessions[i], rec.haystack_session_ids[i], rec.haystack_dates[i]));
+      const sid = rec.haystack_session_ids[i];
+      sidToContent.set(sid, sessionToContent(rec.haystack_sessions[i], sid, rec.haystack_dates[i]));
+      sidToDate.set(sid, rec.haystack_dates[i] ?? "");
     }
+    // Take top-K retrieved, then re-sort by haystack date ascending.
+    const topKRetrieved = retrievedSessions.slice(0, args.topK);
+    const chronological = [...topKRetrieved].sort((a, b) => {
+      const da = sidToDate.get(a) ?? "";
+      const db = sidToDate.get(b) ?? "";
+      return da.localeCompare(db);
+    });
     const ctxParts: string[] = [];
     let budget = args.contextChars;
-    for (const sid of retrievedSessions.slice(0, args.topK)) {
+    for (const sid of chronological) {
       const part = sidToContent.get(sid);
       if (!part) continue;
       const slice = part.slice(0, Math.max(0, budget));
@@ -520,7 +564,7 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
       if (budget <= 0) break;
     }
     const ctx = ctxParts.join("\n\n---\n\n");
-    const gen = await generateAnswer(args, rec.question, ctx || "(no retrieved context)");
+    const gen = await generateAnswer(args, rec.question, ctx || "(no retrieved context)", rec.question_date);
     predictedAnswer = gen.answer;
     answerMs = gen.ms;
     const judge = await judgeAnswer(args, rec.question, rec.answer, gen.answer);
@@ -568,47 +612,34 @@ function aggregate(results: ScoredQuestion[]): void {
   console.log("");
   const judgeUsed = results.some(r => r.judge_score !== undefined);
   console.log("Per category:");
-  if (judgeUsed) {
-    console.log("  " + "category".padEnd(26) + " n   H@1   H@5   H@10  Answer%");
-  } else {
-    console.log("  " + "category".padEnd(26) + " n   H@1   H@5   H@10  ingest_ms recall_ms");
-  }
-  console.log("  " + "─".repeat(78));
+  console.log("  " + "category".padEnd(26) + " n   H@1   H@5   H@10  AllG@10 Cov@10" + (judgeUsed ? "  Answer%" : ""));
+  console.log("  " + "─".repeat(judgeUsed ? 84 : 76));
   for (const [cat, rows] of [...byCategory.entries()].sort()) {
     const n = rows.length;
     const h1 = (rows.filter(r => r.hit_at_1).length / n * 100).toFixed(1);
     const h5 = (rows.filter(r => r.hit_at_5).length / n * 100).toFixed(1);
     const h10 = (rows.filter(r => r.hit_at_10).length / n * 100).toFixed(1);
+    const allg = (rows.filter(r => r.all_gold_at_10).length / n * 100).toFixed(1);
+    const cov = (rows.reduce((s, r) => s + r.coverage_at_10, 0) / n * 100).toFixed(1);
+    let line = "  " + cat.padEnd(26) + String(n).padStart(3) +
+      " " + h1.padStart(5) +
+      " " + h5.padStart(5) +
+      " " + h10.padStart(5) +
+      " " + allg.padStart(6) +
+      " " + cov.padStart(5);
     if (judgeUsed) {
       const judged = rows.filter(r => r.judge_score !== undefined);
       const ans = judged.length ? (judged.filter(r => r.judge_score === 1).length / judged.length * 100).toFixed(1) : "n/a";
-      console.log(
-        "  " + cat.padEnd(26) +
-        String(n).padStart(3) +
-        " " + h1.padStart(5) +
-        " " + h5.padStart(5) +
-        " " + h10.padStart(5) +
-        " " + ans.padStart(7)
-      );
-    } else {
-      const ing = (rows.reduce((s, r) => s + r.ingest_ms, 0) / n).toFixed(0);
-      const rec = (rows.reduce((s, r) => s + r.recall_ms, 0) / n).toFixed(0);
-      console.log(
-        "  " + cat.padEnd(26) +
-        String(n).padStart(3) +
-        " " + h1.padStart(5) +
-        " " + h5.padStart(5) +
-        " " + h10.padStart(5) +
-        " " + ing.padStart(9) +
-        "ms " + rec.padStart(8) + "ms"
-      );
+      line += " " + ans.padStart(7);
     }
+    console.log(line);
   }
   console.log("");
   const all = results;
-  const overall = (rows: ScoredQuestion[], k: "hit_at_1" | "hit_at_5" | "hit_at_10") =>
-    (rows.filter(r => r[k]).length / rows.length * 100).toFixed(1);
-  let line = `Overall: n=${all.length}  Hit@1=${overall(all, "hit_at_1")}%  Hit@5=${overall(all, "hit_at_5")}%  Hit@10=${overall(all, "hit_at_10")}%`;
+  const overall = (rows: ScoredQuestion[], k: "hit_at_1" | "hit_at_5" | "hit_at_10" | "all_gold_at_10") =>
+    (rows.filter(r => r[k] === true).length / rows.length * 100).toFixed(1);
+  const meanCov = (all.reduce((s, r) => s + r.coverage_at_10, 0) / all.length * 100).toFixed(1);
+  let line = `Overall: n=${all.length}  Hit@1=${overall(all, "hit_at_1")}%  Hit@5=${overall(all, "hit_at_5")}%  Hit@10=${overall(all, "hit_at_10")}%  AllGold@10=${overall(all, "all_gold_at_10")}%  Coverage@10=${meanCov}%`;
   if (judgeUsed) {
     const judged = all.filter(r => r.judge_score !== undefined);
     const ans = judged.length ? (judged.filter(r => r.judge_score === 1).length / judged.length * 100).toFixed(1) : "n/a";
