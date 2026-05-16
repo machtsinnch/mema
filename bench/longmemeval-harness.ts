@@ -158,6 +158,7 @@ function parseArgs(): Args {
     judgeBackend: (flags["judge-backend"] ? String(flags["judge-backend"]) : (flags["answer-backend"] ? String(flags["answer-backend"]) : "ollama")) as AnswerBackend,
     balanced: !!flags["balanced"],
     kinds: (flags["kinds"] ? String(flags["kinds"]).split(",") : ["episode"]) as Args["kinds"],
+    saveResults: flags["save-results"] ? String(flags["save-results"]) : null,
   };
 }
 
@@ -738,6 +739,15 @@ async function main() {
   }
 
   aggregate(results);
+
+  // v2.10.5+ — dump per-question results for error-class auditing.
+  // One JSONL line per question, queryable via jq/grep/python for the
+  // 7-class failure taxonomy from the reviewer's diagnostic.
+  if (args.saveResults) {
+    const lines = results.map(r => JSON.stringify(r));
+    await Bun.write(args.saveResults, lines.join("\n") + "\n");
+    console.log(`\nResults saved: ${args.saveResults}  (${lines.length} questions)`);
+  }
 }
 
 main().catch(e => { console.error("fatal:", e?.message ?? e); process.exit(1); });
