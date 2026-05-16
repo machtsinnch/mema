@@ -72,6 +72,11 @@ interface Args {
   // first N from the file (the LongMemEval oracle is ordered by category,
   // so a plain --limit N=100 misses 5 of 6 categories).
   balanced: boolean;
+  // v2.10.2+ — which mema record kinds to retrieve. Default "episode"
+  // (back-compat with the v2.10.0 baseline). The reviewer's v3.0
+  // ablation asks for "episode-only vs episode+fact+cognitive" so the
+  // gain from extraction + reflection is measurable separately.
+  kinds: ("episode" | "fact" | "cognitive" | "entity")[];
 }
 
 interface ChatTurn { role: string; content: string }
@@ -140,6 +145,7 @@ function parseArgs(): Args {
     answerBackend: (flags["answer-backend"] ? String(flags["answer-backend"]) : "ollama") as AnswerBackend,
     judgeBackend: (flags["judge-backend"] ? String(flags["judge-backend"]) : (flags["answer-backend"] ? String(flags["answer-backend"]) : "ollama")) as AnswerBackend,
     balanced: !!flags["balanced"],
+    kinds: (flags["kinds"] ? String(flags["kinds"]).split(",") : ["episode"]) as Args["kinds"],
   };
 }
 
@@ -450,8 +456,8 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
     const useVector = args.retrievalMode === "vector" || args.retrievalMode === "hybrid";
     const recallRes = await apiOwner("/v2/recall", {
       query: rec.question,
-      purpose: `longmemeval_${args.retrievalMode}_${args.fusion}`,
-      kinds: ["episode"],
+      purpose: `longmemeval_${args.retrievalMode}_${args.fusion}_${args.kinds.join("+")}`,
+      kinds: args.kinds,
       limit: args.topK,
       use_vector: useVector,
       fusion: args.fusion,
@@ -606,7 +612,7 @@ async function main() {
   console.log(`  Owner:    ${args.owner}_<question_id>`);
   console.log(`  Limit:    ${args.limit}${args.category ? ` (category=${args.category})` : ""}`);
   console.log(`  top-K:    ${args.topK}`);
-  console.log(`  Mode:     retrieval=${args.retrievalMode}  fusion=${args.fusion}`);
+  console.log(`  Mode:     retrieval=${args.retrievalMode}  fusion=${args.fusion}  kinds=${args.kinds.join("+")}`);
   console.log(`  Extract:  ${args.extract ? "yes (LLM-extracted drafts then auto-review)" : "no (retrieval-only)"}`);
   console.log(`  Judge:    ${args.judge}${args.judge !== "none" ? ` answer-backend=${args.answerBackend} judge-backend=${args.judgeBackend}` : ""}`);
   console.log("");
