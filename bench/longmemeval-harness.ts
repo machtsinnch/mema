@@ -130,6 +130,31 @@ interface Args {
   kinds: ("episode" | "fact" | "cognitive" | "entity")[];
 }
 
+// v2.11.0+ — recall response hit, mirroring src/v2/types.ts RetrievalHit.
+// The harness only needs id + kind + excerpt + payload; the full type is
+// duplicated here to keep bench/ free of imports from src/ wherever possible.
+interface RecallHit {
+  kind: "episode" | "fact" | "cognitive" | "entity";
+  id: string;
+  excerpt: string;
+  payload?: {
+    // fact
+    subject?: string;
+    predicate?: string;
+    object?: string;
+    valid_from?: string;
+    invalidated_at?: string;
+    // cognitive
+    content?: string;
+    cognitive_kind?: "belief" | "observation" | "experience";
+    confidence?: number;
+    // entity
+    name?: string;
+    entity_type?: string;
+    aliases?: string[];
+  };
+}
+
 interface ChatTurn { role: string; content: string }
 interface LMERecord {
   question_id: string;
@@ -549,8 +574,20 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
   // 3. Recall — v2.10.0+ ablation-aware. The retrieval-mode switch
   //    routes the question through one of four pipelines so we can
   //    publish apples-to-apples ablations alongside the mema number.
+  // v2.11.0+ — capture the FULL hit objects (kind + id + payload + excerpt)
+  //    instead of throwing away everything but the id. The pre-2.11 harness
+  //    silently dropped fact/cognitive/entity hits from the context packet:
+  //    the `idToSession` map only had episode→session mappings, so non-episode
+  //    hit IDs returned `undefined` from sidToContent and `continue`-d out.
+  //    That made the v2.10.6 "architecture ablation" methodologically
+  //    invalid — the answer LLM only ever saw episode session text even when
+  //    --kinds episode,fact,cognitive was requested. Fix: keep per-kind hits
+  //    separately and build a proper sectioned context packet below.
   const t1 = Date.now();
   let retrievedSessions: string[] = [];
+  let factHits: RecallHit[] = [];
+  let cognitiveHits: RecallHit[] = [];
+  let entityHits: RecallHit[] = [];
 
   if (args.retrievalMode === "full-context") {
     // Oracle upper bound: every haystack session in order is "retrieved".
@@ -567,10 +604,19 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
       fusion: args.fusion,
     });
     if (recallRes.ok) {
-      const rj = await recallRes.json() as { hits: { id: string }[] };
+      const rj = await recallRes.json() as { hits: RecallHit[] };
       const idToSession = new Map<string, string>();
       for (const [sid, eid] of sessionToEpisode) idToSession.set(eid, sid);
-      retrievedSessions = rj.hits.map(h => idToSession.get(h.id) ?? h.id);
+      // Episode hits → session IDs (for scoreHits against gold answer_session_ids).
+      // Non-episode hits cannot map to sessions; they're rendered into their
+      // own packet sections below and do NOT participate in Hit@K scoring
+      // (which is correct — gold is defined as the answer-bearing sessions).
+      retrievedSessions = rj.hits
+        .filter(h => h.kind === "episode")
+        .map(h => idToSession.get(h.id) ?? h.id);
+      factHits = rj.hits.filter(h => h.kind === "fact" && h.payload);
+      cognitiveHits = rj.hits.filter(h => h.kind === "cognitive" && h.payload?.content);
+      entityHits = rj.hits.filter(h => h.kind === "entity" && h.payload);
     }
     if (args.retrievalMode === "vector") {
       // Vector-only ablation: drop keyword-anchored hits by re-querying
@@ -599,8 +645,20 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
   //     requires a timeline, not a relevance ranking.
   //   - Pass question_date through to the answer prompt so temporal "now"
   //     questions are answerable.
-  //   - Same content-budget as before, just better ordered.
-  if (args.judge !== "none" && retrievedSessions.length > 0) {
+  // v2.11.0+ — proper memory-packet construction. Four sections:
+  //   1. # APPROVED FACTS — facts sorted by valid_from, invalidations inline
+  //   2. # COGNITIVE BELIEFS — cognitive content with kind label
+  //   3. # ENTITIES — name (type), aliases
+  //   4. # EVIDENCE TIMELINE — episode session text, chronological
+  // The non-episode sections share ~25% of contextChars (any unused budget
+  // rolls back to the evidence timeline). This is the fix for the silent-drop
+  // bug that invalidated the v2.10.6 ablation.
+  const hasAnyContent =
+    retrievedSessions.length > 0 ||
+    factHits.length > 0 ||
+    cognitiveHits.length > 0 ||
+    entityHits.length > 0;
+  if (args.judge !== "none" && hasAnyContent) {
     const sidToContent = new Map<string, string>();
     const sidToDate = new Map<string, string>();
     for (let i = 0; i < rec.haystack_session_ids.length; i++) {
@@ -608,24 +666,104 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
       sidToContent.set(sid, sessionToContent(rec.haystack_sessions[i], sid, rec.haystack_dates[i]));
       sidToDate.set(sid, rec.haystack_dates[i] ?? "");
     }
-    // Take top-K retrieved, then re-sort by haystack date ascending.
-    const topKRetrieved = retrievedSessions.slice(0, args.topK);
-    const chronological = [...topKRetrieved].sort((a, b) => {
-      const da = sidToDate.get(a) ?? "";
-      const db = sidToDate.get(b) ?? "";
-      return da.localeCompare(db);
-    });
+
     const ctxParts: string[] = [];
-    let budget = args.contextChars;
-    for (const sid of chronological) {
-      const part = sidToContent.get(sid);
-      if (!part) continue;
-      const slice = part.slice(0, Math.max(0, budget));
-      if (!slice) break;
-      ctxParts.push(slice);
-      budget -= slice.length;
-      if (budget <= 0) break;
+    const totalBudget = args.contextChars;
+    // Reserve up to 25% of context for non-episode sections. If fewer
+    // chars are used, the remainder rolls back to the evidence timeline.
+    const nonEpisodeReserve = Math.floor(totalBudget * 0.25);
+    let nonEpUsed = 0;
+
+    // ── Section 1: APPROVED FACTS ─────────────────────────────────
+    if (factHits.length > 0) {
+      const sorted = [...factHits].sort((a, b) => {
+        const va = a.payload?.valid_from ?? "";
+        const vb = b.payload?.valid_from ?? "";
+        return va.localeCompare(vb);
+      });
+      const lines: string[] = ["# APPROVED FACTS (sorted by validity)"];
+      for (const f of sorted) {
+        const date = (f.payload?.valid_from ?? "").slice(0, 10) || "unknown-date";
+        const inv = f.payload?.invalidated_at
+          ? `  (invalidated ${String(f.payload.invalidated_at).slice(0, 10)})`
+          : "";
+        const subj = f.payload?.subject ?? "?";
+        const pred = f.payload?.predicate ?? "?";
+        const obj = f.payload?.object ?? "?";
+        lines.push(`- [${date}] ${subj} ${pred} ${obj}${inv}`);
+      }
+      const block = lines.join("\n");
+      const room = nonEpisodeReserve - nonEpUsed;
+      const slice = block.length <= room ? block : block.slice(0, Math.max(0, room));
+      if (slice) {
+        ctxParts.push(slice);
+        nonEpUsed += slice.length;
+      }
     }
+
+    // ── Section 2: COGNITIVE BELIEFS ──────────────────────────────
+    if (cognitiveHits.length > 0 && nonEpUsed < nonEpisodeReserve) {
+      const lines: string[] = ["# COGNITIVE BELIEFS"];
+      for (const c of cognitiveHits) {
+        const kind = c.payload?.cognitive_kind ?? "belief";
+        const content = (c.payload?.content ?? "").replace(/\s+/g, " ").trim();
+        lines.push(`- [${kind}] ${content}`);
+      }
+      const block = lines.join("\n");
+      const room = nonEpisodeReserve - nonEpUsed;
+      const slice = block.length <= room ? block : block.slice(0, Math.max(0, room));
+      if (slice) {
+        ctxParts.push(slice);
+        nonEpUsed += slice.length;
+      }
+    }
+
+    // ── Section 3: ENTITIES ───────────────────────────────────────
+    if (entityHits.length > 0 && nonEpUsed < nonEpisodeReserve) {
+      const lines: string[] = ["# ENTITIES"];
+      for (const e of entityHits) {
+        const name = e.payload?.name ?? "?";
+        const type = e.payload?.entity_type ?? "?";
+        const aliases = e.payload?.aliases && e.payload.aliases.length > 0
+          ? `, aliases: ${e.payload.aliases.join(", ")}`
+          : "";
+        lines.push(`- ${name} (${type})${aliases}`);
+      }
+      const block = lines.join("\n");
+      const room = nonEpisodeReserve - nonEpUsed;
+      const slice = block.length <= room ? block : block.slice(0, Math.max(0, room));
+      if (slice) {
+        ctxParts.push(slice);
+        nonEpUsed += slice.length;
+      }
+    }
+
+    // ── Section 4: EVIDENCE TIMELINE (episodes, chronological) ────
+    // Episode budget = full budget MINUS what non-episode sections actually used.
+    // (Unused non-episode reserve rolls back to episodes.)
+    if (retrievedSessions.length > 0) {
+      const topKRetrieved = retrievedSessions.slice(0, args.topK);
+      const chronological = [...topKRetrieved].sort((a, b) => {
+        const da = sidToDate.get(a) ?? "";
+        const db = sidToDate.get(b) ?? "";
+        return da.localeCompare(db);
+      });
+      const header = "# EVIDENCE TIMELINE";
+      let epBudget = totalBudget - nonEpUsed - header.length;
+      if (epBudget > 0) {
+        ctxParts.push(header);
+        for (const sid of chronological) {
+          const part = sidToContent.get(sid);
+          if (!part) continue;
+          const slice = part.slice(0, Math.max(0, epBudget));
+          if (!slice) break;
+          ctxParts.push(slice);
+          epBudget -= slice.length;
+          if (epBudget <= 0) break;
+        }
+      }
+    }
+
     const ctx = ctxParts.join("\n\n---\n\n");
     const gen = await generateAnswer(args, rec.question, ctx || "(no retrieved context)", rec.question_date);
     predictedAnswer = gen.answer;

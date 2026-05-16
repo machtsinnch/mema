@@ -234,6 +234,32 @@ export interface RetrievalHit {
   asset_version?: number;
   verification_status?: "unverified" | "verified" | "anchored";
   why_retrieved?: string;      // human-readable explanation of why this hit ranked here
+  // v2.11.0+ — per-kind structured payload for downstream prompt construction
+  // (bench harnesses, agent prompts). Additive + optional; pre-2.11 consumers ignore.
+  // Without this, callers had only `excerpt` (240 chars of the first matched line),
+  // which is fine for diagnostics but insufficient to format facts/beliefs/entities
+  // into a context packet for an answer LLM. Populated when the hit's kind has
+  // structured fields worth surfacing.
+  payload?: RetrievalHitPayload;
+}
+
+// v2.11.0+ structured per-kind content carried by a RetrievalHit. Fields are
+// union-typed across kinds; only the subset relevant to the hit's `kind` is set.
+export interface RetrievalHitPayload {
+  // fact
+  subject?: string;
+  predicate?: string;
+  object?: string;
+  valid_from?: string;
+  invalidated_at?: string;
+  // cognitive (content is the record body, not a frontmatter field)
+  content?: string;
+  cognitive_kind?: "belief" | "observation" | "experience";
+  confidence?: number;
+  // entity
+  name?: string;
+  entity_type?: string;
+  aliases?: string[];
 }
 
 export interface RetrievalResult {

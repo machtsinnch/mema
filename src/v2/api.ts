@@ -802,7 +802,12 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     const parsed = await parseBody<{
       query: string;
       purpose: string;
-      kinds?: ("episode" | "fact" | "cognitive")[];
+      // v2.11.0+ — "entity" added to align with RetrievalKind. v2.9.0 made
+      // entities first-class retrieval candidates but the API type only
+      // listed three kinds. Pre-2.11 callers that supplied "entity" still
+      // worked at runtime (recall() honored it), but TS clients couldn't
+      // type-check the value.
+      kinds?: ("episode" | "fact" | "cognitive" | "entity")[];
       temporal?: { valid_at?: string };
       limit?: number;
       use_vector?: boolean;

@@ -2,6 +2,54 @@
 
 All notable changes to mema. Follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v2.11.0-rc.1 — 2026-05-17
+
+Honesty fix for the v2.10.6 architecture ablation. The pre-2.11 LongMemEval
+harness silently dropped fact / cognitive / entity hits from the context
+packet (the `idToSession` map only knew episode IDs, so non-episode hit IDs
+returned `undefined` and were `continue`-d out by `sidToContent.get`). That
+made every "architecture ablation" number through v2.10.6 methodologically
+invalid — the answer LLM only ever saw episode session text even when
+`--kinds episode,fact,cognitive` was requested.
+
+### Added
+
+- **`RetrievalHit.payload`** — optional structured per-kind content carried
+  alongside the existing 240-char `excerpt`. For facts: `subject`,
+  `predicate`, `object`, `valid_from`, `invalidated_at`. For cognitive:
+  `content` (record body), `cognitive_kind`, `confidence`. For entities:
+  `name`, `entity_type`, `aliases`. Additive + optional; pre-2.11 consumers
+  ignore the field. Populated by `recall()` in `layer5-retrieval.ts` from
+  the record's frontmatter (and body, for cognitive). New type
+  `RetrievalHitPayload` exported from `src/v2/types.ts`.
+- **5 new tests** in `tests/v2/recall-payload.test.ts` exercising payload
+  for facts (subject/predicate/object/valid_from/invalidated_at),
+  cognitive (content/cognitive_kind/confidence), entities
+  (name/entity_type/aliases), and confirming episodes do not carry payload.
+- **`POST /v2/recall` accepts `"entity"` in kinds at the type level.**
+  Runtime behavior was unchanged (recall() already honored it via
+  `RetrievalKind`), but the API parseBody type narrowed to
+  `episode|fact|cognitive` which prevented TS clients from passing entity.
+  Now `episode|fact|cognitive|entity`.
+
+### Fixed
+
+- **`bench/longmemeval-harness.ts` packet construction.** Rewrote the
+  context-packet builder to produce four sections (`# APPROVED FACTS`
+  sorted by `valid_from` with invalidations inline, `# COGNITIVE BELIEFS`,
+  `# ENTITIES`, `# EVIDENCE TIMELINE` chronological). Non-episode sections
+  share up to 25% of `--context-chars`; any unused reserve rolls back to
+  the evidence timeline. Hit@K scoring is unchanged — only episode hits
+  participate (which is correct, since gold is defined as the
+  answer-bearing sessions). The architecture ablation can now make a
+  defensible claim about whether mema's facts/cognitive/entity layers
+  earn their keep.
+
+### Backward compatibility
+
+`RetrievalHit.payload` is optional. Pre-2.11 consumers (including the
+public-facing bench scripts shipped with v2.10.0) ignore the field.
+
 ## v2.10.0 — 2026-05-16
 
 Architecture-complete checkpoint for the v3.0 evidence-package push.

@@ -339,6 +339,32 @@ export async function recall(
       verification_status: rec.frontmatter.verification_status,
       why_retrieved: why,
     };
+    // v2.11.0+ — per-kind structured payload. Downstream consumers (bench
+    // harnesses, agent prompts) get structured fields without re-parsing the
+    // record. The 240-char `excerpt` above is unchanged and remains the
+    // diagnostic field; `payload` is the load-bearing content channel.
+    const fm = rec.frontmatter as any;
+    if (kind === "fact") {
+      hit.payload = {
+        subject: fm.subject,
+        predicate: fm.predicate,
+        object: fm.object,
+        valid_from: fm.valid_from,
+        ...(fm.invalidated_at ? { invalidated_at: fm.invalidated_at } : {}),
+      };
+    } else if (kind === "cognitive") {
+      hit.payload = {
+        content: rec.body,
+        cognitive_kind: fm.kind,
+        ...(typeof fm.confidence === "number" ? { confidence: fm.confidence } : {}),
+      };
+    } else if (kind === "entity") {
+      hit.payload = {
+        name: fm.name,
+        entity_type: fm.type,
+        ...(Array.isArray(fm.aliases) && fm.aliases.length > 0 ? { aliases: fm.aliases } : {}),
+      };
+    }
     hits.push(hit);
     evidenceChain.push(hit.id);
 
