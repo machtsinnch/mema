@@ -522,8 +522,11 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
   return {
     question_id: rec.question_id,
     category: rec.question_type,
-    question: rec.question.slice(0, 100),
-    answer: rec.answer.slice(0, 100),
+    question: String(rec.question ?? "").slice(0, 100),
+    // v2.10.2+ — some LongMemEval entries have non-string answer fields
+    // (arrays/objects); coerce defensively so the harness doesn't drop
+    // them with "rec.answer.slice is not a function".
+    answer: (typeof rec.answer === "string" ? rec.answer : JSON.stringify(rec.answer ?? "")).slice(0, 100),
     answer_session_ids: rec.answer_session_ids,
     retrieved_ids: retrievedSessions,
     ingest_ms: ingestMs,
