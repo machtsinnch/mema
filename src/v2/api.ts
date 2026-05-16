@@ -14,7 +14,10 @@ import {
   resolveEntity,
 } from "./layer2-entities";
 import { findEpisode } from "./layer1-episodic";
-import { recordCognitive, supersedeBelief, addDerivedFrom } from "./layer3-cognitive";
+import {
+  recordCognitive, supersedeBelief, addDerivedFrom,
+  approveCognitive, rejectCognitive, listDraftCognitive, pathForCognitive,
+} from "./layer3-cognitive";
 import { reflect, reflectLLM } from "./layer3-reflection";
 import { buildGovernance, hardErase } from "./layer4-governance";
 import { recall } from "./layer5-retrieval";
@@ -589,6 +592,74 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   });
 
   // Append IDs to an existing cognitive record's derived_from chain. Used by
+  // v2.10.0+ cognitive approval lifecycle — parity with fact/entity
+  // approve/reject endpoints (NEW; closes the v3.0 acceptance-lifecycle
+  // criterion). Same fail-closed semantics: drafts with empty
+  // derived_from or missing source episode are rejected with 422 unless
+  // force:true + non-empty reason is passed.
+  app.post("/v2/cognitive/:id/approve", async c => {
+    const id = c.req.param("id");
+    const parsed = await parseBody<{ reason?: string; force?: boolean }>(c);
+    if (!parsed.ok) return parsed.response;
+    const owner = c.get("owner");
+    const actor = c.get("actor");
+    const path = pathForCognitive(cfg.vaultRoot, owner, id);
+    if (!path) return c.json({ error: "not found" }, 404);
+    // Load the record so we can check derived_from + source.
+    const matter = (await import("gray-matter")).default;
+    const parsedRec = matter(readFileSync(path, "utf8"));
+    const fm = parsedRec.data as any;
+    if (fm.owner !== owner) return c.json({ error: "not found" }, 404);
+    const force = parsed.body.force === true;
+    if (force && !(parsed.body.reason && parsed.body.reason.trim())) {
+      return c.json({ error: "force_requires_reason" }, 400);
+    }
+    if (!force) {
+      const derivedFrom = ((fm.derived_from ?? []) as any[]).filter(s => typeof s === "string" && s.length > 0) as string[];
+      if (derivedFrom.length === 0) {
+        return c.json({
+          error: "evidence_check_failed",
+          missing: ["derived_from"],
+          hint: "cognitive draft has no source citation; pass {force:true, reason:'...'} to override",
+        }, 422);
+      }
+      // For cognitive records derived_from can cite episode OR fact IDs.
+      // Require at least one to resolve in the vault.
+      const epId = derivedFrom[0];
+      const ep = findEpisode(cfg.vaultRoot, owner, epId);
+      const fact = ep ? null : readFact(cfg.vaultRoot, owner, epId);
+      if (!ep && !fact) {
+        return c.json({
+          error: "evidence_check_failed",
+          missing: ["source_episode_or_fact"],
+          hint: `derived_from cites '${epId}' which is neither an episode nor a fact in this vault; pass {force:true, reason:'...'} to override`,
+        }, 422);
+      }
+    }
+    const r = approveCognitive(cfg.vaultRoot, id, owner, actor, parsed.body.reason);
+    if (!r) return c.json({ error: "not found" }, 404);
+    return c.json({ record: r });
+  });
+
+  app.post("/v2/cognitive/:id/reject", async c => {
+    const id = c.req.param("id");
+    const parsed = await parseBody<{ reason: string }>(c);
+    if (!parsed.ok) return parsed.response;
+    if (!parsed.body.reason || !parsed.body.reason.trim()) {
+      return c.json({ error: "reason is required for reject" }, 400);
+    }
+    const owner = c.get("owner");
+    const actor = c.get("actor");
+    const r = rejectCognitive(cfg.vaultRoot, id, owner, actor, parsed.body.reason);
+    if (!r) return c.json({ error: "not found" }, 404);
+    return c.json({ record: r });
+  });
+
+  app.get("/v2/cognitive/drafts", async c => {
+    const owner = c.get("owner");
+    return c.json({ records: listDraftCognitive(cfg.vaultRoot, owner) });
+  });
+
   // the PAI migration to wire cross-memory wikilinks AFTER all records exist.
   app.post("/v2/cognitive/:id/derived-from", async c => {
     const parsed = await parseBody<{ add: string[] }>(c);
@@ -745,6 +816,9 @@ export function mountV2(app: Hono, cfg: V2Config): void {
         approved_models?: string[];
       };
       policy_mode?: "permissive" | "strict";
+      // v2.10.0+ ablation switch (NEW). "weighted" default = back-compat;
+      // "rrf" = Reciprocal Rank Fusion over keyword/vector/graph/temporal/title.
+      fusion?: "weighted" | "rrf";
     }>(c);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");

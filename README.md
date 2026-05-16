@@ -12,8 +12,8 @@ services, healthcare, public sector — where audit replay, hard erasure,
 multi-tenant isolation, jurisdiction-aware governance, and inspectable
 storage matter as much as benchmark recall.
 
-[![v2.9.0](https://img.shields.io/badge/release-v2.9.0-blue)](https://github.com/machtsinnch/mema/releases/tag/v2.9.0)
-[![tests](https://img.shields.io/badge/tests-222_passing-green)](https://github.com/machtsinnch/mema/blob/main/tests/)
+[![v2.10.0](https://img.shields.io/badge/release-v2.10.0-blue)](https://github.com/machtsinnch/mema/releases/tag/v2.10.0)
+[![tests](https://img.shields.io/badge/tests-231_passing-green)](https://github.com/machtsinnch/mema/blob/main/tests/)
 [![benchmark](https://img.shields.io/badge/Precision@1-96.0%25-green)](https://github.com/machtsinnch/mema/blob/main/bench/recall-benchmark-v2.py)
 [![license](https://img.shields.io/badge/license-BUSL--1.1-orange)](LICENSE)
 
@@ -21,17 +21,19 @@ storage matter as much as benchmark recall.
 
 ## Status
 
-**v2.9.0** — Closes every P0 from the v2.8.0 external review plus adds
-the architectural pieces needed to make the "competes with
-Zep/Hindsight on memory performance" claim defensible: contradiction
-detection + auto-supersedes, LLM-driven reflection (drafts gated),
-entity resolution (Zep-style alias inference), RRF fusion helper for
-hybrid retrieval, and an LLM-judge layer on the LongMemEval harness
-so we can report answer-level accuracy alongside Hit@k. License
-pivoted to **Business Source License 1.1** (converts to Apache 2.0
-on 2030-05-15); v2.0.0–v2.8.0 remain MIT at their tags.
+**v2.10.0** — Architecture-complete checkpoint for the v3.0
+evidence-package push. RRF is now wired into `/v2/recall` as an
+opt-in fusion mode (`fusion: "rrf"`); cognitive records have
+approve/reject parity with facts and entities; the LongMemEval
+harness gains `--retrieval-mode {hybrid,bm25,vector,full-context}`
+and `--fusion {weighted,rrf}` for one-flag ablations; new
+`bench/locomo-harness.ts` runs LoCoMo QA; new
+`bench/swiss-trust-bench.ts` ships **9 end-to-end trust scenarios
+(9/9 passing)** — the differentiator no other memory system has.
+v3.0 itself waits on the full benchmark evidence (LongMemEval N=500
+with judge, LoCoMo QA full run, Zep/Hindsight apples-to-apples).
 
-- **222 tests passing** across 25 test files (525+ `expect()` assertions)
+- **231 tests passing** across 26 test files (551 `expect()` assertions)
 - **96.0% Precision@1** on a 25-query retrieval benchmark over a real
   347-document corpus (vs 44.0% for the v1 baseline — **+52 percentage
   points**). External harness for LongMemEval included in `bench/`.

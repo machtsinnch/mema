@@ -101,6 +101,86 @@ export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput):
   return record;
 }
 
+// v2.10.0+ acceptance lifecycle on cognitive records — parity with
+// fact and entity approve/reject. LLM-driven reflectLLM() writes drafts;
+// these functions promote or reject them, with the same fail-closed
+// evidence-gate semantics (enforced at the API layer).
+export function approveCognitive(
+  vaultRoot: string,
+  cognitiveId: string,
+  owner: string,
+  actor: string,
+  reason?: string,
+): CognitiveRecord | null {
+  const path = pathForCognitive(vaultRoot, owner, cognitiveId);
+  if (!path) return null;
+  const parsed = matter(readFileSync(path, "utf8"));
+  const fm = parsed.data as any;
+  if (fm.owner !== owner) return null;
+  if (fm.status === "approved") return fm as CognitiveRecord;
+  fm.status = "approved";
+  fm.reviewed_by = actor;
+  fm.reviewed_at = new Date().toISOString();
+  if (reason) fm.review_reason = reason;
+  atomicWriteFile(path, matter.stringify(parsed.content, fm));
+  appendAudit({
+    op: "APPROVE",
+    actor,
+    owner,
+    record_ids: [cognitiveId],
+    evidence_chain: (fm.derived_from ?? []) as string[],
+    reason,
+  });
+  return fm as CognitiveRecord;
+}
+
+export function rejectCognitive(
+  vaultRoot: string,
+  cognitiveId: string,
+  owner: string,
+  actor: string,
+  reason: string,
+): CognitiveRecord | null {
+  const path = pathForCognitive(vaultRoot, owner, cognitiveId);
+  if (!path) return null;
+  const parsed = matter(readFileSync(path, "utf8"));
+  const fm = parsed.data as any;
+  if (fm.owner !== owner) return null;
+  if (fm.status === "rejected") return fm as CognitiveRecord;
+  fm.status = "rejected";
+  fm.reviewed_by = actor;
+  fm.reviewed_at = new Date().toISOString();
+  fm.review_reason = reason;
+  atomicWriteFile(path, matter.stringify(parsed.content, fm));
+  appendAudit({
+    op: "REJECT",
+    actor,
+    owner,
+    record_ids: [cognitiveId],
+    evidence_chain: (fm.derived_from ?? []) as string[],
+    reason,
+  });
+  return fm as CognitiveRecord;
+}
+
+// List all draft cognitive records across all three kinds (belief,
+// observation, experience).
+export function listDraftCognitive(vaultRoot: string, owner: string): CognitiveRecord[] {
+  const out: CognitiveRecord[] = [];
+  for (const kind of ["belief", "observation", "experience"]) {
+    const dir = join(vaultRoot, "cognitive", owner, kind);
+    if (!existsSync(dir)) continue;
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith(".md")) continue;
+      try {
+        const parsed = matter(readFileSync(join(dir, f), "utf8"));
+        if ((parsed.data as any).status === "draft") out.push(parsed.data as CognitiveRecord);
+      } catch { /* skip malformed */ }
+    }
+  }
+  return out;
+}
+
 // Append IDs to an existing cognitive record's derived_from chain (dedup'd)
 // and rebuild its links frontmatter. Used by the PAI migration to add
 // cross-memory references after every record exists. Owner-scoped: caller's

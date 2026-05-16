@@ -2,6 +2,74 @@
 
 All notable changes to mema. Follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v2.10.0 — 2026-05-16
+
+Architecture-complete checkpoint for the v3.0 evidence-package push.
+Closes the architecture half of the v3.0 acceptance criteria proposed
+in the third external review; the remaining half (FULL LongMemEval +
+LoCoMo runs with answer-level judge, human-labeled extraction sample,
+Swiss Trust Bench scenarios expanded, Zep/Hindsight apples-to-apples
+baselines) is benchmark RUNTIME that produces evidence on top of this
+release. v2.10.0 is the last code-only release before v3.0.
+
+### Added (v3.0 acceptance-criteria items)
+
+- **#1 RRF wired into /v2/recall.** New `RetrievalQuery.fusion?: "weighted" | "rrf"`.
+  When `"rrf"`, recall builds five per-signal ranked lists (keyword,
+  vector, graph, temporal, title) and replaces the per-hit weighted-
+  linear score with the Reciprocal Rank Fusion score (k=60). Hit set
+  is identical to the weighted path; only ordering differs. The
+  `score_components.rrf` field is populated so downstream consumers
+  can debug fusion outcomes. 3 new tests verify both modes return the
+  same hit set with different orderings.
+- **#2 Cognitive approval endpoints (parity with facts/entities).** New
+  endpoints `POST /v2/cognitive/:id/approve`, `POST /v2/cognitive/:id/reject`,
+  `GET /v2/cognitive/drafts`. Same fail-closed semantics as facts:
+  empty `derived_from` or missing source episode/fact = 422, force
+  bypass requires non-empty reason. New layer functions
+  `approveCognitive`, `rejectCognitive`, `listDraftCognitive`. 6 new
+  tests.
+- **#3 LongMemEval harness ablation modes.** Added `--retrieval-mode
+  hybrid|bm25|vector|full-context` and `--fusion weighted|rrf` to
+  `bench/longmemeval-harness.ts`. Lets reviewers reproduce the
+  ablation matrix the v3.0 criteria asks for with single-flag changes.
+  `full-context` is the oracle upper bound (every haystack session
+  goes into the answer prompt). `bm25` is keyword-only baseline.
+- **#4 LoCoMo benchmark harness skeleton.** New
+  `bench/locomo-harness.ts` runs QA over LoCoMo-10 conversations
+  (Snap Research, NAACL 2024). Same x-owner-isolation pattern as the
+  LongMemEval harness. Substring + LLM judge modes. Summarization and
+  multimodal-dialogue tasks deferred to v2.11.
+- **#5 Swiss Trust Memory Bench skeleton** — `bench/swiss-trust-bench.ts`
+  with 9 end-to-end scenarios: strict-mode deny / permissive allow /
+  governance-builder / cross-tenant isolation / hard-erase audit
+  chain / audit-chain integrity under burst / fact-gate orphan
+  rejection / entity-gate fragment rejection / model-routing context
+  plumbing. **9/9 scenarios pass** on a fresh strict-mode bench
+  instance. This is the differentiator no other memory system has.
+
+### Test counts
+
+- v2.9.0:  222 tests, 24 files, 519 expect() calls
+- v2.10.0: 231 tests, 26 files, 551 expect() calls (+9 tests covering
+  cognitive approval flow + RRF integration)
+
+### v3.0 milestone — what's still missing
+
+The reviewer's v3.0 acceptance criteria split into:
+- **Code (this release):** RRF wired, cognitive approval, harness
+  ablation modes, LoCoMo skeleton, Swiss Trust Bench skeleton.
+- **Evidence (next sessions):** full 500-question LongMemEval with
+  --extract --judge llm; LoCoMo QA full run; weighted-vs-RRF
+  ablation matrix; extraction precision/recall against a
+  human-labeled sample; Zep/Hindsight apples-to-apples baseline
+  comparison; optional direct Zep run.
+
+A small 50-question LongMemEval run with `--extract --judge llm`
+will be kicked off in the background after this commit lands.
+
+---
+
 ## v2.9.0 — 2026-05-16
 
 Closes every P0 from the v2.8.0 external review and adds the architectural

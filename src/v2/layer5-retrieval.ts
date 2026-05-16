@@ -24,6 +24,7 @@ import { appendAudit } from "./layer6-audit";
 import { pickEmbedder, vectorSearch, type Embedder } from "./layer5-embeddings";
 import { buildEvidenceChain, buildSupportIndex } from "./layer5-graph";
 import { factValidAt, toEpochMs } from "./temporal";
+import { reciprocalRankFusion } from "./layer5-rrf";
 
 // Module-level cached embedder — initialized once per process.
 let _embedder: Embedder | null = null;
@@ -344,6 +345,53 @@ export async function recall(
     // For facts: include derived_from chain
     if (kind === "fact" && rec.frontmatter.derived_from) {
       evidenceChain.push(...(rec.frontmatter.derived_from as string[]));
+    }
+  }
+
+  // v2.10.0+ optional Reciprocal Rank Fusion (NEW — closes v3.0 criterion).
+  // The default path uses the weighted-linear score we just computed above.
+  // When query.fusion === "rrf", we replace that score with RRF over five
+  // per-signal ranked lists (keyword/vector/graph/temporal/entity). RRF is
+  // scale-free — it cares about ranks, not raw scores, which means it
+  // tolerates mixed score ranges without weight tuning. Both modes use the
+  // SAME hit set; only the ordering differs.
+  if (query.fusion === "rrf") {
+    // Build the five candidate lists by sorting `hits` on each signal.
+    // A document absent from a list contributes 0 from that list.
+    const byKeyword = [...hits].sort((a, b) =>
+      (b.score_components.idf ?? 0) - (a.score_components.idf ?? 0)
+    );
+    const byVector = [...hits].sort((a, b) =>
+      (b.score_components.vector ?? 0) - (a.score_components.vector ?? 0)
+    );
+    const byGraph = [...hits].sort((a, b) =>
+      (b.score_components.graph_support ?? 0) - (a.score_components.graph_support ?? 0)
+    );
+    const byTemporal = [...hits].sort((a, b) =>
+      (b.score_components.recency ?? 0) - (a.score_components.recency ?? 0)
+    );
+    // Title boost acts as an entity-overlap proxy when entity-overlap isn't
+    // computed separately yet — proper entity-graph candidates are v2.11.
+    const byTitle = [...hits].sort((a, b) =>
+      (b.score_components.title ?? 0) - (a.score_components.title ?? 0)
+    );
+    const fused = reciprocalRankFusion([
+      { name: "keyword", items: byKeyword },
+      { name: "vector", items: byVector },
+      { name: "graph", items: byGraph },
+      { name: "temporal", items: byTemporal },
+      { name: "title", items: byTitle },
+    ]);
+    // Replace each hit's score with the RRF score, preserving components
+    // for debuggability, then re-sort by the new score.
+    const idToHit = new Map(hits.map(h => [h.id, h]));
+    hits.length = 0;
+    for (const f of fused) {
+      const h = idToHit.get(f.id);
+      if (!h) continue;
+      h.score = f.rrf_score;
+      h.score_components = { ...h.score_components, rrf: f.rrf_score };
+      hits.push(h);
     }
   }
 

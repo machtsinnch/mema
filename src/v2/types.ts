@@ -212,6 +212,12 @@ export interface RetrievalQuery {
     approved_models?: string[];
   };
   policy_mode?: "permissive" | "strict";  // override env var per-call
+  // v2.10.0+ fusion strategy (NEW; closes v3.0 RRF criterion). Default
+  // "weighted" keeps the v2.5.1→v2.9.0 linear-sum scorer. Switch to
+  // "rrf" to use Reciprocal Rank Fusion across keyword, vector, graph,
+  // temporal, entity candidate lists — scale-free fusion that doesn't
+  // depend on the per-signal score ranges.
+  fusion?: "weighted" | "rrf";
 }
 
 export interface RetrievalHit {

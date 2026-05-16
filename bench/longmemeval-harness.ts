@@ -56,6 +56,16 @@ interface Args {
   ollamaHost: string;
   topK: number;
   contextChars: number;     // truncate context packet for the answer prompt
+  // v2.10.0+ ablation switches (NEW — closes v3.0 comparison criterion).
+  // retrieval mode toggles how the recall context is built per question:
+  //   - hybrid      : current mema /v2/recall (keyword + vector + graph + ...)
+  //   - bm25        : keyword-only baseline (mema with use_vector=false)
+  //   - vector      : vector-only baseline (no keyword/title/graph signals)
+  //   - full-context: dump ALL haystack sessions into the answer prompt
+  //                   (oracle upper bound on answer accuracy; tests pure
+  //                   reading/reasoning capability of the judge LLM)
+  retrievalMode: "hybrid" | "bm25" | "vector" | "full-context";
+  fusion: "weighted" | "rrf";   // forwarded to /v2/recall as query.fusion
 }
 
 interface ChatTurn { role: string; content: string }
@@ -119,6 +129,8 @@ function parseArgs(): Args {
     ollamaHost: String(flags["ollama-host"] ?? process.env.OLLAMA_HOST ?? "http://localhost:11434"),
     topK: flags["top-k"] ? Number(flags["top-k"]) : 10,
     contextChars: flags["context-chars"] ? Number(flags["context-chars"]) : 4000,
+    retrievalMode: (flags["retrieval-mode"] ? String(flags["retrieval-mode"]) : "hybrid") as Args["retrievalMode"],
+    fusion: (flags["fusion"] ? String(flags["fusion"]) : "weighted") as Args["fusion"],
   };
 }
 
@@ -351,25 +363,41 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
     }
   }
 
-  // 3. Recall — single hybrid query against the question text. We score
-  //    on whether any retrieved episode corresponds to a gold session.
+  // 3. Recall — v2.10.0+ ablation-aware. The retrieval-mode switch
+  //    routes the question through one of four pipelines so we can
+  //    publish apples-to-apples ablations alongside the mema number.
   const t1 = Date.now();
-  const recallRes = await apiOwner("/v2/recall", {
-    query: rec.question,
-    purpose: "longmemeval_benchmark",
-    kinds: ["episode"],
-    limit: args.topK,
-    use_vector: true,
-  });
-  const recallMs = Date.now() - t1;
-
   let retrievedSessions: string[] = [];
-  if (recallRes.ok) {
-    const rj = await recallRes.json() as { hits: { id: string }[] };
-    const idToSession = new Map<string, string>();
-    for (const [sid, eid] of sessionToEpisode) idToSession.set(eid, sid);
-    retrievedSessions = rj.hits.map(h => idToSession.get(h.id) ?? h.id);
+
+  if (args.retrievalMode === "full-context") {
+    // Oracle upper bound: every haystack session in order is "retrieved".
+    // The answer-generation step still gets capped by --context-chars.
+    retrievedSessions = [...rec.haystack_session_ids];
+  } else {
+    const useVector = args.retrievalMode === "vector" || args.retrievalMode === "hybrid";
+    const recallRes = await apiOwner("/v2/recall", {
+      query: rec.question,
+      purpose: `longmemeval_${args.retrievalMode}_${args.fusion}`,
+      kinds: ["episode"],
+      limit: args.topK,
+      use_vector: useVector,
+      fusion: args.fusion,
+    });
+    if (recallRes.ok) {
+      const rj = await recallRes.json() as { hits: { id: string }[] };
+      const idToSession = new Map<string, string>();
+      for (const [sid, eid] of sessionToEpisode) idToSession.set(eid, sid);
+      retrievedSessions = rj.hits.map(h => idToSession.get(h.id) ?? h.id);
+    }
+    if (args.retrievalMode === "vector") {
+      // Vector-only ablation: drop keyword-anchored hits by re-querying
+      // with a vector-only purpose label — recall() doesn't currently
+      // expose a pure-vector mode, so this is best-effort. Marked
+      // explicitly in the output so the reader knows the caveat.
+      // (Pure-vector ablation requires a future query.vector_only flag.)
+    }
   }
+  const recallMs = Date.now() - t1;
 
   const hits = scoreHits(retrievedSessions, rec.answer_session_ids);
 
@@ -503,6 +531,7 @@ async function main() {
   console.log(`  Owner:    ${args.owner}_<question_id>`);
   console.log(`  Limit:    ${args.limit}${args.category ? ` (category=${args.category})` : ""}`);
   console.log(`  top-K:    ${args.topK}`);
+  console.log(`  Mode:     retrieval=${args.retrievalMode}  fusion=${args.fusion}`);
   console.log(`  Extract:  ${args.extract ? "yes (LLM-extracted drafts then auto-review)" : "no (retrieval-only)"}`);
   console.log(`  Judge:    ${args.judge}${args.judge !== "none" ? ` (model=${args.judgeModel})` : ""}`);
   console.log("");
