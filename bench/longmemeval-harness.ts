@@ -570,7 +570,20 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
       // v2.11.1+ — pass the session's haystack date as OBSERVATION_DATE so
       // the extractor can ground relative temporal refs ("yesterday", "today")
       // to the actual conversation time, not to extractor-run time.
-      const observationDate = rec.haystack_dates[idx] ?? rec.question_date ?? new Date().toISOString().slice(0, 10);
+      // v2.11.1+ — temporal-grounding rule: NEVER fall back to wall-clock
+      // now() here. If the LongMemEval record has neither a haystack_date
+      // nor a question_date, fail loudly rather than silently re-introduce
+      // the v2.11.0-rc.1 bug. Per critic review of v2.11.1.
+      const observationDate = rec.haystack_dates[idx] ?? rec.question_date;
+      if (!observationDate) {
+        throw new Error(`[harness] missing haystack_dates[${idx}] and question_date for question ${rec.question_id}; cannot ground extraction temporally`);
+      }
+      // v2.11.1+ — Ollama extractor doesn't thread observationDate yet (v2.13
+      // work). Warn loudly so a Claude-grounded bench's results aren't quietly
+      // compared against an Ollama-extracted run.
+      if (args.extractorBackend === "ollama") {
+        console.warn(`[harness] WARNING: --extractor-backend ollama does NOT propagate observation_date to the extractor. Facts will be stamped with extraction-time (today), reproducing the v2.11.0-rc.1 temporal-grounding bug. Use --extractor-backend claude or codex for honest bench numbers.`);
+      }
       let result;
       try {
         if (args.extractorBackend === "claude") {
