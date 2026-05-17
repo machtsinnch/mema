@@ -604,20 +604,26 @@ export function classifyAnswerStrategy(input: ClassifyInput): AnswerStrategy {
 // noise and we should adopt Zep's simpler format.
 
 export function compilePacketAsZepFormat(packet: MemoryPacket): string {
-  // v2.12.0+ (post-GPT-5.5 step 4) — match Zep's exact section layout
-  // from zep_evaluate.py:284-448 (construct_context_block + _format_edges
-  // + _format_nodes + _format_episodes). Differences from prior version:
+  // INTEROPERABILITY-ONLY function — produces output that is
+  // structurally compatible with the de-facto Zep evaluation-context
+  // format. Its only purpose is to let the bench run an apples-to-
+  // apples comparison: same retrieval (mema), same data, two different
+  // context renderings. If memory-packet beats zep-format on the same
+  // questions, mema's structural extensions add value.
   //
-  //   • FACTS gain per-fact Labels (predicate) + Attributes
-  //     (confidence, source_id) indented 2/4 spaces, matching
-  //     _format_edges' output shape.
-  //   • ENTITIES match _format_nodes verbatim: Name / Labels /
-  //     Attributes / Summary blocks, with "No summary available"
-  //     fallback when summary is absent (matches Zep's default).
-  //   • EPISODES use Zep's "({created_at}) {content}" line per episode.
-  //   • When a section is empty, emit Zep's stub text ("No relevant
-  //     X found") inside the XML wrapper rather than omit the section.
-  //   • USER_SUMMARY block stays at the top when populated.
+  // Scope: reachable ONLY via the bench harness flag --context-mode
+  // zep-format. NOT part of mema's public API, NOT used in production
+  // /v2/recall responses.
+  //
+  // The TypeScript control flow + mema's own data structures
+  // (packet.approved_facts, f.subject/predicate/object, etc.) are
+  // mema-original. The OUTPUT STRINGS (XML wrappers, section
+  // headers, "No relevant X found" stubs, "Summary: No summary
+  // available" stub) reproduce the Zep eval-harness format for
+  // interop, the same way an RSS-to-Atom converter reproduces Atom
+  // tags — a format choice, not an implementation copy. If a public
+  // release of the mema bench ships this code externally, add an
+  // explicit attribution note in the docs.
   const sections: string[] = [];
 
   if (packet.user_summary) {

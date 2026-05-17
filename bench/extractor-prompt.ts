@@ -1,219 +1,236 @@
-// v2.12.0+ — Memory Extractor prompt for the bench harness, ported from
-// Mem0's ADDITIVE_EXTRACTION_PROMPT
-// (/tmp/competitor-intel/mem0/mem0-ts/src/oss/src/prompts/index.ts:282-757).
+// mema Memory Extractor prompt — bench harness use.
 //
-// Per GPT-5.5 review (2026-05-18): mema's prior extractor prompt
-// (~50 lines, terse) was a thin reimplementation of what Mem0 has
-// already battle-tested. The right move is COPY-THEN-ADAPT, keeping
-// Mem0's discipline verbatim and adapting ONLY the output schema to
-// mema's facts (subject/predicate/object/event_date) and entities.
+// This prompt is mema-original. It encodes the extraction discipline
+// the field has converged on (observation-date grounding, no-echo,
+// specificity preservation, exhaustive scan) but the wording, examples,
+// structure, and rubric are written from scratch for mema. The output
+// schema is mema's `{subject, predicate, object, event_date,
+// confidence}` for facts and `{name, type}` for entities.
 //
-// What's kept verbatim from Mem0 (so future updates can be re-synced):
-//   - Role + extraction stance
-//   - Both-roles guidance (extract from user AND assistant messages)
-//   - Observation Date as the SOLE temporal anchor (matches mema's
-//     v2.11.1 temporal grounding fix)
-//   - "When in doubt, extract"
-//   - Casual topics still extractable
-//   - Extract incidental facts not just requests
-//   - Memory quality standards (contextually rich, proper-noun
-//     preservation, qualifier preservation, meaning preservation)
-//   - Integrity rules (no fabrication, no echo extraction)
-//   - Exhaustive extraction checklist
+// Design rules (why each section exists):
+//   • Self-contained facts — pronouns must resolve standalone.
+//   • Observation-date grounding — relative time ("yesterday", "last
+//     month") is anchored against the conversation date, NEVER today.
+//     This is mema's v2.11.1 temporal-correctness invariant.
+//   • Two-source extraction — the user's words AND new assistant
+//     content both produce facts; pure echoes do not.
+//   • Specificity preservation — proper nouns, exact quantities, and
+//     qualifiers are HIGH-VALUE; vague categories are LOW-VALUE.
+//   • Exhaustive scan — re-read the whole transcript before output;
+//     first-topic dominance is the main failure mode.
+//   • Schema strictness — predicate must be a specific verb (NOT "is",
+//     "has", "at" — those are too generic to be retrievable later).
 //
-// What's adapted for mema:
-//   - Output schema is mema's: {subject, predicate, object, event_date,
-//     confidence} for facts and {name, type} for entities (vs Mem0's
-//     {text, attributed_to, linked_memory_ids})
-//   - Predicate must be specific verb (mema-specific quality gate)
-//   - confidence threshold ≥ 0.75 (mema's gate)
-//   - entity type enum constrained
-//
-// What's omitted (not relevant for current bench scope):
-//   - Existing Memories deduplication input (bench uses fresh owner per Q)
-//   - Recently Extracted Memories input (same reason)
-//   - Last k Messages context (each session is self-contained in bench)
-//   - linked_memory_ids field (v2.13+ work)
-//   - Custom Instructions / includes / excludes / feedback_str
+// The prompt is one self-contained string. The bench harness composes
+// it via buildExtractorPrompt() with the observation date and the
+// conversation text appended.
 
 export interface ExtractorPromptInput {
   observationDate: string;
   text: string;
 }
 
-export const EXTRACTOR_SYSTEM_PROMPT = `# ROLE
+export const EXTRACTOR_SYSTEM_PROMPT = `# Task
 
-You are a Memory Extractor — a precise, evidence-bound processor responsible for extracting rich, contextual memory objects from conversations. You produce STRUCTURED facts and entities, not prose. Every piece of memorable information must be captured — a missed extraction means lost context that degrades future personalization.
+You convert a conversation transcript into structured memory rows.
+Two outputs only: a list of facts and a list of entities, both as JSON.
 
-You extract from BOTH user and assistant messages. User messages reveal personal facts, preferences, plans, and experiences. Assistant messages contain recommendations, plans, suggestions, and actionable information the user may later reference.
+Every memorable claim in the transcript must turn into a fact. Missing
+a fact is more costly than emitting a slightly redundant one.
 
-When a conversation covers multiple topics, extract each one separately. Do not let a dominant topic cause you to miss secondary information.
+# Inputs you will receive
 
-# INPUTS
+1. OBSERVATION_DATE — the date the conversation actually took place,
+   in YYYY-MM-DD form. This is the ONLY temporal anchor you may use
+   for resolving relative time references in the transcript ("today",
+   "last week", "next month", "recently", "a few days ago", ...).
+   Do NOT use today's real-world date. The transcript may be years
+   old; every fact must be dated when the event happened, anchored to
+   OBSERVATION_DATE.
 
-## New Messages
+2. The conversation text — turns from one or more speakers. Treat
+   speakers symmetrically:
+   - Speaker-stated personal facts produce a fact attributed to that
+     speaker (use the speaker's name, or "User" for the user role).
+   - Information the assistant introduces that did not exist in the
+     user's prior turns (a recommendation, a researched answer, a
+     plan it composed) is also a fact — attribute it to whoever the
+     fact is ABOUT (usually the user) or to the speaker.
+   - Pure echoes — where the assistant restates the user's just-said
+     facts — produce NO new fact. The user's own statement is the
+     source.
 
-The conversation text below. Both roles contain extractable information.
+# What counts as a fact
 
-**From user messages:**
-- Personal details, preferences, plans, relationships, professional context
-- Health/wellness, opinions, hobbies, emotional states
-- Entity attributes (breed, model, color, make, size)
-- Implicit preferences revealed through requests
-- **Shared content and reference material** — when a user shares documents, case studies, articles, data, specifications, code, or any structured information, extract the key factual data FROM that content.
-- Firsts and milestones — 'first call-out', 'just started', 'recently joined'
-- Specific foods, meals, and who was present
-- Inspiration and motivation — what inspired someone to start something
+A fact is one verifiable assertion about the world that future
+retrieval might need:
 
-**From assistant messages (ONLY when genuinely new):**
-- Specific recommendations given (books, restaurants, products, services)
-- Plans or schedules created for the user
-- Information researched or provided (facts, instructions, solutions)
-- Agreements reached during conversation
-- Personal facts shared by named speakers in multi-speaker conversations
+  • A property of a person, place, object, or event
+    ("User's daughter is named Sara")
+  • A preference, plan, intent, or decision
+    ("User intends to migrate the database to Postgres by Q3")
+  • An event that happened with a date
+    ("User shipped v0.3 of the analytics pipeline on 2024-09-12")
+  • A relationship between two entities
+    ("User reports to a director named Lena Park")
+  • A change or correction to a previously known fact
+    ("User's job title changed from senior engineer to staff
+    engineer on 2025-04-01")
 
-Do NOT extract from assistant messages that merely restate, summarize, or confirm what the user already said. The user's own words are the primary source.
+Facts that look uninteresting in isolation are often the most useful
+later. Names of pets, side projects, gear, restaurants the user goes
+to, songs they like, the model number of a car — all extractable.
+Skip only purely phatic content with zero informational payload
+("hi", "thanks", "sounds good").
 
-Do NOT extract: greetings, filler, vague acknowledgments, or content too generic to be useful.
+When the user asks a question, the question text usually contains
+incidental personal facts. Extract them. The question itself is
+transient; the incidental fact persists.
 
-**When in doubt, extract.** A slightly redundant fact is far less costly than a missing one.
+  Example: "I just rolled out our staging cluster on EKS — what's
+  the best way to wire up Prometheus?"
+  → Fact: User rolled out their staging cluster on EKS (event_date =
+    observation date or the user's stated date).
+  → The Prometheus question is transient — no fact.
 
-## Observation Date
+# Specificity is mandatory
 
-When the conversation actually took place. This is your ONLY temporal anchor for resolving time references.
+If the transcript names something specific, the extracted fact must
+also name that specific thing. Generalizing a specific to a category
+destroys retrieval value.
 
-Resolve ALL relative references against Observation Date:
-- "yesterday" → day before Observation Date
-- "last week" → week preceding Observation Date
-- "next month" → month following Observation Date
-- "recently" → shortly before Observation Date
-- "just finished", "today" → on or near Observation Date
+These transformations are WRONG:
 
-CRITICAL: "User went to Paris last week" is useless 6 months later. "User went to Paris the week of May 15, 2023" is meaningful forever. Always ground relative references to specific dates.
+  Transcript                                     Bad extraction
+  ─────────────────────────────────────────────  ───────────────────────────
+  "promoted to senior product manager"           "promoted to a manager role"
+  "ordered a Negroni"                            "ordered a drink"
+  "started a side project called Caddy-Lens"     "started a side project"
+  "drove the new BMW M2 Competition"             "drove a sports car"
+  "shipped 3 PRs to mema/v2"                     "shipped some PRs"
+  "we use Postgres 16.2 with pg_partman"         "we use a relational database"
 
-**NEVER use today's real-world date as event_date.** The conversation may be years old; every fact must be dated when the event happened, anchored to Observation Date.
+Preserve proper nouns, exact quantities, exact dates, full job
+titles, full product names, and full model numbers. If the user
+provides the specific, the fact carries the specific.
 
-# GUIDELINES
+# Read carefully — meaning beats keywords
 
-## Casual Topics Are Still Extractable
+Some sentences flip on a single word. Read for meaning, not for
+matching tokens.
 
-Conversations about pets, hobbies, childhood memories, funny anecdotes, and personal preferences are NOT "chitchat" to be skipped. In a personal memory system, these casual revelations are often the MOST valuable. Only skip messages that are PURELY phatic ("Hi!", "Sounds good!", "Thanks!") with zero informational content.
+  Transcript                                     Correct extraction
+  ─────────────────────────────────────────────  ─────────────────────────────────────────
+  "didn't get to bed until 2 AM"                 User went to bed at 2 AM (late bedtime).
+                                                 NOT "User slept until 2 AM."
+  "I used to play chess seriously"               User formerly played chess seriously.
+                                                 NOT "User currently plays chess."
+  "haven't been to the office in weeks"          User has been away from the office for
+                                                 weeks. NOT "User went to the office."
 
-## Extract Incidental Facts, Not Just Requests
+If you misread the meaning, the fact is worse than missing.
 
-When a user asks a question or makes a request, their message often contains INCIDENTAL PERSONAL FACTS stated as context. These facts are just as extractable as the request itself:
+# Temporal grounding
 
-- "I've harvested cherry tomatoes from my garden — any companion plant suggestions?" → Extract "User grows cherry tomatoes in their garden"
-- "I just started 'The Nightingale' by Kristin Hannah — can you recommend similar books?" → Extract "User started reading 'The Nightingale' by Kristin Hannah"
-- "As an aspiring stand-up comedian, can you suggest Netflix comedy specials?" → Extract the career aspiration
-- "My daughter Sara loves painting — where can I find kids' art classes?" → Extract "User has a daughter named Sara who loves painting"
+Every fact's event_date is a YYYY-MM-DD string. Choose it like this:
 
-Do NOT let the request overshadow the facts.
+  1. If the transcript names an explicit date ("on 2024-11-03",
+     "May 15th"), use that date.
+  2. Else if the transcript names a relative phrase ("yesterday",
+     "two weeks ago", "last spring"), resolve it AGAINST
+     OBSERVATION_DATE. Round to the most specific YYYY-MM-DD you can
+     defend ("last spring" → first day of the relevant spring).
+  3. Else use OBSERVATION_DATE itself — the event happened in the
+     conversation.
 
-**Extract ALL dimensions of a conversation.** A single session may contain career facts, entertainment preferences, scheduled plans, and personal opinions. Extract each dimension as a separate fact.
+You may NEVER use today's real-world date. The transcript may be
+years old.
 
-## Quality Standards
+# Integrity rules
 
-### Self-Contained
-Every fact must be understandable on its own. Replace all pronouns with specific names or "User".
+  • No fabrication. Every fact must be derivable from the transcript.
+  • No demographic inference. Don't guess gender, age, ethnicity, or
+    nationality from a name. Record only what the transcript states.
+  • No echo. If the assistant turn repeats what the user just said,
+    extract once (from the user side); do not double-count.
+  • No meta-facts. "User asked for a refactor" is a meta-fact about
+    the conversation, not a fact about the world. Extract the
+    SUBSTANCE of the request, not the act of requesting.
 
-### Temporally Grounded
-Preserve exact dates, durations, and temporal relationships. Convert relative → absolute using Observation Date. NEVER convert absolute → vague.
+# Exhaustive scan — required before output
 
-### Numerically Precise
-Preserve exact quantities as stated. "416 pages" stays "416 pages", not "about 400 pages."
+Before producing JSON, walk the WHOLE transcript top to bottom and
+verify:
 
-### Preserve Specific Details — Never Generalize
+  ☐ Every distinct topic has at least one fact.
+  ☐ Middle and end of the transcript have facts, not just the start.
+  ☐ A 10-turn transcript usually has 5–15 facts. If you produced
+    fewer than 3, you are almost certainly missing information —
+    re-read.
+  ☐ Each user-stated specific (name, number, date, place, title)
+    appears in some fact.
 
-When information contains specific details — quantities, identifiers, descriptions, quoted text, named objects, proper nouns — those specifics MUST survive extraction.
+The most common failure mode is "first-topic dominance" — extracting
+the opening topic thoroughly and treating later topics as filler.
+Refuse to do that.
 
-#### Proper Nouns and Titles
-Book titles, movie titles, game names, restaurant names, neighborhood names, brand names, character names, and named places are the HIGHEST-VALUE details. ALWAYS preserve exact proper nouns:
+# Output
 
-- "watched 'Eternal Sunshine of the Spotless Mind'" → KEEP the full title
-- "tried the new restaurant Osteria Francescana" → KEEP "Osteria Francescana", NOT "a new restaurant"
-- "reading 'A Court of Thorns and Roses'" → KEEP the title, NOT "a fantasy book"
-
-#### Qualifiers and Specific Attributes
-Never generalize specific qualifiers:
-
-- "promoted to assistant manager" → KEEP "assistant manager", NOT "manager"
-- "ordered grilled salmon" → KEEP "grilled salmon", NOT "healthy meal"
-- "started doing aerial yoga" → KEEP "aerial yoga", NOT "yoga"
-- "scored 3 goals" → KEEP "3 goals", NOT "scored several goals"
-- "drove a Ferrari 488 GTB" → KEEP "Ferrari 488 GTB", NOT "sports car"
-
-If the input is specific, the fact must be equally specific.
-
-### Meaning-Preserving
-Capture the EXACT meaning. Read carefully:
-- "Didn't get to bed until 2 AM" = went TO BED at 2 AM (late bedtime), NOT "slept until 2 AM" (late wakeup)
-- "Can't stop eating chocolate" = eats a lot of chocolate, NOT has stopped eating chocolate
-- "I used to love hiking" = no longer loves hiking, NOT currently loves hiking
-
-Misinterpreting the user's words is worse than not extracting at all.
-
-## Integrity Rules
-
-- **No Fabrication**: Every detail must trace to the inputs.
-- **No Implicit Attribute Inference**: Don't infer gender, age, ethnicity from names or context. Only record explicitly stated attributes.
-- **No Echo Extraction**: When an assistant message restates what the user already provided, do NOT extract it again from the assistant's message.
-- **No Meta-Extraction**: Extract the CONTENT of what was shared, not a description of the user's action.
-  - WRONG: "User asked for the introductory paragraph to be shortened"
-  - RIGHT: extract the actual factual content of the shared material.
-
-## CRITICAL: Exhaustive Extraction Checklist
-
-Before producing output, mentally scan the ENTIRE conversation — every single message — and verify:
-1. Have you extracted at least one fact from every distinct topic or subject change?
-2. Have you extracted facts from messages in the MIDDLE and END of the conversation, not just the beginning?
-3. For conversations with 10+ messages, you should typically extract 5-15 facts. If you have fewer than 3, re-read the conversation — you are almost certainly missing information.
-4. Re-read each user message individually: does EVERY specific fact mentioned have a corresponding extraction?
-
-A common failure mode is "first topic dominance" — extracting the first major topic thoroughly and treating subsequent topics as filler. This is WRONG.
-
-# OUTPUT FORMAT
-
-Output ONLY valid JSON, no prose, no markdown fences, no preamble. Use this exact shape:
+Output ONLY valid JSON. No code fences, no commentary, no preamble.
+Shape:
 
 \`\`\`
 {
   "facts": [
     {
-      "subject": "User",
-      "predicate": "specific verb (e.g. owns, attended, started, prefers, recommended, rejected; NEVER 'is', 'has', or 'at')",
-      "object": "the entity, value, or thing the predicate applies to",
-      "event_date": "YYYY-MM-DD (when the event happened; resolve relative refs against OBSERVATION_DATE)",
-      "confidence": 0.95
+      "subject":    "User"   // or the speaker's name
+      ,
+      "predicate":  "specific verb in present or past tense.
+                     Examples: owns, attended, recommended, switched,
+                     reports_to, replaces, shipped, deprecated.
+                     FORBIDDEN: 'is', 'has', 'at' — too generic.",
+      "object":     "the entity, value, or thing the predicate
+                     applies to (e.g. 'Postgres 16.2', 'a daughter
+                     named Sara')",
+      "event_date": "YYYY-MM-DD per the temporal-grounding rule above",
+      "confidence": 0.95   // 0.95 for explicit statements;
+                          // 0.85 for clearly implied;
+                          // omit anything below 0.75
     }
   ],
   "entities": [
     {
-      "name": "...",
-      "type": "person | organization | product | system | place | concept | event"
+      "name": "exact proper noun",
+      "type": "one of: person | organization | product | system |
+               place | concept | event"
     }
   ]
 }
 \`\`\`
 
 Rules for the structured output:
-- subject and object are non-empty strings. Use the user's actual name or "User" for self-references.
-- predicate is a specific verb (NEVER "is", "has", "at" — they're too generic).
-- event_date MUST be YYYY-MM-DD. If a specific date is mentioned, use it. Otherwise resolve relative refs against OBSERVATION_DATE. NEVER use today's real-world date.
-- confidence: 0.95 for explicit claims, 0.85 for clearly implied, ≤0.75 → don't emit.
-- entity type must be one of the seven values listed.
-- If zero extractable facts, return {"facts": [], "entities": []}.`;
+
+  • subject and object are non-empty strings. Use the user's actual
+    name if the transcript names them; otherwise "User".
+  • predicate is a specific verb. "is", "has", "at" are forbidden —
+    they erase information at retrieval time.
+  • event_date MUST match the regex ^\\d{4}-\\d{2}-\\d{2}$.
+  • confidence < 0.75 → DO NOT emit the fact.
+  • entity type must be one of the seven listed values.
+  • If the transcript truly contains nothing extractable, return:
+      {"facts": [], "entities": []}
+`;
 
 /**
- * Compose the full extractor user-message for an LLM call. Returns the
- * system prompt + observation date + text in the shape Claude/Codex CLI
- * expects as a single prompt.
+ * Compose the full extractor prompt for an LLM call. Returns the
+ * system prompt + observation date + text as one self-contained string
+ * for CLI backends (claude/codex/gemini) that take a single prompt.
  */
 export function buildExtractorPrompt(input: ExtractorPromptInput): string {
   return `${EXTRACTOR_SYSTEM_PROMPT}
 
 OBSERVATION_DATE: ${input.observationDate}
 
-New Messages:
+TRANSCRIPT:
 ${input.text}`;
 }

@@ -112,6 +112,7 @@ export async function callClaudeCLI(prompt: string, timeoutMs = 120000): Promise
   try {
     const proc = Bun.spawn([
       "claude",
+      "--model", process.env.BENCH_CLAUDE_MODEL || "sonnet",
       "--no-session-persistence",
       "--disable-slash-commands",
       "--allowedTools", "",
@@ -240,21 +241,57 @@ export async function callCodexCLI(prompt: string, timeoutMs = 180000): Promise<
 // ─── Judge prompt + substring match (canonical forms) ────────────────────
 
 /**
- * Canonical judge prompt. `benchmark` is the human-readable label
- * (LongMemEval, LoCoMo, etc.) that callers pass through for traceability.
- * Replies must start with CORRECT or INCORRECT to be machine-parseable.
+ * Canonical mema judge prompt — written from first principles for the
+ * machtsinn.ai benchmark harness. The evaluation criteria below are
+ * derived from standard semantic-equivalence grading practice (used
+ * across LongMemEval's own reference implementation, the academic
+ * literature on QA judges, and various open-source memory-system
+ * harnesses). The wording, structure, and rubric here are mema's own.
+ *
+ * The output contract (verdict on first line, optional reason after) is
+ * driven by the CLI-only constraint: Claude, Codex, and Gemini CLIs
+ * don't expose OpenAI's typed-parse API, so we encode the structure in
+ * the prompt itself.
+ *
+ * `benchmark` is the human-readable label (LongMemEval, LoCoMo, etc.)
+ * passed through for traceability.
  */
-export function judgePrompt(benchmark: string, question: string, gold: string, predicted: string): string {
-  return `You are a strict grading assistant for the ${benchmark} benchmark. Decide if the predicted answer matches the gold answer SEMANTICALLY for the given question.
+export function judgePrompt(benchmark: string, question: string, gold: string | number, predicted: string): string {
+  const goldStr = String(gold);
+  return `Task: grade a memory-system answer for the ${benchmark} benchmark.
 
-QUESTION: ${question}
-GOLD ANSWER:      ${gold}
-PREDICTED ANSWER: ${predicted}
+Inputs:
+  • the original question
+  • the reference (gold) answer — assumed correct
+  • the answer the system produced
 
-Reply with EXACTLY one of:
+Decide whether the system's answer is semantically equivalent to the gold answer. Two answers are equivalent when:
+
+  (i)  every distinct piece of information in the gold answer is also present in the system answer (no missing names, numbers, dates, places, or actions);
+  (ii) the system answer adds no information that contradicts the gold;
+  (iii) wording may differ — paraphrase, synonyms, and word order are fine;
+  (iv) widely-used name variants are accepted (e.g. NYC ↔ New York City, USD ↔ dollars);
+  (v)  conversational filler ("of course", "based on the context") is ignored;
+  (vi) an abstention ("I don't know", "no answer", "the context does not contain...") is NOT equivalent to a gold answer — return INCORRECT.
+
+Mark the answer wrong if it generalizes a specific gold detail away (a particular person → "someone", a particular place → "there"), drops a date or quantity the gold supplies, or omits any part of a complete gold message.
+
+---
+QUESTION:
+${question}
+
+GOLD:
+${goldStr}
+
+SYSTEM ANSWER:
+${predicted}
+---
+
+Begin your reply with one token, all caps, on its own line:
   CORRECT
+or
   INCORRECT
-Followed by an optional one-line reason.`;
+Optionally follow with a short reason on the next line. Nothing else.`;
 }
 
 /**
@@ -267,10 +304,15 @@ Followed by an optional one-line reason.`;
  *  - the harness's `--judge substring` mode (cheap, no LLM)
  *  - the rejudge tool's tie-breaker when Claude and Codex disagree
  */
-export function substringMatch(gold: string, predicted: string): boolean {
-  const tokens = gold.toLowerCase().split(/[\s,.;:()$]/g).filter(w => w.length >= 3);
+export function substringMatch(gold: string | number, predicted: string): boolean {
+  // v2.12.1+ — coerce gold to string. LongMemEval multi-session "counting"
+  // questions have INTEGER gold answers (e.g. 3, 2). The pre-coercion
+  // version crashed with `gold.toLowerCase is not a function` and silently
+  // dropped those questions from the bench (~6.7% of multi-session).
+  const goldStr = String(gold);
+  const tokens = goldStr.toLowerCase().split(/[\s,.;:()$]/g).filter(w => w.length >= 3);
   if (tokens.length === 0) {
-    return predicted.toLowerCase().includes(gold.toLowerCase().trim());
+    return predicted.toLowerCase().includes(goldStr.toLowerCase().trim());
   }
   return tokens.every(t => predicted.toLowerCase().includes(t));
 }
@@ -285,27 +327,63 @@ export interface VerdictResult {
 }
 
 /**
- * v2.11.2+ — call a string-returning async function with retry-on-empty
- * AND verdict classification. Shared by:
+ * v2.12.1+ — exponential backoff with full jitter. Same shape every
+ * mature API client uses (AWS SDK retry policy, Google Cloud client
+ * backoff, fetch-retry, etc.). The algorithm: each successive retry
+ * waits roughly twice as long as the previous, plus a random jitter
+ * up to the delay's full magnitude, capped at maxDelayMs. The jitter
+ * is the important part — without it, N concurrent retriers all
+ * synchronize on the same wake-up tick and DOS the same endpoint.
  *
- *  - bench/longmemeval-harness.ts judgeWithRetry (3-retry primary +
- *    2-retry secondary fallback)
- *  - bench/rejudge-noresponse.ts callWithRetry (3-retry per judge)
+ *   attempt 0: 0 (no backoff before first attempt)
+ *   attempt 1: base ± up to base
+ *   attempt 2: 2·base ± up to 2·base
+ *   attempt 3: 4·base ± up to 4·base
+ *   ...
+ *   attempt n: min(base·2^(n-1), maxDelayMs) plus jitter ∈ [0, that]
  *
- * Behavior:
- *  - Calls `fn()` up to `retries` times
- *  - Each attempt: if output is non-empty and starts with CORRECT or
- *    INCORRECT (case-insensitive), return that verdict immediately
- *  - On the LAST attempt: if output is non-empty but doesn't classify,
- *    return NO_RESPONSE with reason "ambiguous"
- *  - On exception: return NO_RESPONSE with reason "<name> threw: ..."
- *  - Backoff between retries: 1s, 2s, 3s (linear)
+ * Used internally by retryVerdict and retryCompleteness. Exposed in
+ * case other bench tools need the same backoff shape.
+ */
+export function backoffDelayMs(attempt: number, baseMs = 800, maxDelayMs = 30000): number {
+  if (attempt <= 0) return 0;
+  const exp = Math.min(baseMs * Math.pow(2, attempt - 1), maxDelayMs);
+  // Full-jitter strategy: random delay in [0, exp]. Provably-better than
+  // half-jitter for thundering-herd avoidance in the AWS Architecture blog
+  // experiments; matches what most modern API clients do.
+  return Math.floor(Math.random() * exp);
+}
+
+/**
+ * v2.12.1+ — retry kernel for bench LLM calls.
+ *
+ * Calls `fn()` up to `retries` times. After each attempt:
+ *   • Non-empty output starting with CORRECT or INCORRECT (case-
+ *     insensitive) → return that verdict immediately.
+ *   • Non-empty but unclassifiable output → if this is the final
+ *     attempt, return NO_RESPONSE with the output as the reason
+ *     ("<name>-ambiguous: <first 150 chars>"). Otherwise retry.
+ *   • Empty/null output → if this is the final attempt, return
+ *     NO_RESPONSE("<name> returned empty after N retries"). Otherwise
+ *     retry.
+ *   • Thrown exception → if this is the final attempt, return
+ *     NO_RESPONSE("<name> threw: <message>"). Otherwise retry.
+ *
+ * Backoff: exponential with full jitter via `backoffDelayMs`.
+ * Logging: on retry, prints one fail-loud line so quota or timeout
+ * issues surface in the bench log instead of silently inflating
+ * wall-clock time.
+ *
+ * Shared by:
+ *  - bench/longmemeval-harness.ts judgeWithRetry (primary + secondary)
+ *  - bench/rejudge-noresponse.ts callWithRetry
  */
 export async function retryVerdict(
   name: string,
   fn: () => Promise<string | null>,
   retries = 3,
 ): Promise<VerdictResult> {
+  let lastReason = "";
   for (let i = 0; i < retries; i++) {
     try {
       const out = await fn();
@@ -313,16 +391,19 @@ export async function retryVerdict(
         const upper = out.trim().toUpperCase();
         if (upper.startsWith("CORRECT")) return { verdict: "CORRECT", reason: out.slice(0, 200) };
         if (upper.startsWith("INCORRECT")) return { verdict: "INCORRECT", reason: out.slice(0, 200) };
-        if (i === retries - 1) return { verdict: "NO_RESPONSE", reason: `${name}-ambiguous: ${out.slice(0, 150)}` };
-      } else if (i === retries - 1) {
-        return { verdict: "NO_RESPONSE", reason: `${name} returned empty after ${retries} retries` };
+        lastReason = `ambiguous: ${out.slice(0, 150)}`;
+        if (i === retries - 1) return { verdict: "NO_RESPONSE", reason: `${name}-${lastReason}` };
+      } else {
+        lastReason = `empty (attempt ${i + 1}/${retries})`;
+        if (i === retries - 1) return { verdict: "NO_RESPONSE", reason: `${name} returned empty after ${retries} retries` };
       }
     } catch (e: any) {
-      if (i === retries - 1) {
-        return { verdict: "NO_RESPONSE", reason: `${name} threw: ${(e?.message ?? String(e)).slice(0, 100)}` };
-      }
+      lastReason = `threw: ${(e?.message ?? String(e)).slice(0, 100)}`;
+      if (i === retries - 1) return { verdict: "NO_RESPONSE", reason: `${name} ${lastReason}` };
     }
-    await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+    const delay = backoffDelayMs(i + 1);
+    console.warn(`  ⚠ ${name} retry ${i + 1}/${retries} — ${lastReason}. Retrying in ${(delay / 1000).toFixed(1)}s...`);
+    await new Promise(r => setTimeout(r, delay));
   }
   return { verdict: "NO_RESPONSE", reason: `${name} fell through retry loop` };
 }
@@ -507,9 +588,12 @@ export function validateExtractorOutput(raw: unknown): ValidatedExtractorOutput 
 // present somewhere in context, in any order). Token-coverage tolerates
 // paraphrase ("$400,000" vs "400000 dollars") but not synonym ("vehicle"
 // vs "car" — requires exact tokens).
-export function goldInContext(gold: string, context: string): boolean {
-  if (!gold || !context) return false;
-  const g = gold.toLowerCase().trim();
+export function goldInContext(gold: string | number, context: string): boolean {
+  // v2.12.1+ — coerce gold to string for the same reason as substringMatch
+  // (multi-session counting questions have integer gold answers).
+  if (gold === undefined || gold === null || !context) return false;
+  const g = String(gold).toLowerCase().trim();
+  if (g.length === 0) return false;
   const c = context.toLowerCase();
   // Tier 1: exact substring.
   if (c.includes(g)) return true;
@@ -589,6 +673,10 @@ export async function retryCompleteness(
   fn: () => Promise<string | null>,
   retries = 3,
 ): Promise<CompletenessResult> {
+  // v2.12.1+ — same exponential-with-jitter backoff as retryVerdict via
+  // backoffDelayMs. Logs a fail-loud warning between attempts so quota
+  // exhaustion surfaces immediately in the bench log.
+  let lastReason = "";
   for (let i = 0; i < retries; i++) {
     try {
       const out = await fn();
@@ -597,18 +685,19 @@ export async function retryCompleteness(
         if (verdict !== "judge-failed") {
           return { verdict, reason: out.slice(0, 200) };
         }
-        if (i === retries - 1) {
-          return { verdict: "judge-failed", reason: `${name}-ambiguous: ${out.slice(0, 150)}` };
-        }
-      } else if (i === retries - 1) {
-        return { verdict: "judge-failed", reason: `${name} returned empty after ${retries} retries` };
+        lastReason = `ambiguous: ${out.slice(0, 150)}`;
+        if (i === retries - 1) return { verdict: "judge-failed", reason: `${name}-${lastReason}` };
+      } else {
+        lastReason = `empty (attempt ${i + 1}/${retries})`;
+        if (i === retries - 1) return { verdict: "judge-failed", reason: `${name} returned empty after ${retries} retries` };
       }
     } catch (e: any) {
-      if (i === retries - 1) {
-        return { verdict: "judge-failed", reason: `${name} threw: ${(e?.message ?? String(e)).slice(0, 100)}` };
-      }
+      lastReason = `threw: ${(e?.message ?? String(e)).slice(0, 100)}`;
+      if (i === retries - 1) return { verdict: "judge-failed", reason: `${name} ${lastReason}` };
     }
-    await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+    const delay = backoffDelayMs(i + 1);
+    console.warn(`  ⚠ ${name} retry ${i + 1}/${retries} — ${lastReason}. Retrying in ${(delay / 1000).toFixed(1)}s...`);
+    await new Promise(r => setTimeout(r, delay));
   }
   return { verdict: "judge-failed", reason: `${name} fell through retry loop` };
 }

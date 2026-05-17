@@ -109,6 +109,16 @@ describe("substringMatch", () => {
     expect(substringMatch("3", "Three items: a, b, c")).toBe(false);
     expect(substringMatch("3", "The count is 3 items")).toBe(true);
   });
+
+  // v2.12.1+ — multi-session counting questions have INTEGER gold answers.
+  // Pre-fix the harness crashed with "gold.toLowerCase is not a function"
+  // and silently dropped those questions from the bench.
+  test("accepts integer gold (multi-session counting questions)", () => {
+    expect(substringMatch(3, "The count is 3 items")).toBe(true);
+    expect(substringMatch(3, "Three items: a, b, c")).toBe(false);
+    expect(substringMatch(2, "User mentioned this 2 times")).toBe(true);
+    expect(substringMatch(0, "no relevant mentions")).toBe(false);
+  });
 });
 
 // ─── judgePrompt ────────────────────────────────────────────────────────
