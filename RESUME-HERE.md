@@ -27,8 +27,9 @@ cd ~/Projects/machtsinn.ai
 # 1. Check bench completion
 tail -1 /tmp/bench_v211_3mode.log
 # Expected when done: "ALL_MODES_COMPLETE"
+# If memory-packet still running, see "partial results" section below.
 
-# 2. View 3-mode comparison (only 3 modes ran; flat-mixed + routed-packet are missing)
+# 2. View whichever modes completed
 bun bench/compare-context-modes.ts
 
 # 3. View commits ready for push
@@ -159,6 +160,57 @@ tail -3 /tmp/bench_v211_5mode.log        # last bench log line
 ```
 
 ---
+
+## EPISODE-ONLY N=30 FIRST RESULT (already in)
+
+Episode-only completed at 05:21 PT. Initial number:
+- **Hit@1/5/10 = 100% / 100% / 100%** (retrieval rock solid)
+- **Answer-correct overall: 60.0%** (n=30)
+- Per category: knowledge-update 80% / multi-session 40% / single-session-{assistant=60%, preference=40%, user=60%}
+- Note: no temporal-reasoning category in this N=30 balanced — sampling chose 5 other categories. (Ardin: confirm whether to weight that into interpretation.)
+
+**Why 60% vs the v2.10.5 baseline of 83%?** Likely a combination of:
+1. N=30 = ~5/category sample variance
+2. Different category mix (no temporal-reasoning in this sample; that was the highest-scoring category in v2.10.5 at 94.1%)
+3. Answer-LLM behavior may have shifted slightly between runs
+
+The **within-N=30 apples-to-apples** comparison (memory-packet vs THIS 60%, not vs historical 83%) is what matters for the v2.11 verdict.
+
+## Partial results — viewing memory-packet mid-run
+
+Memory-packet rate is ~15 min/q (with --extract: ~6 sessions × Claude CLI extractor + answer + judge). At N=30, finishes ~12:51 PT — likely PAST your wake time.
+
+To see partial progress before it completes:
+```bash
+# Per-question Hit@K from the log
+grep "^  \[" /tmp/bench_v211_3mode.log | grep -A0 "memory-packet" -B100 2>/dev/null | tail -20
+
+# Count of questions completed in current mode
+grep -A1000 "=== START memory-packet" /tmp/bench_v211_3mode.log | grep -c "^  \["
+
+# Answer-correct count from log (per-question judge output is NOT in log;
+# only Hit@K. The Answer% only appears after mode completes and the
+# Overall: line is printed.)
+```
+
+If memory-packet hasn't finished by the time you read this:
+1. Decide whether to **wait** (~2-3h more) or **kill+restart at smaller N** (lose progress but get a verdict sooner).
+2. Zep-format won't have started yet. You'll need to choose: run it (~2-4h more wall time) or defer.
+
+If memory-packet HAS finished but zep-format hasn't started, manually launch zep-format:
+```bash
+cd ~/Projects/machtsinn.ai
+bun bench/longmemeval-harness.ts \
+  --data /tmp/longmemeval/data/longmemeval_oracle.json \
+  --api http://localhost:3002 --key bench-key \
+  --owner lme_v211_zep_$(date +%s) \
+  --limit 30 --balanced \
+  --context-mode zep-format \
+  --extract --extractor-backend claude --kinds episode,fact,cognitive,entity \
+  --judge llm --answer-backend claude --judge-backend codex \
+  --top-k 10 \
+  --save-results /tmp/bench_v211_5mode_zep-format.jsonl
+```
 
 ## If bench is still running when you wake
 
