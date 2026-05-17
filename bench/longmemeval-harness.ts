@@ -201,7 +201,10 @@ interface LMERecord {
   question_id: string;
   question_type: string;
   question: string;
-  answer: string;
+  // v2.12.1+ — LongMemEval multi-session counting questions have INTEGER
+  // gold answers (e.g. 3, 2). Pre-coercion the harness crashed with
+  // `.toLowerCase is not a function` and silently dropped those questions.
+  answer: string | number;
   question_date: string;
   haystack_dates: string[];
   haystack_session_ids: string[];
@@ -384,30 +387,86 @@ function scoreHits(retrievedSessionIds: string[], gold: string[]): {
 //   - llm: ask another model to score (predicted == gold semantically).
 //     Closer to LongMemEval's official protocol.
 
-// v2.10.4+ — prompt rewritten per third-party troubleshooting report.
-// Adds: (1) QUESTION_DATE so temporal questions have a reference point,
-// (2) explicit timeline-reasoning instruction for multi-session questions,
-// (3) chronological-context invariant so the model can trust the order.
-const ANSWER_PROMPT = (question: string, context: string, questionDate?: string) =>
-  `You are a long-term-memory assistant answering a question about past conversations.
-Use ONLY the context below. The context is a TIMELINE of past sessions, sorted CHRONOLOGICALLY (oldest first).
+// v2.12.1+ — context-mode-aware answer prompts. Three families, each
+// written from scratch for mema's harness. The shared design principle:
+// the prompt must match the SHAPE of the context the worker sees.
+//
+//   FLAT_PROMPT      — for raw conversational context (episode-only,
+//                      flat-mixed, and zep-format). The context is text;
+//                      the prompt asks for a short grounded answer.
+//
+//   PACKET_PROMPT    — for the Memory Packet's typed sections (facts +
+//                      entities + episodes + Datalog rules). The prompt
+//                      explicitly references mema's structural artifacts
+//                      so the worker exploits them.
+//
+// All prompts are mema-original. The fair-comparison property is
+// preserved by giving every mode an equally tight, equally well-formed
+// prompt — not by copying a competitor's exact prose.
 
-${questionDate ? `QUESTION_DATE: ${questionDate}
-Answer questions about "now" or "current" as of this date. Treat sessions after this date as future / not yet known.
+const FLAT_PROMPT = (question: string, context: string, questionDate?: string) =>
+  `You answer questions about a user's past conversations using only the supplied context.
 
-` : ""}CONTEXT (chronological timeline):
+${questionDate ? `Reference date for the question: ${questionDate}
+Treat any session or statement dated AFTER this reference date as not-yet-known.
+
+` : ""}Context (chronological transcript, oldest first):
 ${context}
 
-QUESTION: ${question}
+Question:
+${question}
 
-Reason internally using this structure (do NOT output the steps):
-  1. Identify which sessions / turns contain evidence.
-  2. For temporal or "current state" questions: pick the LATEST relevant statement AT OR BEFORE the QUESTION_DATE.
-  3. For multi-session counting / aggregation questions: enumerate every relevant item across all sessions.
-  4. For preference questions: infer the durable pattern from one or more concrete statements.
-  5. For knowledge-update questions: prefer the most recent statement over older contradicting statements.
+How to choose your answer — two task classes with opposite failure modes:
 
-Return ONLY the final answer as a single short sentence, or say "no answer" if the context truly doesn't support one.`;
+  Factual recall ("when did I", "what did I say about", "who is", counting, "current"/"now", knowledge-update):
+    • Counting / multi-session — enumerate every relevant occurrence across the transcript before answering.
+    • "Current" / "now" — use the LATEST relevant statement on or before the reference date.
+    • Knowledge-update — prefer the newer statement over older contradicting ones.
+    • If the context truly lacks the answer, reply: no answer
+
+  Personalization ("recommend", "suggest", "what should I", "help me pick", "what kind of"):
+    Filter the answer through the user's stored preferences, tastes, and patterns. If exact-match preferences for the topic are absent, transfer from adjacent stored facts (past choices, stated likes, recurring patterns, related domains). Refusing to answer when relevant signal exists is the worst outcome — personalize imperfectly over abstaining.
+
+Output: a single short sentence. Nothing else.`;
+
+const PACKET_PROMPT = (question: string, context: string, questionDate?: string) =>
+  `You answer questions about a user's past conversations using a structured Memory Packet.
+
+The packet contains three typed sections:
+  <FACTS>     — extracted subject/predicate/object assertions with event_date and Datalog
+                rules. A fact tagged isCurrent is true as of the reference date below;
+                a fact tagged isSuperseded has been invalidated by a later contradicting fact.
+  <ENTITIES>  — typed entities (person, organization, product, system, place, concept, event).
+  <EPISODES>  — chronological session events for cases the facts don't cover.
+
+${questionDate ? `Reference date for the question: ${questionDate}
+Treat facts and episodes dated AFTER this reference date as not-yet-known. Trust the Datalog
+rules — they have already resolved supersession; do not re-derive them from raw dates.
+
+` : ""}Memory Packet:
+${context}
+
+Question:
+${question}
+
+How to choose your answer — two task classes with opposite failure modes:
+
+  Factual recall (counting, "current"/"now", knowledge-update, "when did I", "what did I say"):
+    • Prefer FACTS over EPISODES when both apply — facts are typed assertions with explicit dates.
+    • Counting / multi-session — enumerate every relevant fact AND every relevant episode.
+    • "Current" / "now" — pick the fact tagged isCurrent. If multiple, pick the highest-confidence one.
+    • Knowledge-update — use the fact tagged isCurrent. Ignore facts tagged isSuperseded.
+    • If the packet truly lacks the answer, reply: no answer
+
+  Personalization ("recommend", "suggest", "what should I", "help me pick", "what kind of"):
+    Filter the answer through the user's stored preferences in FACTS and ENTITIES. If exact-match preferences for the topic are absent, transfer from adjacent stored facts (past choices, stated likes, recurring patterns, related domains). Treat facts with confidence ≥ 0.85 as durable preferences; lower-confidence facts and episodes are corroborative. Refusing to answer when relevant signal exists is the worst outcome — personalize imperfectly over abstaining.
+
+Output: a single short sentence. Nothing else.`;
+
+function selectAnswerPrompt(contextMode: Args["contextMode"]) {
+  if (contextMode === "memory-packet" || contextMode === "routed-packet") return PACKET_PROMPT;
+  return FLAT_PROMPT;
+}
 
 // v2.11.2+ — JUDGE_PROMPT lives in bench/bench-utils.ts as judgePrompt().
 const JUDGE_PROMPT = (question: string, gold: string, predicted: string) =>
@@ -445,7 +504,10 @@ async function generateAnswer(
   questionDate?: string,
 ): Promise<{ answer: string; ms: number }> {
   const t = Date.now();
-  const a = await callBackend(args.answerBackend, args, args.judgeModel, ANSWER_PROMPT(question, context, questionDate));
+  // v2.12.1+ — select prompt by context mode so each mode gets a prompt
+  // matched to its context shape. See selectAnswerPrompt above.
+  const promptFn = selectAnswerPrompt(args.contextMode);
+  const a = await callBackend(args.answerBackend, args, args.judgeModel, promptFn(question, context, questionDate));
   return { answer: (a ?? "no answer").slice(0, 500), ms: Date.now() - t };
 }
 
@@ -707,6 +769,10 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
       limit_memory: Math.max(args.topK * 2, 20),
       use_vector: useVector,
       fusion: args.fusion,
+      // v2.13.2+ — pass the question's reference date so the server's
+      // factValidAt filter excludes facts dated after the question.
+      // The server already supports this (src/v2/layer5-retrieval.ts:149).
+      temporal: { valid_at: rec.question_date },
     });
     if (recallRes.ok) {
       const rj = await recallRes.json() as {
@@ -736,6 +802,9 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
       limit: args.topK,
       use_vector: useVector,
       fusion: args.fusion,
+      // v2.13.2+ — pass the question's reference date so the server's
+      // factValidAt filter excludes facts dated after the question.
+      temporal: { valid_at: rec.question_date },
     });
     if (recallRes.ok) {
       const rj = await recallRes.json() as { hits: RecallHit[] };

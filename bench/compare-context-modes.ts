@@ -69,12 +69,17 @@ function parseArgs() {
   // bench/rejudge-noresponse.ts. Lets us report corrected metrics without
   // re-running the full bench when only the judge infrastructure flaked.
   let rejudge: string | null = null;
+  // v2.13.0+ — --prefix makes the tool work on any per-bench filename pattern.
+  // Default preserves v2.11 backward compat; v2.12+ benches use different prefixes
+  // (e.g. bench_v212_claude_, bench_v213_nomic_).
+  let prefix = "bench_v211_5mode_";
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--json") json = true;
     if (argv[i] === "--dir") dir = argv[++i] ?? dir;
     if (argv[i] === "--rejudge") rejudge = argv[++i] ?? null;
+    if (argv[i] === "--prefix") prefix = argv[++i] ?? prefix;
   }
-  return { dir, json, rejudge };
+  return { dir, json, rejudge, prefix };
 }
 
 interface RejudgeEntry {
@@ -95,8 +100,8 @@ function loadRejudge(path: string | null): Map<string, RejudgeEntry> {
   return map;
 }
 
-function loadMode(dir: string, mode: Mode, rejudge: Map<string, RejudgeEntry>): QuestionResult[] | null {
-  const path = join(dir, `bench_v211_5mode_${mode}.jsonl`);
+function loadMode(dir: string, mode: Mode, rejudge: Map<string, RejudgeEntry>, prefix = "bench_v211_5mode_"): QuestionResult[] | null {
+  const path = join(dir, `${prefix}${mode}.jsonl`);
   if (!existsSync(path)) return null;
   const lines = readFileSync(path, "utf8").trim().split("\n").filter(Boolean);
   const results: QuestionResult[] = [];
@@ -440,9 +445,9 @@ if (args.rejudge) {
 }
 const rows = new Map<Mode, AggregateRow>();
 for (const mode of MODES) {
-  const results = loadMode(args.dir, mode, rejudge);
+  const results = loadMode(args.dir, mode, rejudge, args.prefix);
   if (!results) {
-    console.error(`  [warn] no JSONL for mode=${mode} at ${args.dir}`);
+    console.error(`  [warn] no JSONL for mode=${mode} at ${args.dir} (prefix=${args.prefix})`);
     continue;
   }
   rows.set(mode, aggregate(mode, results));
