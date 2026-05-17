@@ -5,6 +5,33 @@
 **Current released version:** v2.10.0 (tag) — `main` has 10 new commits for v2.11.0-rc.1 + v2.11.1 fix
 **Commits NOT pushed** (per your "no push" authorization). Push when satisfied.
 
+## ⚠️ Two-part v2.11.1 fix — both must apply before N=100 re-bench
+
+### Part 1: Extractor temporal grounding (already landed)
+Extractor now passes observation_date + extracts event_date per fact. Re-verified on the 5 failing knowledge-update questions: 40% → 80%.
+
+### Part 2: Judge retry + cross-judge rejudge (NEW)
+Diagnosed the temporal-reasoning -20pp regression. Root cause: the SAME judge-no-response bug that caused 1 of the 5 knowledge-update failures was responsible. 9/90 questions (10%) across the N=30 run got `judge-no-response` from Codex CLI silently → all scored 0.
+
+**Cross-judged with Claude + Codex (parallel) + substring fallback. Of 9 failures:**
+- 5 actually CORRECT (judge bug masked real wins)
+- 2 actually INCORRECT
+- 2 DISPUTED → resolved to INCORRECT
+
+**Corrected per-category memory-packet vs episode-only (N=30):**
+- temporal-reasoning: +0.0pp ✅ (was -20pp — entirely judge bug)
+- multi-session: +20.0pp ✅ (real win)
+- knowledge-update: -40.0pp ⚠️ (pre-v2.11.1 extractor bug — fixed)
+- 3 single-session categories: 0.0pp (tied)
+
+**Harness now has judgeWithRetry: 3 retries on primary judge → 2 on secondary fallback. ScoredQuestion.judge_score type is now `number | null | undefined` so judge failures are visible in JSONL (not silently coerced to 0).**
+
+To view corrected metrics:
+```bash
+cd ~/Projects/machtsinn.ai
+bun bench/compare-context-modes.ts --rejudge /tmp/rejudge_v211_5mode.jsonl
+```
+
 ## ⚠️ The v2.11.1 fix DOES NOT yet validate the architecture at scale
 
 The v2.11.1 fix took knowledge-update memory-packet from 40% → 80% on the SAME 5 questions that failed in the v2.11.0-rc.1 N=30 run. This is a clean diagnostic win — it proves the fix removes the specific bug. **It is NOT yet a generalization claim** because:
