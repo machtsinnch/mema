@@ -19,7 +19,7 @@ import {
   type TwoChannelHits,
 } from "../src/v2/memory-packet";
 import type { RetrievalHit } from "../src/v2/types";
-import { sanitizeEventDate } from "./bench-utils";
+import { sanitizeEventDate, callClaudeCLI } from "./bench-utils";
 
 interface ChatTurn { role: string; content: string }
 interface LMERecord {
@@ -110,19 +110,12 @@ Output JSON: {"facts": [{"subject":"...","predicate":"...","object":"...","event
 
 TEMPORAL GROUNDING: every fact's "event_date" must be YYYY-MM-DD. Use the OBSERVATION_DATE supplied below as the anchor for relative refs ("today", "yesterday", "recently"). If a specific date is mentioned in the text, use that. NEVER use today's real-world date as event_date.`;
 
-async function claudeCLI(prompt: string): Promise<string | null> {
-  const p = Bun.spawn(["claude", "--print", prompt], {
-    stdout: "pipe", stderr: "pipe",
-  });
-  await p.exited;
-  return (await new Response(p.stdout).text()).trim();
-}
-
+// v2.11.2+ — uses shared callClaudeCLI from bench-utils.
 for (const [sid, epId] of sessionToEpisode) {
   const idx = rec.haystack_session_ids.indexOf(sid);
   const body = sessionToContent(rec.haystack_sessions[idx], sid, "");
   const observationDate = rec.haystack_dates[idx] ?? rec.question_date ?? new Date().toISOString().slice(0, 10);
-  const out = await claudeCLI(`${EXTRACTOR_SYSTEM}\n\nOBSERVATION_DATE: ${observationDate}\n\nText:\n${body}`);
+  const out = await callClaudeCLI(`${EXTRACTOR_SYSTEM}\n\nOBSERVATION_DATE: ${observationDate}\n\nText:\n${body}`);
   if (!out) continue;
   let parsed: any = null;
   try {

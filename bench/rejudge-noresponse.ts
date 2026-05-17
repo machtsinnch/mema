@@ -18,6 +18,13 @@
 //   bun bench/rejudge-noresponse.ts --input PATH --output PATH
 
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
+import {
+  callClaudeCLI,
+  callCodexCLI,
+  judgePrompt,
+  substringMatch,
+  retryVerdict,
+} from "./bench-utils";
 
 interface QuestionResult {
   question_id: string;
@@ -60,94 +67,8 @@ const MODES = ["episode-only", "memory-packet", "zep-format"];
 const INPUT_DIR = "/tmp";
 const OUTPUT_PATH = flags.output ?? "/tmp/rejudge_v211_5mode.jsonl";
 
-// ─── Judge helpers ──────────────────────────────────────────────────────
-
-const JUDGE_PROMPT = (question: string, gold: string, predicted: string) => `You are an evaluator. Compare the PREDICTED_ANSWER against the GOLD_ANSWER for the given QUESTION.
-
-QUESTION: ${question}
-
-GOLD_ANSWER: ${gold}
-
-PREDICTED_ANSWER: ${predicted}
-
-Reply with a SINGLE WORD on the first line: either "CORRECT" if the predicted answer matches the gold answer in meaning (allow minor phrasing differences, units, formatting), or "INCORRECT" if it does not match. Optionally add a brief explanation on a second line.
-
-Response format:
-CORRECT or INCORRECT
-[optional 1-line reasoning]`;
-
-async function callClaude(prompt: string): Promise<string | null> {
-  const proc = Bun.spawn(["claude", "-p", prompt], {
-    stdout: "pipe", stderr: "pipe", env: process.env,
-  });
-  const watchdog = setTimeout(() => { try { proc.kill(); } catch {} }, 120000);
-  try {
-    const out = await new Response(proc.stdout).text();
-    await proc.exited;
-    return out.trim() || null;
-  } finally {
-    clearTimeout(watchdog);
-  }
-}
-
-async function callCodex(prompt: string): Promise<string | null> {
-  const outPath = `/tmp/codex-rejudge-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
-  const proc = Bun.spawn([
-    "codex", "exec",
-    "--skip-git-repo-check",
-    "--output-last-message", outPath,
-    prompt,
-  ], { stdout: "ignore", stderr: "pipe", env: process.env });
-  const watchdog = setTimeout(() => { try { proc.kill(); } catch {} }, 180000);
-  try {
-    await proc.exited;
-    try {
-      const text = await Bun.file(outPath).text();
-      return text.trim() || null;
-    } finally {
-      try { await Bun.file(outPath).unlink(); } catch {}
-    }
-  } finally {
-    clearTimeout(watchdog);
-  }
-}
-
-async function callWithRetry(
-  name: string,
-  fn: () => Promise<string | null>,
-  retries = 3,
-): Promise<{ verdict: "CORRECT" | "INCORRECT" | "NO_RESPONSE"; reason: string }> {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const out = await fn();
-      if (out && out.trim().length > 0) {
-        const upper = out.trim().toUpperCase();
-        if (upper.startsWith("CORRECT")) return { verdict: "CORRECT", reason: out.slice(0, 200) };
-        if (upper.startsWith("INCORRECT")) return { verdict: "INCORRECT", reason: out.slice(0, 200) };
-        // Output existed but didn't start with CORRECT/INCORRECT — accept the
-        // attempt as "ambiguous response" and try again unless out of retries.
-        if (i === retries - 1) return { verdict: "NO_RESPONSE", reason: `ambiguous: ${out.slice(0, 100)}` };
-      } else if (i === retries - 1) {
-        return { verdict: "NO_RESPONSE", reason: `${name} returned empty after ${retries} retries` };
-      }
-    } catch (e: any) {
-      if (i === retries - 1) return { verdict: "NO_RESPONSE", reason: `${name} threw: ${e?.message?.slice(0, 100)}` };
-    }
-    // brief backoff between retries
-    await new Promise(r => setTimeout(r, 1000 * (i + 1)));
-  }
-  return { verdict: "NO_RESPONSE", reason: `${name} fell through retry loop` };
-}
-
-// Substring fallback: returns true if all "significant" gold tokens appear in predicted.
-function substringMatch(gold: string, predicted: string): boolean {
-  const tokens = gold.toLowerCase().split(/[\s,.;:()$]/g).filter(w => w.length >= 3);
-  if (tokens.length === 0) {
-    // Gold is a single short token (e.g., "four", "5") — direct substring check.
-    return predicted.toLowerCase().includes(gold.toLowerCase().trim());
-  }
-  return tokens.every(t => predicted.toLowerCase().includes(t));
-}
+// v2.11.2+ — callClaudeCLI, callCodexCLI, judgePrompt, substringMatch, and
+// retryVerdict all live in bench/bench-utils.ts.
 
 // ─── Main ───────────────────────────────────────────────────────────────
 
@@ -182,7 +103,7 @@ for (let i = 0; i < allCases.length; i++) {
   const predicted = r.predicted_answer ?? "";
   console.error(`[rejudge] [${i+1}/${allCases.length}] mode=${mode} qid=${r.question_id} category=${r.category}`);
 
-  const prompt = JUDGE_PROMPT(r.question, gold, predicted);
+  const prompt = judgePrompt("LongMemEval", r.question, gold, predicted);
 
   // Claude (Anthropic) and Codex (OpenAI) are independent providers with
   // independent rate-limit pools. Running them in parallel halves wall
@@ -191,8 +112,8 @@ for (let i = 0; i < allCases.length; i++) {
   // shares a pool with the other.
   console.error(`           → claude + codex (parallel)...`);
   const [claude, codex] = await Promise.all([
-    callWithRetry("claude", () => callClaude(prompt)),
-    callWithRetry("codex", () => callCodex(prompt)),
+    retryVerdict("claude", () => callClaudeCLI(prompt)),
+    retryVerdict("codex", () => callCodexCLI(prompt)),
   ]);
   const substr = substringMatch(gold, predicted);
 

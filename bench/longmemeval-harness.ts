@@ -49,7 +49,16 @@ import {
   type TwoChannelHits,
 } from "../src/v2/memory-packet";
 import type { RetrievalHit } from "../src/v2/types";
-import { sanitizeEventDate } from "./bench-utils";
+import {
+  sanitizeEventDate,
+  callClaudeCLI,
+  callCodexCLI,
+  judgePrompt,
+  substringMatch,
+  retryVerdict,
+  classifyAnswerShape,
+  type AnswerShape,
+} from "./bench-utils";
 
 // v2.10.6+ — Claude/Codex CLI extractors for bench runs (Ollama
 // llama3.1:8b at ~30s/session is too slow and quality-bottlenecks the
@@ -246,6 +255,14 @@ interface ScoredQuestion {
   judge_reason?: string;
   answer_ms?: number;
   judge_ms?: number;
+  // v2.11.2+ — answer shape classification (correct% vs wrong-confident% vs
+  // no-answer% vs empty%). Empirical defense against INSTRUCTIONS-softening
+  // hallucination risk: if a future bench shows no-answer% dropping while
+  // wrong-confident% rises, the softening is trading abstention for
+  // confabulation (BAD). Tracked alongside judge_score so the comparison
+  // tool can break apart "judge said 0" into "LLM said no-answer" vs
+  // "LLM confidently said wrong thing".
+  answer_shape?: AnswerShape;
 }
 
 function parseArgs(): Args {
@@ -388,17 +405,9 @@ Reason internally using this structure (do NOT output the steps):
 
 Return ONLY the final answer as a single short sentence, or say "no answer" if the context truly doesn't support one.`;
 
+// v2.11.2+ — JUDGE_PROMPT lives in bench/bench-utils.ts as judgePrompt().
 const JUDGE_PROMPT = (question: string, gold: string, predicted: string) =>
-  `You are a strict grading assistant for the LongMemEval benchmark. Decide if the predicted answer matches the gold answer SEMANTICALLY for the given question.
-
-QUESTION: ${question}
-GOLD ANSWER:      ${gold}
-PREDICTED ANSWER: ${predicted}
-
-Reply with EXACTLY one of:
-  CORRECT
-  INCORRECT
-Followed by an optional one-line reason.`;
+  judgePrompt("LongMemEval", question, gold, predicted);
 
 async function callOllama(host: string, model: string, prompt: string, timeoutMs = 60000): Promise<string | null> {
   const ctrl = new AbortController();
@@ -417,64 +426,7 @@ async function callOllama(host: string, model: string, prompt: string, timeoutMs
   finally { clearTimeout(t); }
 }
 
-// v2.10.1+ — shell out to the locally-authenticated Claude Code CLI.
-// Uses `--print` (-p) for non-interactive mode. Hook errors are emitted
-// to stderr (some hooks lack +x); we redirect them so they don't pollute
-// the answer. No API key required if the CLI is already logged in.
-async function callClaudeCLI(prompt: string, timeoutMs = 120000): Promise<string | null> {
-  try {
-    const proc = Bun.spawn(["claude", "-p", prompt], {
-      stdout: "pipe",
-      stderr: "pipe",
-      env: process.env,
-    });
-    const decoder = new TextDecoder();
-    // Race against timeout; kill the process if it stalls.
-    const watchdog = setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs);
-    const [out] = await Promise.all([
-      (async () => decoder.decode(await new Response(proc.stdout).arrayBuffer()))(),
-      proc.exited,
-    ]);
-    clearTimeout(watchdog);
-    // Strip post-response hook noise lines if any made it into stdout.
-    const cleaned = out
-      .split("\n")
-      .filter(l => !l.includes("hook [") && !l.includes("Permission denied"))
-      .join("\n")
-      .trim();
-    return cleaned || null;
-  } catch { return null; }
-}
-
-// v2.10.1+ — shell out to the codex CLI. `--output-last-message <file>`
-// writes ONLY the final assistant text to a file, so we don't have to
-// parse the formatted session log. --skip-git-repo-check avoids the
-// trust-directory prompt for non-interactive runs.
-async function callCodexCLI(prompt: string, timeoutMs = 180000): Promise<string | null> {
-  const outPath = `/tmp/codex-out-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  try {
-    const proc = Bun.spawn([
-      "codex", "exec",
-      "--skip-git-repo-check",
-      "--output-last-message", outPath,
-      prompt,
-    ], {
-      stdout: "ignore",
-      stderr: "pipe",
-      env: process.env,
-    });
-    const watchdog = setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs);
-    await proc.exited;
-    clearTimeout(watchdog);
-    try {
-      const text = await Bun.file(outPath).text();
-      return text.trim() || null;
-    } finally {
-      try { await Bun.file(outPath).unlink(); } catch {}
-    }
-  } catch { return null; }
-}
-
+// v2.11.2+ — callClaudeCLI + callCodexCLI live in bench/bench-utils.ts.
 async function callBackend(backend: AnswerBackend, args: Args, model: string, prompt: string, timeoutMs?: number): Promise<string | null> {
   if (backend === "claude") return callClaudeCLI(prompt, timeoutMs ?? 120000);
   if (backend === "codex") return callCodexCLI(prompt, timeoutMs ?? 180000);
@@ -502,12 +454,6 @@ async function generateAnswer(
 //   3. Only if both fail across all retries, return score=null +
 //      reason="judge-no-response-after-retries". score=null lets the
 //      consumer distinguish "judge failed" from a genuine "INCORRECT".
-async function judgeAnswerOnce(
-  args: Args, backend: AnswerBackend, question: string, gold: string, predicted: string,
-): Promise<string | null> {
-  return await callBackend(backend, args, args.judgeModel, JUDGE_PROMPT(question, gold, predicted));
-}
-
 export async function judgeWithRetry(
   args: Args,
   question: string,
@@ -516,52 +462,51 @@ export async function judgeWithRetry(
 ): Promise<{ score: number | null; reason: string; ms: number }> {
   const t = Date.now();
   if (args.judge === "substring") {
-    const ok = gold.trim().toLowerCase().split(/\s+/).filter(w => w.length >= 3).every(
-      w => predicted.toLowerCase().includes(w),
-    );
+    const ok = substringMatch(gold, predicted);
     return { score: ok ? 1 : 0, reason: ok ? "substring-match" : "substring-miss", ms: Date.now() - t };
   }
   if (args.judge !== "llm") {
     return { score: 0, reason: "judge-disabled", ms: 0 };
   }
 
-  // Primary judge: up to 3 attempts.
+  // Primary judge (args.judgeBackend), up to 3 attempts via the shared
+  // retryVerdict kernel.
   const primary = args.judgeBackend;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const verdict = await judgeAnswerOnce(args, primary, question, gold, predicted);
-    if (verdict && verdict.trim().length > 0) {
-      const v = verdict.trim().toUpperCase();
-      if (v.startsWith("CORRECT")) return { score: 1, reason: verdict.slice(0, 200), ms: Date.now() - t };
-      if (v.startsWith("INCORRECT")) return { score: 0, reason: verdict.slice(0, 200), ms: Date.now() - t };
-      // Ambiguous (judge wrote prose, didn't lead with verdict word). Treat as 0
-      // but log so it's visible.
-      if (attempt === 3) {
-        return { score: 0, reason: `${primary}-ambiguous: ${verdict.slice(0, 150)}`, ms: Date.now() - t };
-      }
-    }
-    // Brief backoff
-    await new Promise(r => setTimeout(r, 500 * attempt));
+  const primaryPrompt = JUDGE_PROMPT(question, gold, predicted);
+  const primaryResult = await retryVerdict(
+    primary,
+    () => callBackend(primary, args, args.judgeModel, primaryPrompt),
+    3,
+  );
+  if (primaryResult.verdict === "CORRECT") {
+    return { score: 1, reason: primaryResult.reason, ms: Date.now() - t };
+  }
+  if (primaryResult.verdict === "INCORRECT") {
+    return { score: 0, reason: primaryResult.reason, ms: Date.now() - t };
   }
 
-  // Primary failed all 3 retries. Fall back to secondary judge (the OTHER backend).
+  // Primary failed all retries. Fall back to secondary judge (OTHER backend),
+  // up to 2 attempts.
   const secondary: AnswerBackend = primary === "codex" ? "claude" : "codex";
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const verdict = await judgeAnswerOnce(args, secondary, question, gold, predicted);
-    if (verdict && verdict.trim().length > 0) {
-      const v = verdict.trim().toUpperCase();
-      if (v.startsWith("CORRECT")) {
-        return { score: 1, reason: `${secondary}-fallback: ${verdict.slice(0, 180)}`, ms: Date.now() - t };
-      }
-      if (v.startsWith("INCORRECT")) {
-        return { score: 0, reason: `${secondary}-fallback: ${verdict.slice(0, 180)}`, ms: Date.now() - t };
-      }
-    }
-    await new Promise(r => setTimeout(r, 500 * attempt));
+  const secondaryResult = await retryVerdict(
+    secondary,
+    () => callBackend(secondary, args, args.judgeModel, primaryPrompt),
+    2,
+  );
+  if (secondaryResult.verdict === "CORRECT") {
+    return { score: 1, reason: `${secondary}-fallback: ${secondaryResult.reason}`, ms: Date.now() - t };
+  }
+  if (secondaryResult.verdict === "INCORRECT") {
+    return { score: 0, reason: `${secondary}-fallback: ${secondaryResult.reason}`, ms: Date.now() - t };
   }
 
   // Both judges failed all retries. Return null score so consumer can
   // distinguish judge failure from a genuine "INCORRECT".
-  return { score: null, reason: "judge-no-response-after-retries", ms: Date.now() - t };
+  return {
+    score: null,
+    reason: `judge-no-response-after-retries (primary=${primaryResult.reason.slice(0, 60)}, secondary=${secondaryResult.reason.slice(0, 60)})`,
+    ms: Date.now() - t,
+  };
 }
 
 // (judgeAnswer back-compat shim removed v2.11.1 — runQuestion calls
@@ -1012,6 +957,9 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
     judge_reason: judgeReason,
     answer_ms: answerMs,
     judge_ms: judgeMs,
+    // v2.11.2+ — classify the LLM's response shape so the comparison tool
+    // can break apart correct% / wrong-confident% / no-answer% / empty%.
+    answer_shape: classifyAnswerShape(predictedAnswer),
     ...hits,
   };
 }

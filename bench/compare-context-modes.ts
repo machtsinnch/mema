@@ -21,6 +21,7 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { classifyAnswerShape } from "./bench-utils";
 
 interface QuestionResult {
   question_id: string;
@@ -30,7 +31,12 @@ interface QuestionResult {
   hit_at_10: boolean;
   all_gold_at_10?: boolean;
   coverage_at_10?: number;
-  judge_score?: number;
+  // v2.11.1+ — null means judge infra failed after retries
+  judge_score?: number | null;
+  judge_reason?: string;
+  predicted_answer?: string;
+  // v2.11.2+ — LLM answer shape ("no-answer" / "confident" / "empty")
+  answer_shape?: "no-answer" | "confident" | "empty";
 }
 
 const MODES = [
@@ -108,6 +114,38 @@ function pct(num: number, den: number): number {
   return Math.round((num / den) * 1000) / 10;
 }
 
+interface ShapeBreakdown {
+  correct: number;      // judge_score === 1 (any shape)
+  wrongConfident: number;  // judge_score === 0 AND answer_shape === "confident"
+  noAnswer: number;     // answer_shape === "no-answer"
+  empty: number;        // answer_shape === "empty"
+  judgeFailed: number;  // judge_score === null (infra failure)
+  unknown: number;      // no judge_score (judging disabled or missing)
+}
+
+function emptyShape(): ShapeBreakdown {
+  return { correct: 0, wrongConfident: 0, noAnswer: 0, empty: 0, judgeFailed: 0, unknown: 0 };
+}
+
+// v2.11.2+ — trichotomy: correct% / wrong-confident% / no-answer% / empty%.
+// Defense against INSTRUCTIONS-softening hallucination risk. If a future
+// bench shows no-answer% dropping while wrong-confident% rises, the
+// softening is trading abstention for confabulation (BAD). If correct%
+// rises with no-answer% falling and wrong-confident% steady, the softening
+// is unlocking real answers (GOOD).
+function classifyRow(r: QuestionResult): keyof ShapeBreakdown {
+  if (r.judge_score === null) return "judgeFailed";
+  if (r.judge_score === undefined) return "unknown";
+  if (r.judge_score === 1) return "correct";
+  // judge_score === 0 — distinguish wrong-confident from no-answer.
+  // Prefer the harness-recorded answer_shape (v2.11.2+); fall back to
+  // re-classifying from predicted_answer for older JSONLs that lack it.
+  const shape = r.answer_shape ?? classifyAnswerShape(r.predicted_answer);
+  if (shape === "no-answer") return "noAnswer";
+  if (shape === "empty") return "empty";
+  return "wrongConfident";
+}
+
 interface AggregateRow {
   mode: Mode;
   n: number;
@@ -115,10 +153,12 @@ interface AggregateRow {
   allGold: number; cov: number;
   answer: number;
   answerN: number;
+  shape: ShapeBreakdown;
   perCategory: Record<string, {
     n: number; h1: number; h5: number; h10: number;
     allGold: number; cov: number;
     answer: number; answerN: number;
+    shape: ShapeBreakdown;
   }>;
 }
 
@@ -129,8 +169,10 @@ function aggregate(mode: Mode, results: QuestionResult[]): AggregateRow {
   const h10 = results.filter(r => r.hit_at_10).length;
   const allGold = results.filter(r => r.all_gold_at_10).length;
   const covSum = results.reduce((s, r) => s + (r.coverage_at_10 ?? 0), 0);
-  const judged = results.filter(r => r.judge_score !== undefined);
+  const judged = results.filter(r => r.judge_score !== undefined && r.judge_score !== null);
   const ansCorrect = judged.filter(r => r.judge_score === 1).length;
+  const shape = emptyShape();
+  for (const r of results) shape[classifyRow(r)]++;
 
   const perCategory: AggregateRow["perCategory"] = {};
   const byCat = new Map<string, QuestionResult[]>();
@@ -140,7 +182,9 @@ function aggregate(mode: Mode, results: QuestionResult[]): AggregateRow {
   }
   for (const [cat, rows] of byCat) {
     const cn = rows.length;
-    const cJudged = rows.filter(r => r.judge_score !== undefined);
+    const cJudged = rows.filter(r => r.judge_score !== undefined && r.judge_score !== null);
+    const cShape = emptyShape();
+    for (const r of rows) cShape[classifyRow(r)]++;
     perCategory[cat] = {
       n: cn,
       h1: pct(rows.filter(r => r.hit_at_1).length, cn),
@@ -150,6 +194,7 @@ function aggregate(mode: Mode, results: QuestionResult[]): AggregateRow {
       cov: pct(rows.reduce((s, r) => s + (r.coverage_at_10 ?? 0), 0), cn),
       answer: pct(cJudged.filter(r => r.judge_score === 1).length, cJudged.length),
       answerN: cJudged.length,
+      shape: cShape,
     };
   }
 
@@ -160,6 +205,7 @@ function aggregate(mode: Mode, results: QuestionResult[]): AggregateRow {
     cov: pct(covSum, n),
     answer: pct(ansCorrect, judged.length),
     answerN: judged.length,
+    shape,
     perCategory,
   };
 }
@@ -193,6 +239,41 @@ function renderText(rows: Map<Mode, AggregateRow>): string {
       "  " + r.answer.toFixed(1).padStart(6) + "  (n=" + r.answerN + ")"
     );
   }
+  out.push("");
+
+  // v2.11.2+ — Answer-shape trichotomy. Defense against INSTRUCTIONS-
+  // softening hallucination risk. correct% + wrongConfident% + noAnswer%
+  // + empty% + judgeFailed% should sum to ~100% per row (modulo
+  // unknown%/judge-disabled rows).
+  out.push("Answer-shape breakdown (counts; % of N=n)");
+  out.push("  " + "mode".padEnd(18) + "  n      correct  wrong-conf   no-answer       empty  judge-fail");
+  out.push("  " + "─".repeat(82));
+  for (const mode of MODES) {
+    const r = rows.get(mode);
+    if (!r) continue;
+    const cell = (count: number) =>
+      `${String(count).padStart(3)} (${pct(count, r.n).toFixed(1).padStart(4)}%)`;
+    out.push(
+      "  " + mode.padEnd(18) +
+      "  " + String(r.n).padStart(3) +
+      "  " + cell(r.shape.correct).padStart(11) +
+      "  " + cell(r.shape.wrongConfident).padStart(10) +
+      "  " + cell(r.shape.noAnswer).padStart(11) +
+      "  " + cell(r.shape.empty).padStart(11) +
+      "  " + cell(r.shape.judgeFailed).padStart(10)
+    );
+  }
+  out.push("");
+  out.push("  Reading guide:");
+  out.push("    correct       — judge said CORRECT");
+  out.push("    wrong-conf    — LLM gave a confident answer but judge said INCORRECT");
+  out.push("    no-answer     — LLM explicitly punted ('I don't know', 'no answer', etc.)");
+  out.push("    empty         — LLM returned empty/whitespace");
+  out.push("    judge-fail    — judge infra returned no response after retries (score=null)");
+  out.push("  Concerning patterns:");
+  out.push("    wrong-conf rising vs baseline → softening may be pushing toward confabulation (BAD)");
+  out.push("    no-answer dropping + correct rising → softening unlocking real answers (GOOD)");
+  out.push("    judge-fail > 0 → re-run with --rejudge after running bench/rejudge-noresponse.ts");
   out.push("");
 
   // Per-category Answer% (the key metric)

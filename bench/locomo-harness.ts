@@ -25,6 +25,7 @@
 //   bun bench/locomo-harness.ts --data /tmp/locomo10.json --limit 5
 
 import { readFileSync, existsSync } from "node:fs";
+import { judgePrompt } from "./bench-utils";
 
 interface Args {
   data: string;
@@ -115,8 +116,8 @@ async function ollama(host: string, model: string, prompt: string, system?: stri
 const ANSWER_PROMPT = (q: string, ctx: string) =>
   `You are a memory assistant. Use ONLY the context below to answer the question. If the context doesn't support an answer, say "no answer".\n\nCONTEXT:\n${ctx}\n\nQUESTION: ${q}\n\nAnswer in one short sentence, or say "no answer".`;
 
-const JUDGE_PROMPT = (q: string, gold: string, pred: string) =>
-  `You are a strict grader for the LoCoMo benchmark. Decide if the predicted answer matches the gold answer SEMANTICALLY for this question.\n\nQUESTION: ${q}\nGOLD ANSWER:      ${gold}\nPREDICTED ANSWER: ${pred}\n\nReply with EXACTLY one of:\n  CORRECT\n  INCORRECT\nFollowed by an optional one-line reason.`;
+// v2.11.2+ — uses shared judgePrompt from bench/bench-utils.
+const JUDGE_PROMPT = (q: string, gold: string, pred: string) => judgePrompt("LoCoMo", q, gold, pred);
 
 async function runSample(args: Args, sample: LoCoMoSample): Promise<ScoredQA[]> {
   const safeOwner = `${args.owner}_${sample.sample_id}`.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 64);
