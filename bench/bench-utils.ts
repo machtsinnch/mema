@@ -67,7 +67,16 @@ const PAI_CONTAMINATION_MARKERS = [
   "════ PAI",
 ];
 
-const SterileBenchSystemPrompt = `You are a benchmark worker. Answer ONLY the question asked by the user, using ONLY the supplied context. Reply in one short sentence, with no preamble, no headers, no emoji, no formatting scaffolds, no role labels. If the context doesn't support an answer, reply exactly: no answer`;
+// v2.12.0+ — format-neutral sterile system prompt. The user message
+// will tell the worker what to produce (one-sentence answer, JSON,
+// CORRECT/INCORRECT, etc.). This prompt's job is purely to REMOVE
+// the user's PAI persona — never to constrain the output format.
+//
+// Earlier draft of this prompt said "Reply in one short sentence"
+// which broke EXTRACTOR calls (they need JSON output). Same prompt
+// is now used by answer/judge/extractor/completeness — each call
+// site specifies its own format in the user message.
+const SterileBenchSystemPrompt = `You are a benchmark worker. Follow the user message's instructions literally. Produce exactly the output format the user message requests (a single sentence, valid JSON, a CORRECT/INCORRECT verdict, etc.). Do not add preamble, role labels, headers, emoji, framework boilerplate, or any output scaffolding the user message did not ask for.`;
 
 /**
  * Shell out to the Claude CLI in non-interactive sterile mode. Used by
