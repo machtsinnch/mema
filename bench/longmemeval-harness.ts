@@ -769,10 +769,16 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
       limit_memory: Math.max(args.topK * 2, 20),
       use_vector: useVector,
       fusion: args.fusion,
-      // v2.13.2+ — pass the question's reference date so the server's
-      // factValidAt filter excludes facts dated after the question.
-      // The server already supports this (src/v2/layer5-retrieval.ts:149).
-      temporal: { valid_at: rec.question_date },
+      // v2.13.1 reverted v2.13.0's `temporal: { valid_at: rec.question_date }`
+      // pass-through. Measurement showed memory-packet regressing 83.3% → 75.9%
+      // (-7.4pp), with -20pp drops on temporal-reasoning, multi-session, and
+      // single-session-preference. Root cause: src/v2/layer5-retrieval.ts uses
+      // `validAt` for BOTH (a) fact-validity filter (intended use) AND (b)
+      // recency-scoring nowMs (unintended side effect). With validAt = past
+      // question_date, recency for ALL candidates is computed relative to
+      // the past, changing which top-K hits get ranked highest.
+      // Re-enable after src/v2/layer5-retrieval.ts is changed to separate
+      // filtering validAt from recency nowMs.
     });
     if (recallRes.ok) {
       const rj = await recallRes.json() as {
@@ -802,9 +808,7 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
       limit: args.topK,
       use_vector: useVector,
       fusion: args.fusion,
-      // v2.13.2+ — pass the question's reference date so the server's
-      // factValidAt filter excludes facts dated after the question.
-      temporal: { valid_at: rec.question_date },
+      // v2.13.1 reverted (see note in /v2/recall/packet call above).
     });
     if (recallRes.ok) {
       const rj = await recallRes.json() as { hits: RecallHit[] };
