@@ -20,6 +20,7 @@ import {
 } from "../src/v2/memory-packet";
 import type { RetrievalHit } from "../src/v2/types";
 import { sanitizeEventDate, callClaudeCLI } from "./bench-utils";
+import { buildExtractorPrompt } from "./extractor-prompt";
 
 interface ChatTurn { role: string; content: string }
 interface LMERecord {
@@ -100,22 +101,16 @@ console.error(`[dump] ingested ${sessionToEpisode.size} episodes`);
 // 2. Extract facts (claude)
 const AUTO_APPROVE = 0.9;
 let extractedFacts = 0, approvedFacts = 0, extractedEntities = 0;
-// v2.11.1+ — abbreviated temporal-grounding prompt for diagnostic dumps.
-// Kept separate from bench/longmemeval-harness.ts EXTRACTOR_SYSTEM (40 lines)
-// to keep dump output short — the full prompt is for production benching;
-// this minimal one is enough to verify the temporal-grounding pipeline.
-const EXTRACTOR_SYSTEM = `You are a strict structured-fact extractor.
-
-Output JSON: {"facts": [{"subject":"...","predicate":"...","object":"...","event_date":"YYYY-MM-DD","confidence":0.95}], "entities": [{"name":"...","type":"..."}]}
-
-TEMPORAL GROUNDING: every fact's "event_date" must be YYYY-MM-DD. Use the OBSERVATION_DATE supplied below as the anchor for relative refs ("today", "yesterday", "recently"). If a specific date is mentioned in the text, use that. NEVER use today's real-world date as event_date.`;
+// v2.12.0+ — uses the canonical Mem0-ported extractor prompt from
+// bench/extractor-prompt.ts (no separate prompt for diagnostics — keep
+// the bench and the dump tool fed by the same prompt for parity).
 
 // v2.11.2+ — uses shared callClaudeCLI from bench-utils.
 for (const [sid, epId] of sessionToEpisode) {
   const idx = rec.haystack_session_ids.indexOf(sid);
   const body = sessionToContent(rec.haystack_sessions[idx], sid, "");
   const observationDate = rec.haystack_dates[idx] ?? rec.question_date ?? new Date().toISOString().slice(0, 10);
-  const out = await callClaudeCLI(`${EXTRACTOR_SYSTEM}\n\nOBSERVATION_DATE: ${observationDate}\n\nText:\n${body}`);
+  const out = await callClaudeCLI(buildExtractorPrompt({ observationDate, text: body }));
   if (!out) continue;
   let parsed: any = null;
   try {

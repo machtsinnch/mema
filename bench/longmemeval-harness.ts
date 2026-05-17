@@ -57,58 +57,28 @@ import {
   substringMatch,
   retryVerdict,
   classifyAnswerShape,
+  validateExtractorOutput,
+  goldInContext,
+  completenessPrompt,
+  parseCompletenessVerdict,
   type AnswerShape,
+  type CompletenessVerdict,
 } from "./bench-utils";
+import { buildExtractorPrompt } from "./extractor-prompt";
 
-// v2.10.6+ — Claude/Codex CLI extractors for bench runs (Ollama
-// llama3.1:8b at ~30s/session is too slow and quality-bottlenecks the
-// architecture ablation; CLI extractors do ~5-10s per session at much
-// higher precision/recall).
-//
-// v2.11.1+ — TEMPORAL GROUNDING fix (root cause of v2.11.0-rc.1
-// knowledge-update regression). Every extracted fact must carry an
-// `event_date` representing WHEN THE EVENT HAPPENED, not when the
-// extractor ran. Without this, the compiler's isCurrent(fact, question_date)
-// always returns false because facts dated "today" are FUTURE relative
-// to historical questions, and CURRENT_STATE comes back empty. See
-// COMPETITOR-PROMPT-INTEL.md §2 (Mem0's "Resolve ALL relative
-// references against Observation Date" rule).
-const EXTRACTOR_SYSTEM = `You are a strict structured-fact extractor. You read a markdown document and extract:
-
-1. FACTS — explicit subject-predicate-object claims that the text directly states. Each fact has an EVENT DATE (when the claim became true in the world).
-2. ENTITIES — named referents (people, organizations, products, technical systems, places, important concepts).
-
-Rules:
-- Only extract claims explicit and verifiable from the text. Reject vague/hypothetical, metaphors, opinions-as-facts, fragments.
-- Predicates must be specific verbs: founded, owns, uses, rejected, supersedes, deploys_to, depends_on, is_a, located_in, reports_to, manages, supports, integrates_with, built_on. NEVER use is/has/at — too generic.
-- Subjects and objects must be ENTITIES (proper nouns / products / orgs), not pronouns or articles.
-- Reject facts where subject or object is a currency amount (CHF 22), a number/date alone, or a fragment.
-- Entity type ∈ {person, organization, product, system, place, concept, event}.
-- Confidence: 0.95 explicit, 0.85 clearly implied, ≤0.75 → don't emit.
-
-TEMPORAL GROUNDING (CRITICAL):
-- The OBSERVATION_DATE supplied below is the date this conversation occurred. Use it as your temporal anchor.
-- Every fact's "event_date" must be a YYYY-MM-DD string. Choose the date AS-OF WHICH the fact became true:
-  * If the text explicitly names a date ("on May 15, 2023", "January 10th"), use that date.
-  * If the text says "yesterday" / "last week" / "today" / "recently", resolve against OBSERVATION_DATE.
-  * If the fact is a persistent property the user is stating (preferences, possessions, names), use OBSERVATION_DATE.
-  * If you cannot infer a date, use OBSERVATION_DATE.
-- NEVER use the current real-world date or today's date as event_date. The conversation may be years old; facts must be dated when the event happened.
-- Example: OBSERVATION_DATE=2023-05-25, text "I ran a 5K with time 27:12 recently" → event_date "2023-05-25". Text "I ran a 5K on April 3 with time 27:12" → event_date "2023-04-03".
-
-Output ONLY valid JSON, no prose, no markdown fences. Schema:
-{"facts": [{"subject":"...","predicate":"...","object":"...","event_date":"YYYY-MM-DD","confidence":0.95}], "entities": [{"name":"...","type":"..."}]}
-
-If zero extractable facts, return {"facts": [], "entities": []}.`;
+// v2.12.0+ — extractor prompt moved to bench/extractor-prompt.ts. Ported
+// from Mem0's ADDITIVE_EXTRACTION_PROMPT (battle-tested extraction
+// discipline) with mema's event_date + subject/predicate/object schema.
+// Per GPT-5.5 review (2026-05-18): stop reinventing what works; copy.
 
 async function extractViaClaude(text: string, observationDate: string): Promise<{ facts: any[]; entities: any[] }> {
-  const prompt = `${EXTRACTOR_SYSTEM}\n\nOBSERVATION_DATE: ${observationDate}\n\nText:\n${text}`;
+  const prompt = buildExtractorPrompt({ observationDate, text });
   const r = await callClaudeCLI(prompt, 120000);
   return parseExtractorJSON(r ?? "");
 }
 
 async function extractViaCodex(text: string, observationDate: string): Promise<{ facts: any[]; entities: any[] }> {
-  const prompt = `${EXTRACTOR_SYSTEM}\n\nOBSERVATION_DATE: ${observationDate}\n\nText:\n${text}`;
+  const prompt = buildExtractorPrompt({ observationDate, text });
   const r = await callCodexCLI(prompt, 180000);
   return parseExtractorJSON(r ?? "");
 }
@@ -188,6 +158,10 @@ interface Args {
   //                     variant — if memory-packet >= zep-format on bench,
   //                     our extensions earn their keep.
   contextMode: "episode-only" | "flat-mixed" | "memory-packet" | "routed-packet" | "zep-format";
+  // v2.12.0+ — when on, runs a SECOND LLM call per question to grade the
+  // context packet's completeness (COMPLETE/PARTIAL/INSUFFICIENT). Zep's
+  // 2nd primary metric. Adds ~30-60s per question when on.
+  gradeCompleteness: boolean;
 }
 
 // v2.11.0+ — recall response hit, mirroring src/v2/types.ts RetrievalHit.
@@ -247,6 +221,28 @@ interface ScoredQuestion {
   extracted_entities: number;
   approved_facts: number;
   rejected_facts: number;
+  // v2.12.0+ — items rejected by zod schema validation at the extractor
+  // boundary, before any /v2/fact or /v2/entity POST.
+  rejected_invalid_facts?: number;
+  rejected_invalid_entities?: number;
+  // v2.12.0+ — was the gold answer string actually present in the rendered
+  // packet sent to the answer LLM? Decomposes "answer wrong" into:
+  //   gold_in_context=true  AND judge=0 → reading failure (LLM had it, missed it)
+  //   gold_in_context=false AND judge=0 → context failure (retrieval/compile lost it)
+  gold_in_context?: boolean;
+  // v2.12.0+ — what actually made it into the rendered packet AFTER budget
+  // truncation. Counts the structured items the LLM saw, not what was
+  // retrieved. Tells us if our compiler is wasting structured signal.
+  packet_usage?: {
+    facts_rendered: number;
+    cognitive_rendered: number;
+    entities_rendered: number;
+    episodes_rendered: number;
+    total_chars: number;
+  };
+  // v2.12.0+ — LLM-graded context-completeness (Zep's 2nd primary metric).
+  // Populated only when --grade-completeness flag is on.
+  context_completeness?: CompletenessVerdict;
   predicted_answer?: string;
   // v2.11.1+ — null means judge infrastructure failed after retries
   // (distinct from 0 = genuine INCORRECT). Consumers of the JSONL should
@@ -311,6 +307,7 @@ function parseArgs(): Args {
     // iter-1 v2.11.0-rc.1 behavior for back-compat. The new headline mode
     // is "memory-packet" (compiler + two-channel retrieval + XML format).
     contextMode: (flags["context-mode"] ? String(flags["context-mode"]) : "flat-mixed") as Args["contextMode"],
+    gradeCompleteness: !!flags["grade-completeness"],
   };
 }
 
@@ -559,6 +556,10 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
   //    high-confidence ones with passing evidence checks.
   let extractedFacts = 0, extractedEntities = 0;
   let approvedFacts = 0, rejectedFacts = 0;
+  // v2.12.0+ — items rejected by zod schema validation (malformed
+  // event_date, missing fields, generic predicates, etc.) BEFORE they
+  // reach the mema /v2/fact and /v2/entity endpoints.
+  let rejectedInvalidFacts = 0, rejectedInvalidEntities = 0;
   if (args.extract) {
     // v2.10.6+ extractor-backend selection.
     const ollamaExtractor = args.extractorBackend === "ollama" ? await pickExtractor() : null;
@@ -597,13 +598,18 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
           result = await ollamaExtractor!.extract(body);
         }
       } catch { continue; }
+      // v2.12.0+ — Zod schema validation on extractor output. Reject malformed
+      // facts/entities at the boundary so polluted memory never enters the vault.
+      // The validated result has accepted items + per-item rejection reasons.
+      const validated = validateExtractorOutput(result);
+      rejectedInvalidFacts += validated.rejections.filter(r => r.kind === "fact").length;
+      rejectedInvalidEntities += validated.rejections.filter(r => r.kind === "entity").length;
       // Write entity drafts first.
-      for (const e of result.entities) {
-        const name = String(e.name ?? "").trim();
-        if (name.length < 2 || name.length > 80) continue;
+      for (const e of validated.entities) {
+        const name = e.name.trim();
         try {
           await apiOwner("/v2/entity", {
-            name, type: String(e.type ?? "concept"),
+            name, type: e.type,
             status: "draft", derived_from: [epId],
             evidence_excerpt: body.slice(0, 400),
             proposed_by: `lmebench:${extractorName}`,
@@ -612,12 +618,14 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
         } catch { /* dedup/etc */ }
       }
       // Write fact drafts + auto-approve high-confidence ones with evidence.
-      for (const f of result.facts) {
-        const subj = String(f.subject ?? "").trim();
-        const pred = String(f.predicate ?? "").trim();
-        const obj  = String(f.object ?? "").trim();
-        const conf = Number(f.confidence ?? 0);
-        if (!subj || !pred || !obj || conf < 0.75) continue;
+      for (const f of validated.facts) {
+        const subj = f.subject.trim();
+        const pred = f.predicate.trim();
+        const obj  = f.object.trim();
+        const conf = f.confidence;
+        // Schema already enforced non-empty subject/predicate/object and conf >= 0.75
+        // and event_date format. Soft check below is defense in depth.
+        if (!subj || !pred || !obj) continue;
         // v2.11.1+ — sanitize the extractor's event_date and use it as
         // valid_from on the fact record. Falls back to observationDate via
         // sanitizeEventDate when missing or malformed.
@@ -742,6 +750,10 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
   let judgeReason: string | undefined;
   let answerMs: number | undefined;
   let judgeMs: number | undefined;
+  // v2.12.0+ — diagnostic metrics populated during packet render + answer + judge.
+  let goldInCtx: boolean | undefined;
+  let packetUsage: ScoredQuestion["packet_usage"];
+  let contextCompleteness: CompletenessVerdict | undefined;
 
   // v2.10.4+: chronological ordering by haystack_date for the evidence
   // timeline. v2.11.0+: contextMode dispatches the rendering strategy.
@@ -803,6 +815,15 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
 
       // Defensive cap for the zep-format renderer (which doesn't budget itself).
       if (ctx.length > args.contextChars) ctx = ctx.slice(0, args.contextChars);
+
+      // v2.12.0+ — packet usage stats from the actually-rendered packet object.
+      packetUsage = {
+        facts_rendered: packet.approved_facts.length,
+        cognitive_rendered: packet.cognitive_beliefs.length,
+        entities_rendered: packet.entities.length,
+        episodes_rendered: packet.raw_supporting_excerpts.length,
+        total_chars: ctx.length,
+      };
     }
 
     // ── mode episode-only ────────────────────────────────────────────
@@ -815,6 +836,7 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
         return da.localeCompare(db);
       });
       let budget = args.contextChars;
+      let episodesRendered = 0;
       for (const sid of chronological) {
         const part = sidToContent.get(sid);
         if (!part) continue;
@@ -822,9 +844,17 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
         if (!slice) break;
         ctxParts.push(slice);
         budget -= slice.length;
+        episodesRendered++;
         if (budget <= 0) break;
       }
       ctx = ctxParts.join("\n\n---\n\n");
+      packetUsage = {
+        facts_rendered: 0,
+        cognitive_rendered: 0,
+        entities_rendered: 0,
+        episodes_rendered: episodesRendered,
+        total_chars: ctx.length,
+      };
     }
 
     // ── mode flat-mixed (iter-1 sectioned packet, the "bad architecture" ref) ─
@@ -925,7 +955,22 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
       }
 
       ctx = ctxParts.join("\n\n---\n\n");
+      // flat-mixed packet usage (counts what we retrieved that COULD have been
+      // rendered; budget truncation in sections 1-3 is best-effort tracked by
+      // counting items intended to render — accurate within ~1 item).
+      packetUsage = {
+        facts_rendered: factHits.length,
+        cognitive_rendered: cognitiveHits.length,
+        entities_rendered: entityHits.length,
+        episodes_rendered: Math.min(retrievedSessions.length, args.topK),
+        total_chars: ctx.length,
+      };
     }
+
+    // v2.12.0+ — gold-in-context: was the gold answer string actually IN the
+    // rendered packet? Computed BEFORE the answer LLM sees it, so we can
+    // distinguish "context lacked answer" from "LLM missed the answer".
+    goldInCtx = goldInContext(rec.answer, ctx);
 
     const gen = await generateAnswer(args, rec.question, ctx || "(no retrieved context)", rec.question_date);
     predictedAnswer = gen.answer;
@@ -934,6 +979,22 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
     judgeScore = judge.score;  // may be null when both judges failed after retries
     judgeReason = judge.reason;
     judgeMs = judge.ms;
+
+    // v2.12.0+ — context-completeness grading (Zep's 2nd primary metric).
+    // When enabled, a separate LLM call grades the packet itself: did it
+    // contain enough information to answer the question? Independent of
+    // what the answer LLM did. Catches retrieval-good/compilation-bad.
+    if (args.gradeCompleteness) {
+      const cPrompt = completenessPrompt(rec.question, rec.answer, ctx || "(no retrieved context)");
+      const cResult = await retryVerdict(
+        args.judgeBackend,
+        () => callBackend(args.judgeBackend, args, args.judgeModel, cPrompt),
+        3,
+      );
+      // retryVerdict returns CORRECT/INCORRECT/NO_RESPONSE; we re-parse for
+      // the three-class completeness verdict.
+      contextCompleteness = parseCompletenessVerdict(cResult.reason);
+    }
   }
 
   return {
@@ -952,6 +1013,11 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
     extracted_entities: extractedEntities,
     approved_facts: approvedFacts,
     rejected_facts: rejectedFacts,
+    rejected_invalid_facts: rejectedInvalidFacts,
+    rejected_invalid_entities: rejectedInvalidEntities,
+    ...(goldInCtx !== undefined ? { gold_in_context: goldInCtx } : {}),
+    ...(packetUsage ? { packet_usage: packetUsage } : {}),
+    ...(contextCompleteness !== undefined ? { context_completeness: contextCompleteness } : {}),
     predicted_answer: predictedAnswer,
     judge_score: judgeScore,
     judge_reason: judgeReason,
