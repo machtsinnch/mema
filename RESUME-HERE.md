@@ -1,9 +1,19 @@
 # Resume Here — Session Continuation Notes
 
-**Last session ended:** 2026-05-18 (overnight)
-**Resume context:** v2.11 Memory Compiler complete + **3-mode N=30 bench running** (right-sized down from original 5-mode N=100 plan after first run showed 30+ h wall time)
-**Current released version:** v2.10.0 (tag) — `main` has 6 new commits for v2.11.0-rc.1
-**Commits NOT pushed** (per your "no push" authorization). Push when satisfied with overnight bench results.
+**Last session ended:** 2026-05-18 (late morning / early afternoon PT)
+**Resume context:** v2.11.0-rc.1 bench done + diagnosed extractor-temporal-grounding bug + v2.11.1 hotfix landed + verified on 5 knowledge-update questions (40% → 80%)
+**Current released version:** v2.10.0 (tag) — `main` has 10 new commits for v2.11.0-rc.1 + v2.11.1 fix
+**Commits NOT pushed** (per your "no push" authorization). Push when satisfied.
+
+## ⚠️ The v2.11.1 fix DOES NOT yet validate the architecture at scale
+
+The v2.11.1 fix took knowledge-update memory-packet from 40% → 80% on the SAME 5 questions that failed in the v2.11.0-rc.1 N=30 run. This is a clean diagnostic win — it proves the fix removes the specific bug. **It is NOT yet a generalization claim** because:
+
+1. **N=5 ≠ N=78**: knowledge-update has 78 questions in the LongMemEval oracle set; we re-verified on the 5 that the N=30 run sampled. Those 5 were the failure-set, so the +40pp is "the fix removes the regression on the previously-broken cases" — not "the architecture beats episode-only on a fresh holdout".
+2. **Other categories not re-bench'd**: temporal-reasoning regressed -20pp in the N=30 run; we haven't re-tested it.
+3. **`routed-packet` not re-bench'd**: the expert decision rule required routed-packet to beat episode-only overall, not just memory-packet on one category.
+
+**To make the architecture claim defensibly:** run a full N=100 5-mode bench with v2.11.1. That's ~9h wall time. Documented as the next session's first task below.
 
 ## ⚠️ Bench scope reduced — read this first
 
@@ -18,6 +28,26 @@ The original plan was 5 modes × N=100 (~6h estimate). First run showed actual r
 **N=30 caveat:** 30 questions balanced = ~5 per category. Decent directional signal but high variance per category. Decision-rule verdicts (memory-packet vs episode-only, memory-packet vs zep-format) are **directionally meaningful at N=30, not statistically definitive**. A full N=100 follow-up is your next bench task.
 
 ---
+
+## Next-session priorities (in order)
+
+1. **Full N=100 5-mode re-bench with v2.11.1.** ~9h wall time. This is the test that turns the 5-question diagnostic win into a defensible architecture claim. Use the comparison tool to land a verdict against the expert decision rule.
+
+2. **If the verdict is positive:** push the 10 commits, tag v2.11.0-rc.1, decide on GA timeline.
+
+3. **If the verdict shows the v2.11.0-rc.1 regression is fixed AND memory-packet beats episode-only on hard categories AND routed-packet beats episode-only overall:** that's the full validation. Move to v2.12 work (LLM answer-strategy classifier; MemoryValidator module).
+
+4. **If the verdict shows memory-packet still regresses somewhere:** investigate WITHOUT pivoting (per Ardin's standing rule — memory intelligence is the foundation). Likely follow-ups: Mem0-style extraction discipline (port more of their prompt rules from `COMPETITOR-PROMPT-INTEL.md` §2), the INSTRUCTIONS softening's hallucination risk (see "Known caveats" below), per-question prompt audit on failures.
+
+## Known caveats from the critic review of v2.11.1
+
+- **INSTRUCTIONS softening on retrieval-miss questions.** When `packet.uncertainty` is empty, the new INSTRUCTIONS line is "Do not refuse to answer when the evidence actually contains the answer". On questions where retrieval MISSED the gold session, `uncertainty` will (correctly) be empty AND the answer won't actually be in the packet — the new line could push the LLM toward confabulation. The N=30 run had perfect retrieval on the 5 failed questions, so this risk wasn't visible. **The full N=100 re-run should track wrong-answer% separately from no-answer% to surface this if it's real.**
+
+- **`isCurrent` rule is symmetric**: a fact dated AFTER question_date is treated the same as a fact dated BEFORE question_date if it's invalidated. The current logic is "valid_from ≤ question_date AND no invalidated_at". For knowledge-update this is correct; for temporal-reasoning questions that ask about future plans, this may be too strict. Watch for temporal-reasoning regressions in the full bench.
+
+- **Tertiary fallback in extract-loop now THROWS** on missing observation_date instead of silently using today (per critic). If any LongMemEval record has both `haystack_dates[i]` and `question_date` empty, the run will fail loudly. Inspect `rec.question_id` from the error and skip those records explicitly if it becomes a problem (none observed in the N=30 run).
+
+- **Ollama extractor backend warns loudly** if used; don't compare an Ollama run's numbers against a Claude run's numbers — they're not apples-to-apples.
 
 ## TL;DR — what to do FIRST
 
