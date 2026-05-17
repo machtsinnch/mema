@@ -1,9 +1,21 @@
 # Resume Here — Session Continuation Notes
 
 **Last session ended:** 2026-05-18 (overnight)
-**Resume context:** v2.11 Memory Compiler complete + 5-mode bench running overnight
-**Current released version:** v2.10.0 (tag) — `main` has 5 new commits for v2.11.0-rc.1
+**Resume context:** v2.11 Memory Compiler complete + **3-mode N=30 bench running** (right-sized down from original 5-mode N=100 plan after first run showed 30+ h wall time)
+**Current released version:** v2.10.0 (tag) — `main` has 6 new commits for v2.11.0-rc.1
 **Commits NOT pushed** (per your "no push" authorization). Push when satisfied with overnight bench results.
+
+## ⚠️ Bench scope reduced — read this first
+
+The original plan was 5 modes × N=100 (~6h estimate). First run showed actual rate is ~2 min/q for episode-only (no extract) and projected ~4-5 min/q for extract-enabled modes. Full 5×100 would've been **30+ hours** — far past your wake. **Triage call made at 02:00 PT:** kill that run, restart with **3 most informative modes at N=30** (fits in ~5h):
+
+- ✅ **episode-only** — baseline (the 83.0% reference)
+- ✅ **memory-packet** — headline v2.11 (does mema's architecture earn its keep?)
+- ✅ **zep-format** — control (do mema's extensions beat Zep's bare format?)
+- ⏭️ **flat-mixed** — SKIPPED (v2.10.6 already showed regression to 75% with this design; re-confirmation not load-bearing)
+- ⏭️ **routed-packet** — SKIPPED (it's memory-packet + routing — defer to a follow-up session that re-runs ALL 5 at N=100 with a quieter Claude CLI)
+
+**N=30 caveat:** 30 questions balanced = ~5 per category. Decent directional signal but high variance per category. Decision-rule verdicts (memory-packet vs episode-only, memory-packet vs zep-format) are **directionally meaningful at N=30, not statistically definitive**. A full N=100 follow-up is your next bench task.
 
 ---
 
@@ -13,10 +25,10 @@
 cd ~/Projects/machtsinn.ai
 
 # 1. Check bench completion
-tail -1 /tmp/bench_v211_5mode.log
+tail -1 /tmp/bench_v211_3mode.log
 # Expected when done: "ALL_MODES_COMPLETE"
 
-# 2. View 5-mode comparison
+# 2. View 3-mode comparison (only 3 modes ran; flat-mixed + routed-packet are missing)
 bun bench/compare-context-modes.ts
 
 # 3. View commits ready for push
@@ -26,9 +38,11 @@ git log --oneline origin/main..HEAD
 bun test 2>&1 | tail -3
 ```
 
-If the comparison shows **memory-packet ≥ episode-only on hard categories AND memory-packet ≥ zep-format overall**, the architecture earns its keep and you can push v2.11.0-rc.1 with a defensible claim.
+The comparison tool reads `/tmp/bench_v211_5mode_*.jsonl` and tolerates the missing modes (prints `(missing)`). The 3 completed modes give the headline answer.
 
-If memory-packet regresses vs episode-only, the extensions aren't yet helping and the next iteration should focus on extraction quality (Mem0-style — see `COMPETITOR-PROMPT-INTEL.md`) or the routing classifier.
+If the comparison shows **memory-packet ≥ episode-only on hard categories AND memory-packet ≥ zep-format overall**, the architecture is directionally earning its keep (validate with a full N=100 follow-up before claiming externally).
+
+If memory-packet regresses vs episode-only at N=30, the result is suggestive but not definitive (small N). Re-run at N=100 before acting. If the regression also holds at N=100, the next iteration should focus on extraction quality (Mem0-style — see `COMPETITOR-PROMPT-INTEL.md` §2 for the verbatim Mem0 extractor prompt) or wiring the routing classifier (v2.12).
 
 ---
 
