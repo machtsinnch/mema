@@ -37,6 +37,18 @@ interface QuestionResult {
   predicted_answer?: string;
   // v2.11.2+ — LLM answer shape ("no-answer" / "confident" / "empty")
   answer_shape?: "no-answer" | "confident" | "empty";
+  // v2.12.0+ diagnostics
+  gold_in_context?: boolean;
+  packet_usage?: {
+    facts_rendered: number;
+    cognitive_rendered: number;
+    entities_rendered: number;
+    episodes_rendered: number;
+    total_chars: number;
+  };
+  context_completeness?: "complete" | "partial" | "insufficient" | "judge-failed";
+  rejected_invalid_facts?: number;
+  rejected_invalid_entities?: number;
 }
 
 const MODES = [
@@ -146,6 +158,15 @@ function classifyRow(r: QuestionResult): keyof ShapeBreakdown {
   return "wrongConfident";
 }
 
+// v2.12.0+ — context-completeness counts (Zep's 2nd primary metric).
+interface CompletenessBreakdown {
+  complete: number;
+  partial: number;
+  insufficient: number;
+  judgeFailed: number;
+  graded: number;        // total cases where completeness was attempted
+}
+
 interface AggregateRow {
   mode: Mode;
   n: number;
@@ -154,11 +175,22 @@ interface AggregateRow {
   answer: number;
   answerN: number;
   shape: ShapeBreakdown;
+  // v2.12.0+
+  goldInContext: number;          // % where gold was IN the rendered packet
+  goldInContextN: number;         // sample size (rows where field was populated)
+  avgFactsRendered: number;
+  avgCognitiveRendered: number;
+  avgEntitiesRendered: number;
+  avgEpisodesRendered: number;
+  avgPacketChars: number;
+  completeness: CompletenessBreakdown;
   perCategory: Record<string, {
     n: number; h1: number; h5: number; h10: number;
     allGold: number; cov: number;
     answer: number; answerN: number;
     shape: ShapeBreakdown;
+    goldInContext: number;
+    goldInContextN: number;
   }>;
 }
 
@@ -174,6 +206,28 @@ function aggregate(mode: Mode, results: QuestionResult[]): AggregateRow {
   const shape = emptyShape();
   for (const r of results) shape[classifyRow(r)]++;
 
+  // v2.12.0+ — gold_in_context %
+  const gicRows = results.filter(r => r.gold_in_context !== undefined);
+  const gicCount = gicRows.filter(r => r.gold_in_context === true).length;
+
+  // v2.12.0+ — packet-usage averages
+  const pu = results.filter(r => r.packet_usage);
+  const avg = (sel: (p: NonNullable<QuestionResult["packet_usage"]>) => number) =>
+    pu.length === 0 ? 0 : pu.reduce((s, r) => s + sel(r.packet_usage!), 0) / pu.length;
+
+  // v2.12.0+ — completeness breakdown
+  const completeness: CompletenessBreakdown = {
+    complete: 0, partial: 0, insufficient: 0, judgeFailed: 0, graded: 0,
+  };
+  for (const r of results) {
+    if (r.context_completeness === undefined) continue;
+    completeness.graded++;
+    if (r.context_completeness === "complete") completeness.complete++;
+    else if (r.context_completeness === "partial") completeness.partial++;
+    else if (r.context_completeness === "insufficient") completeness.insufficient++;
+    else completeness.judgeFailed++;
+  }
+
   const perCategory: AggregateRow["perCategory"] = {};
   const byCat = new Map<string, QuestionResult[]>();
   for (const r of results) {
@@ -185,6 +239,8 @@ function aggregate(mode: Mode, results: QuestionResult[]): AggregateRow {
     const cJudged = rows.filter(r => r.judge_score !== undefined && r.judge_score !== null);
     const cShape = emptyShape();
     for (const r of rows) cShape[classifyRow(r)]++;
+    const cGicRows = rows.filter(r => r.gold_in_context !== undefined);
+    const cGicCount = cGicRows.filter(r => r.gold_in_context === true).length;
     perCategory[cat] = {
       n: cn,
       h1: pct(rows.filter(r => r.hit_at_1).length, cn),
@@ -195,6 +251,8 @@ function aggregate(mode: Mode, results: QuestionResult[]): AggregateRow {
       answer: pct(cJudged.filter(r => r.judge_score === 1).length, cJudged.length),
       answerN: cJudged.length,
       shape: cShape,
+      goldInContext: pct(cGicCount, cGicRows.length),
+      goldInContextN: cGicRows.length,
     };
   }
 
@@ -206,6 +264,14 @@ function aggregate(mode: Mode, results: QuestionResult[]): AggregateRow {
     answer: pct(ansCorrect, judged.length),
     answerN: judged.length,
     shape,
+    goldInContext: pct(gicCount, gicRows.length),
+    goldInContextN: gicRows.length,
+    avgFactsRendered: avg(p => p.facts_rendered),
+    avgCognitiveRendered: avg(p => p.cognitive_rendered),
+    avgEntitiesRendered: avg(p => p.entities_rendered),
+    avgEpisodesRendered: avg(p => p.episodes_rendered),
+    avgPacketChars: avg(p => p.total_chars),
+    completeness,
     perCategory,
   };
 }

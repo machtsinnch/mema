@@ -151,6 +151,56 @@ export async function callClaudeCLI(prompt: string, timeoutMs = 120000): Promise
 }
 
 /**
+ * v2.12.0+ — shell out to the Gemini CLI. Added after Codex hit its
+ * ChatGPT-account usage limit mid-bench (2026-05-18). Gemini has its
+ * own quota/auth so it sidesteps the codex throttle entirely. No PAI
+ * persona to strip — Gemini CLI is a separate stack from Claude Code.
+ *
+ *   --yolo            auto-approve all tools (we never invoke any —
+ *                     the prompt requests plain text, no tool calls)
+ *   --output-format text   plain text (vs json) so we get clean stdout
+ *   -p <prompt>       non-interactive headless mode
+ *
+ * Pipes stdout, filters the YOLO+ripgrep warning lines, returns the
+ * answer body. Returns null on empty/error/timeout.
+ */
+export async function callGeminiCLI(prompt: string, timeoutMs = 180000): Promise<string | null> {
+  try {
+    const proc = Bun.spawn([
+      "gemini",
+      "--yolo",
+      "--output-format", "text",
+      "-p", prompt,
+    ], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: process.env,
+    });
+    const decoder = new TextDecoder();
+    const watchdog = setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs);
+    const [out] = await Promise.all([
+      (async () => decoder.decode(await new Response(proc.stdout).arrayBuffer()))(),
+      proc.exited,
+    ]);
+    clearTimeout(watchdog);
+    // Strip startup noise: "YOLO mode is enabled..." and "Ripgrep is not
+    // available. Falling back to GrepTool." lines appear before the
+    // model output. Also strip any "Loaded extension..." lines.
+    const cleaned = out
+      .split("\n")
+      .filter(l =>
+        !l.startsWith("YOLO mode") &&
+        !l.startsWith("Ripgrep is not available") &&
+        !l.startsWith("Loaded extension") &&
+        !l.startsWith("Loading ")
+      )
+      .join("\n")
+      .trim();
+    return cleaned || null;
+  } catch { return null; }
+}
+
+/**
  * Shell out to the Codex CLI. `--output-last-message <file>` writes ONLY
  * the final assistant text so we don't have to parse the session log.
  * `--skip-git-repo-check` avoids the trust-directory prompt for
@@ -159,9 +209,15 @@ export async function callClaudeCLI(prompt: string, timeoutMs = 120000): Promise
 export async function callCodexCLI(prompt: string, timeoutMs = 180000): Promise<string | null> {
   const outPath = `/tmp/codex-out-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   try {
+    // v2.12.0+ — pin low reasoning effort (Ardin directive 2026-05-18,
+    // revised from medium → low after observing >20 min/call wall time
+    // on medium for N=30 bench scope. low keeps codex outputs clean of
+    // PAI contamination while bringing per-call latency back to ~1-3 min,
+    // which makes the 3-mode N=30 bench achievable in ~5-9h).
     const proc = Bun.spawn([
       "codex", "exec",
       "--skip-git-repo-check",
+      "-c", `model_reasoning_effort="low"`,
       "--output-last-message", outPath,
       prompt,
     ], {

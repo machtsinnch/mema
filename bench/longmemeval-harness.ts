@@ -53,6 +53,7 @@ import {
   sanitizeEventDate,
   callClaudeCLI,
   callCodexCLI,
+  callGeminiCLI,
   judgePrompt,
   substringMatch,
   retryVerdict,
@@ -83,6 +84,12 @@ async function extractViaCodex(text: string, observationDate: string): Promise<{
   return parseExtractorJSON(r ?? "");
 }
 
+async function extractViaGemini(text: string, observationDate: string): Promise<{ facts: any[]; entities: any[] }> {
+  const prompt = buildExtractorPrompt({ observationDate, text });
+  const r = await callGeminiCLI(prompt, 180000);
+  return parseExtractorJSON(r ?? "");
+}
+
 // (sanitizeEventDate now lives in bench/bench-utils.ts — shared with dump-packet.ts)
 
 function parseExtractorJSON(raw: string): { facts: any[]; entities: any[] } {
@@ -102,7 +109,7 @@ function parseExtractorJSON(raw: string): { facts: any[]; entities: any[] } {
   return { facts: [], entities: [] };
 }
 
-type AnswerBackend = "ollama" | "claude" | "codex";
+type AnswerBackend = "ollama" | "claude" | "codex" | "gemini";
 
 interface Args {
   data: string;
@@ -139,7 +146,7 @@ interface Args {
   // Pre-2.11 fields previously set by parseArgs but missing from this
   // interface — declared here for type completeness.
   saveResults: string | null;
-  extractorBackend: "ollama" | "claude" | "codex";
+  extractorBackend: "ollama" | "claude" | "codex" | "gemini";
   // v2.11.0+ — context-compilation mode for the answer prompt.
   //   episode-only    — only the evidence channel reaches the answer LLM.
   //                     Matches v2.10.5 baseline (83.0% LongMemEval).
@@ -427,6 +434,7 @@ async function callOllama(host: string, model: string, prompt: string, timeoutMs
 async function callBackend(backend: AnswerBackend, args: Args, model: string, prompt: string, timeoutMs?: number): Promise<string | null> {
   if (backend === "claude") return callClaudeCLI(prompt, timeoutMs ?? 120000);
   if (backend === "codex") return callCodexCLI(prompt, timeoutMs ?? 180000);
+  if (backend === "gemini") return callGeminiCLI(prompt, timeoutMs ?? 180000);
   return callOllama(args.ollamaHost, model, prompt, timeoutMs ?? 60000);
 }
 
@@ -565,6 +573,7 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
     const ollamaExtractor = args.extractorBackend === "ollama" ? await pickExtractor() : null;
     const extractorName = args.extractorBackend === "claude" ? "claude-cli"
       : args.extractorBackend === "codex" ? "codex-cli"
+      : args.extractorBackend === "gemini" ? "gemini-cli"
       : ollamaExtractor!.name;
     const AUTO_APPROVE_THRESHOLD = 0.9;
     for (const [sid, epId] of sessionToEpisode) {
@@ -593,6 +602,8 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
           result = await extractViaClaude(body, observationDate);
         } else if (args.extractorBackend === "codex") {
           result = await extractViaCodex(body, observationDate);
+        } else if (args.extractorBackend === "gemini") {
+          result = await extractViaGemini(body, observationDate);
         } else {
           // Ollama path doesn't yet thread observation_date; future v2.13 work.
           result = await ollamaExtractor!.extract(body);
