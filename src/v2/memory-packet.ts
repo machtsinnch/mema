@@ -604,6 +604,20 @@ export function classifyAnswerStrategy(input: ClassifyInput): AnswerStrategy {
 // noise and we should adopt Zep's simpler format.
 
 export function compilePacketAsZepFormat(packet: MemoryPacket): string {
+  // v2.12.0+ (post-GPT-5.5 step 4) — match Zep's exact section layout
+  // from zep_evaluate.py:284-448 (construct_context_block + _format_edges
+  // + _format_nodes + _format_episodes). Differences from prior version:
+  //
+  //   • FACTS gain per-fact Labels (predicate) + Attributes
+  //     (confidence, source_id) indented 2/4 spaces, matching
+  //     _format_edges' output shape.
+  //   • ENTITIES match _format_nodes verbatim: Name / Labels /
+  //     Attributes / Summary blocks, with "No summary available"
+  //     fallback when summary is absent (matches Zep's default).
+  //   • EPISODES use Zep's "({created_at}) {content}" line per episode.
+  //   • When a section is empty, emit Zep's stub text ("No relevant
+  //     X found") inside the XML wrapper rather than omit the section.
+  //   • USER_SUMMARY block stays at the top when populated.
   const sections: string[] = [];
 
   if (packet.user_summary) {
@@ -617,40 +631,77 @@ export function compilePacketAsZepFormat(packet: MemoryPacket): string {
     "FACTS, ENTITIES, and EPISODES represent relevant context from the user's knowledge graph."
   );
 
+  // FACTS — Zep's _format_edges shape: fact (Date range: X - Y) + indented
+  // Labels: predicate / Attributes: confidence + source.
+  const factLines: string[] = [];
   if (packet.approved_facts.length > 0) {
-    const lines = packet.approved_facts.map(f => {
+    for (const f of packet.approved_facts) {
       const endDate = f.invalidated_at ?? "present";
-      return `- ${f.subject} ${f.predicate} ${f.object} (Date range: ${f.valid_from} - ${endDate})`;
-    });
-    sections.push(
-      "# These are the most relevant facts about the user\n" +
-      '# Facts ending in "present" are currently valid\n' +
-      "# Facts with a past end date are NO LONGER VALID.\n" +
-      `<FACTS>\n${lines.join("\n")}\n</FACTS>`
-    );
+      const factText = `${f.subject} ${f.predicate} ${f.object}`;
+      factLines.push(`${factText} (Date range: ${f.valid_from} - ${endDate})`);
+      // Labels: the predicate is the natural label for mema-shaped facts.
+      factLines.push(`  Labels: ${f.predicate}`);
+      // Attributes: indented two-space + four-space per attribute (Zep's pattern).
+      const attrs: string[] = [];
+      if (typeof f.confidence === "number") attrs.push(`    confidence: ${f.confidence}`);
+      if (f.source_id) attrs.push(`    source: ${f.source_id}`);
+      if (attrs.length > 0) {
+        factLines.push("  Attributes:");
+        factLines.push(...attrs);
+      }
+      factLines.push("");  // blank between facts, matching Zep
+    }
+  } else {
+    factLines.push("No relevant facts found");
   }
+  sections.push(
+    "# These are the most relevant facts about the user\n" +
+    '# Facts ending in "present" are currently valid\n' +
+    "# Facts with a past end date are NO LONGER VALID.\n" +
+    `<FACTS>\n${factLines.join("\n")}\n</FACTS>`
+  );
 
+  // ENTITIES — Zep's _format_nodes shape: Name / Labels / Attributes /
+  // Summary blocks, blank line between entities.
+  const entityLines: string[] = [];
   if (packet.entities.length > 0) {
-    const lines = packet.entities.map(e => {
-      const aliases = e.aliases && e.aliases.length > 0 ? `, aliases: ${e.aliases.join(", ")}` : "";
-      return `Name: ${e.name}\nType: ${e.type}${aliases ? "\nAliases: " + e.aliases?.join(", ") : ""}\n`;
-    });
-    sections.push(
-      "# These are the most relevant entities (people, locations, organizations, items, and more).\n" +
-      `<ENTITIES>\n${lines.join("\n")}\n</ENTITIES>`
-    );
+    for (const e of packet.entities) {
+      entityLines.push(`Name: ${e.name}`);
+      entityLines.push(`Labels: ${e.type}`);
+      const attrs: string[] = [];
+      attrs.push(`  type: ${e.type}`);
+      if (e.aliases && e.aliases.length > 0) {
+        attrs.push(`  aliases: ${e.aliases.join(", ")}`);
+      }
+      entityLines.push("Attributes:");
+      entityLines.push(...attrs);
+      // v2.13 work: per-entity LLM-generated Summary. For now use Zep's default.
+      entityLines.push(`Summary: No summary available`);
+      entityLines.push("");  // blank between entities
+    }
+  } else {
+    entityLines.push("No relevant entities found");
   }
+  sections.push(
+    "# These are the most relevant entities (people, locations, organizations, items, and more).\n" +
+    `<ENTITIES>\n${entityLines.join("\n")}\n</ENTITIES>`
+  );
 
+  // EPISODES — Zep's _format_episodes shape: ({created_at}) {content}
+  // per episode. Single blank line between (achieved by join("\n")).
+  const episodeLines: string[] = [];
   if (packet.raw_supporting_excerpts.length > 0) {
-    const lines = packet.raw_supporting_excerpts.map(r => {
-      const head = r.date ? `(${r.date}) ` : "";
-      return `${head}${r.text}`;
-    });
-    sections.push(
-      "# These are the most relevant episodes\n" +
-      `<EPISODES>\n${lines.join("\n\n")}\n</EPISODES>`
-    );
+    for (const r of packet.raw_supporting_excerpts) {
+      const created = r.date ?? "Unknown date";
+      episodeLines.push(`(${created}) ${r.text}`);
+    }
+  } else {
+    episodeLines.push("No relevant episodes found");
   }
+  sections.push(
+    "# These are the most relevant episodes\n" +
+    `<EPISODES>\n${episodeLines.join("\n")}\n</EPISODES>`
+  );
 
   return sections.join("\n\n");
 }

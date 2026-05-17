@@ -484,7 +484,72 @@ describe("compilePacketToPrompt", () => {
 
 // ─── compilePacketAsZepFormat (control variant) ──────────────────────────
 
-describe("compilePacketAsZepFormat", () => {
+describe("compilePacketAsZepFormat (Zep-faithful — GPT-5.5 step 4)", () => {
+  test("each FACT carries Labels and Attributes (Zep _format_edges shape)", () => {
+    const hits: TwoChannelHits = {
+      evidence_channel: [],
+      memory_channel: [
+        factHit({
+          subject: "user", predicate: "owns", object: "Toyota Camry",
+          valid_from: "2024-07-18", confidence: 0.94,
+        }),
+      ],
+    };
+    const packet = buildMemoryPacket({ query: "?", hits });
+    const rendered = compilePacketAsZepFormat(packet);
+    // Fact line + Labels line + Attributes block (Zep's exact pattern)
+    expect(rendered).toContain("user owns Toyota Camry (Date range: 2024-07-18 - present)");
+    expect(rendered).toContain("  Labels: owns");
+    expect(rendered).toContain("  Attributes:");
+    // confidence comes from the score_components — covered when payload has it
+  });
+
+  test("each ENTITY has Name / Labels / Attributes / Summary blocks", () => {
+    const hits: TwoChannelHits = {
+      evidence_channel: [],
+      memory_channel: [
+        entityHit({ name: "Toyota Camry", type: "product", aliases: ["Camry"] }),
+      ],
+    };
+    const packet = buildMemoryPacket({ query: "?", hits });
+    const rendered = compilePacketAsZepFormat(packet);
+    expect(rendered).toContain("Name: Toyota Camry");
+    expect(rendered).toContain("Labels: product");
+    expect(rendered).toContain("Attributes:");
+    expect(rendered).toContain("  type: product");
+    expect(rendered).toContain("  aliases: Camry");
+    // Zep's default — until v2.13 LLM-generated entity summaries land
+    expect(rendered).toContain("Summary: No summary available");
+  });
+
+  test("EPISODES use Zep's ({created_at}) {content} line shape", () => {
+    const hits: TwoChannelHits = {
+      evidence_channel: [episodeHit({ excerpt: "user bought a Camry" })],
+      memory_channel: [],
+    };
+    const packet = buildMemoryPacket({
+      query: "?",
+      hits,
+      raw_session_text: new Map([
+        [hits.evidence_channel[0].id, { date: "2024-07-18", text: "user said they bought a Camry" }],
+      ]),
+    });
+    const rendered = compilePacketAsZepFormat(packet);
+    // Zep wraps episode lines as "(date) content" — not with brackets.
+    expect(rendered).toContain("(2024-07-18) user said they bought a Camry");
+  });
+
+  test("empty sections emit Zep's stub text inside the XML wrapper", () => {
+    const packet = buildMemoryPacket({
+      query: "?",
+      hits: { evidence_channel: [], memory_channel: [] },
+    });
+    const rendered = compilePacketAsZepFormat(packet);
+    expect(rendered).toContain("<FACTS>\nNo relevant facts found\n</FACTS>");
+    expect(rendered).toContain("<ENTITIES>\nNo relevant entities found\n</ENTITIES>");
+    expect(rendered).toContain("<EPISODES>\nNo relevant episodes found\n</EPISODES>");
+  });
+
   test("renders FACTS / ENTITIES / EPISODES sections only — no mema extensions", () => {
     const hits: TwoChannelHits = {
       evidence_channel: [episodeHit({ excerpt: "(2024-07-18) user bought a Camry" })],
