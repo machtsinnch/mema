@@ -505,13 +505,34 @@ export function compilePacketToPrompt(
     );
   }
 
-  // INSTRUCTIONS (always present unless explicitly disabled — for control runs like mode E zep-format)
+  // INSTRUCTIONS (always present unless explicitly disabled — for control runs like mode E zep-format).
+  //
+  // v2.11.1+ — softened to handle empty CURRENT_STATE gracefully. Pre-2.11.1
+  // wording told the LLM to "Answer using CURRENT_STATE first" unconditionally;
+  // when CURRENT_STATE was empty (because of the extractor temporal-grounding
+  // bug, or simply because no facts are current at question_date), the LLM
+  // over-deferred and returned "no answer" even when FACTS contained the
+  // answer. New wording explicitly lays out a fallback chain.
   if (includeInstructions) {
+    const hasCurrentState = packet.current_state.length > 0;
+    const hasFacts = packet.approved_facts.length > 0;
+    const hasUncertainty = packet.uncertainty.length > 0;
+
+    const priorityLine = hasCurrentState
+      ? "Answer using CURRENT_STATE first, then FACTS chronologically (latest valid_from wins on the same subject+predicate), then RAW_SUPPORTING_EXCERPTS."
+      : hasFacts
+      ? "CURRENT_STATE is empty. Use FACTS chronologically (latest valid_from wins on the same subject+predicate), supplemented by RAW_SUPPORTING_EXCERPTS."
+      : "No structured memory is current. Answer from RAW_SUPPORTING_EXCERPTS, reading them chronologically and trusting the most recent statement on the topic.";
+
+    const uncertaintyLine = hasUncertainty
+      ? "If UNCERTAINTY notes apply to the asked question, prefer to admit not-knowing over confabulation."
+      : "Do not refuse to answer when the evidence (FACTS or RAW excerpts) actually contains the answer — read carefully before defaulting to 'no answer'.";
+
     sections.push(
       "<INSTRUCTIONS>\n" +
-      "Answer using CURRENT_STATE first, then FACTS, then RAW_SUPPORTING_EXCERPTS.\n" +
+      priorityLine + "\n" +
       "Do not treat COGNITIVE_BELIEFS as facts unless supported by RAW evidence.\n" +
-      "If UNCERTAINTY notes apply, prefer to admit not-knowing over confabulation.\n" +
+      uncertaintyLine + "\n" +
       "Keep responses SHORT - one sentence when possible.\n" +
       "</INSTRUCTIONS>"
     );

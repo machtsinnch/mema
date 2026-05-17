@@ -417,6 +417,69 @@ describe("compilePacketToPrompt", () => {
     const rendered = compilePacketToPrompt(packet, { includeInstructions: false });
     expect(rendered).not.toContain("<INSTRUCTIONS>");
   });
+
+  // v2.11.1+ — INSTRUCTIONS softening: when CURRENT_STATE is empty but FACTS
+  // are present (e.g. all facts dated before question_date — historical
+  // questions), the INSTRUCTIONS must NOT tell the LLM to start from
+  // CURRENT_STATE. Instead, route to FACTS chronologically.
+  test("INSTRUCTIONS — fallback to FACTS chronologically when CURRENT_STATE is empty", () => {
+    const hits: TwoChannelHits = {
+      evidence_channel: [],
+      memory_channel: [
+        factHit({
+          subject: "user", predicate: "owns", object: "Honda Civic",
+          valid_from: "2024-01-01", invalidated_at: "2024-07-18",
+        }),
+        factHit({
+          subject: "user", predicate: "owns", object: "Toyota Camry",
+          valid_from: "2024-07-18",
+        }),
+      ],
+    };
+    // question_date BEFORE both facts → CURRENT_STATE will be empty
+    const packet = buildMemoryPacket({
+      query: "What car did the user own?",
+      question_date: "2023-01-01",
+      hits,
+    });
+    expect(packet.current_state.length).toBe(0);
+    expect(packet.approved_facts.length).toBe(2);
+
+    const rendered = compilePacketToPrompt(packet);
+    // Must NOT tell the LLM to use CURRENT_STATE first (it's empty).
+    expect(rendered).not.toContain("Answer using CURRENT_STATE first");
+    expect(rendered).toContain("CURRENT_STATE is empty");
+    expect(rendered).toContain("Use FACTS chronologically");
+    // Must tell the LLM to actually answer when evidence is present.
+    expect(rendered).toContain("Do not refuse to answer");
+  });
+
+  test("INSTRUCTIONS — fall back to RAW excerpts when no structured memory at all", () => {
+    const hits: TwoChannelHits = {
+      evidence_channel: [episodeHit({ excerpt: "raw conversation text" })],
+      memory_channel: [],
+    };
+    const packet = buildMemoryPacket({
+      query: "What did the user say?",
+      hits,
+    });
+    const rendered = compilePacketToPrompt(packet);
+    expect(rendered).toContain("No structured memory is current");
+    expect(rendered).toContain("RAW_SUPPORTING_EXCERPTS");
+    expect(rendered).toContain("trusting the most recent statement");
+  });
+
+  test("INSTRUCTIONS — preserve admit-unknown wording when UNCERTAINTY notes present", () => {
+    const hits: TwoChannelHits = {
+      evidence_channel: [],
+      memory_channel: [],  // no structured memory → UNCERTAINTY is populated
+    };
+    const packet = buildMemoryPacket({ query: "What?", hits });
+    expect(packet.uncertainty.length).toBeGreaterThan(0);
+
+    const rendered = compilePacketToPrompt(packet);
+    expect(rendered).toContain("prefer to admit not-knowing");
+  });
 });
 
 // ─── compilePacketAsZepFormat (control variant) ──────────────────────────

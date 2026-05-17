@@ -49,14 +49,24 @@ import {
   type TwoChannelHits,
 } from "../src/v2/memory-packet";
 import type { RetrievalHit } from "../src/v2/types";
+import { sanitizeEventDate } from "./bench-utils";
 
 // v2.10.6+ — Claude/Codex CLI extractors for bench runs (Ollama
 // llama3.1:8b at ~30s/session is too slow and quality-bottlenecks the
 // architecture ablation; CLI extractors do ~5-10s per session at much
 // higher precision/recall).
+//
+// v2.11.1+ — TEMPORAL GROUNDING fix (root cause of v2.11.0-rc.1
+// knowledge-update regression). Every extracted fact must carry an
+// `event_date` representing WHEN THE EVENT HAPPENED, not when the
+// extractor ran. Without this, the compiler's isCurrent(fact, question_date)
+// always returns false because facts dated "today" are FUTURE relative
+// to historical questions, and CURRENT_STATE comes back empty. See
+// COMPETITOR-PROMPT-INTEL.md §2 (Mem0's "Resolve ALL relative
+// references against Observation Date" rule).
 const EXTRACTOR_SYSTEM = `You are a strict structured-fact extractor. You read a markdown document and extract:
 
-1. FACTS — explicit subject-predicate-object claims that the text directly states.
+1. FACTS — explicit subject-predicate-object claims that the text directly states. Each fact has an EVENT DATE (when the claim became true in the world).
 2. ENTITIES — named referents (people, organizations, products, technical systems, places, important concepts).
 
 Rules:
@@ -67,22 +77,34 @@ Rules:
 - Entity type ∈ {person, organization, product, system, place, concept, event}.
 - Confidence: 0.95 explicit, 0.85 clearly implied, ≤0.75 → don't emit.
 
+TEMPORAL GROUNDING (CRITICAL):
+- The OBSERVATION_DATE supplied below is the date this conversation occurred. Use it as your temporal anchor.
+- Every fact's "event_date" must be a YYYY-MM-DD string. Choose the date AS-OF WHICH the fact became true:
+  * If the text explicitly names a date ("on May 15, 2023", "January 10th"), use that date.
+  * If the text says "yesterday" / "last week" / "today" / "recently", resolve against OBSERVATION_DATE.
+  * If the fact is a persistent property the user is stating (preferences, possessions, names), use OBSERVATION_DATE.
+  * If you cannot infer a date, use OBSERVATION_DATE.
+- NEVER use the current real-world date or today's date as event_date. The conversation may be years old; facts must be dated when the event happened.
+- Example: OBSERVATION_DATE=2023-05-25, text "I ran a 5K with time 27:12 recently" → event_date "2023-05-25". Text "I ran a 5K on April 3 with time 27:12" → event_date "2023-04-03".
+
 Output ONLY valid JSON, no prose, no markdown fences. Schema:
-{"facts": [{"subject":"...","predicate":"...","object":"...","confidence":0.95}], "entities": [{"name":"...","type":"..."}]}
+{"facts": [{"subject":"...","predicate":"...","object":"...","event_date":"YYYY-MM-DD","confidence":0.95}], "entities": [{"name":"...","type":"..."}]}
 
 If zero extractable facts, return {"facts": [], "entities": []}.`;
 
-async function extractViaClaude(text: string): Promise<{ facts: any[]; entities: any[] }> {
-  const prompt = `${EXTRACTOR_SYSTEM}\n\nText:\n${text}`;
+async function extractViaClaude(text: string, observationDate: string): Promise<{ facts: any[]; entities: any[] }> {
+  const prompt = `${EXTRACTOR_SYSTEM}\n\nOBSERVATION_DATE: ${observationDate}\n\nText:\n${text}`;
   const r = await callClaudeCLI(prompt, 120000);
   return parseExtractorJSON(r ?? "");
 }
 
-async function extractViaCodex(text: string): Promise<{ facts: any[]; entities: any[] }> {
-  const prompt = `${EXTRACTOR_SYSTEM}\n\nText:\n${text}`;
+async function extractViaCodex(text: string, observationDate: string): Promise<{ facts: any[]; entities: any[] }> {
+  const prompt = `${EXTRACTOR_SYSTEM}\n\nOBSERVATION_DATE: ${observationDate}\n\nText:\n${text}`;
   const r = await callCodexCLI(prompt, 180000);
   return parseExtractorJSON(r ?? "");
 }
+
+// (sanitizeEventDate now lives in bench/bench-utils.ts — shared with dump-packet.ts)
 
 function parseExtractorJSON(raw: string): { facts: any[]; entities: any[] } {
   const stripped = raw.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
@@ -543,14 +565,20 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
       : ollamaExtractor!.name;
     const AUTO_APPROVE_THRESHOLD = 0.9;
     for (const [sid, epId] of sessionToEpisode) {
-      const body = sessionToContent(rec.haystack_sessions[rec.haystack_session_ids.indexOf(sid)], sid, "");
+      const idx = rec.haystack_session_ids.indexOf(sid);
+      const body = sessionToContent(rec.haystack_sessions[idx], sid, "");
+      // v2.11.1+ — pass the session's haystack date as OBSERVATION_DATE so
+      // the extractor can ground relative temporal refs ("yesterday", "today")
+      // to the actual conversation time, not to extractor-run time.
+      const observationDate = rec.haystack_dates[idx] ?? rec.question_date ?? new Date().toISOString().slice(0, 10);
       let result;
       try {
         if (args.extractorBackend === "claude") {
-          result = await extractViaClaude(body);
+          result = await extractViaClaude(body, observationDate);
         } else if (args.extractorBackend === "codex") {
-          result = await extractViaCodex(body);
+          result = await extractViaCodex(body, observationDate);
         } else {
+          // Ollama path doesn't yet thread observation_date; future v2.13 work.
           result = await ollamaExtractor!.extract(body);
         }
       } catch { continue; }
@@ -575,12 +603,17 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
         const obj  = String(f.object ?? "").trim();
         const conf = Number(f.confidence ?? 0);
         if (!subj || !pred || !obj || conf < 0.75) continue;
+        // v2.11.1+ — sanitize the extractor's event_date and use it as
+        // valid_from on the fact record. Falls back to observationDate via
+        // sanitizeEventDate when missing or malformed.
+        const validFrom = sanitizeEventDate(f.event_date, observationDate);
         let createdId: string | null = null;
         try {
           const r = await apiOwner("/v2/fact", {
             subject: subj, predicate: pred, object: obj,
             derived_from: [epId],
             confidence: Math.min(Math.max(conf, 0), 1),
+            valid_from: validFrom,
             status: "draft",
             evidence_excerpt: body.slice(0, 500),
             proposed_by: `lmebench:${extractorName}`,
