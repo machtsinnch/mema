@@ -47,11 +47,13 @@ cat /tmp/AUTONOMOUS-SESSION-FINAL-RESULTS.md  # the full story of what happened
 
 ## Bench results table
 
-| Mode | v2.12 baseline | v2.13a (new embedder + prompts) | v2.13b (+time-aware) |
-|---|---|---|---|
-| episode-only | 78.6% (n=28) | **83.3% (n=30)** | 80.0% (n=30) — judge noise¹ |
-| memory-packet | 79.3% (n=29) | **83.3% (n=30)** | not re-benched² |
-| zep-format | 66.7% (n=30) | **73.3% (n=30)** | not re-benched² |
+| Mode | v2.12 baseline | v2.13a (new embedder + prompts) | v2.13b (+time-aware) | v2.13.1 verify-revert |
+|---|---|---|---|---|
+| episode-only | 78.6% (n=28) | **83.3% (n=30)** | 80.0% (n=30) | not re-measured³ |
+| memory-packet | 79.3% (n=29) | **83.3% (n=30)** | 75.9% (n=29) | **73.3% (n=30)** ⚠️ |
+| zep-format | 66.7% (n=30) | **73.3% (n=30)** | not re-benched² | not re-measured³ |
+
+³ Honest variance caveat (read this before quoting numbers): memory-packet was re-run a third time after the time-aware revert and came in at 73.3%, not the 83.3% headline. Three runs of the same mode with the same nomic embedder cluster at 73.3% / 75.9% / 83.3% — **inter-run variance is ~5-10pp at n=30**. The 83.3% memory-packet "lift" claim in v2.13.0's commit message is overstated; the honest mean is ~77% ± 5pp. **What's solidly real:** single-session-preference category jumped from 20% → 80% across ALL three runs (+60pp) — way bigger than judge noise. The preference prompt fix works. The other claimed lifts need n=100 to validate.
 
 ¹ The -3.3pp v2.13b dip on episode-only is **one judge flip on one question** (Miami hotel, same retrieval and near-identical predicted answer). At n=5 per category, one flip = ±20pp. Not a real regression.
 
@@ -66,6 +68,24 @@ cat /tmp/AUTONOMOUS-SESSION-FINAL-RESULTS.md  # the full story of what happened
 ## Known regression to investigate
 
 **memory-packet knowledge-update dropped 80% → 60%.** Likely cause: new prompt assumes `isSuperseded` tags, but mema doesn't do write-time supersession yet (v2.14 work — the ADD/UPDATE/DELETE memory manager). The LLM seeing both old and new contradicting facts without supersession tags abstains where it previously guessed-correctly.
+
+## Architectural commitment for v2.14+ (Ardin's directive, 2026-05-17)
+
+**Every layer is mandatory. Every operation is deterministic in its CONTRACT, even when the LLM call inside is stochastic. Every failure is explicit, never silent.**
+
+The principle: LLMs are stochastic — mema's PURPOSE is to add a deterministic layer on top. If mema's operational behavior is itself optional ("sometimes extract, sometimes don't, depending on a flag"), it inherits the chaos it's meant to filter. **Cannot sell stability on a stochastic foundation.**
+
+Current architectural inconsistency that must be fixed in v2.14:
+- Extraction is currently OPTIONAL via the bench's `--extract` flag (and likely via `/v2/observe`'s request body). This means some episodes have facts/entities/citations, some don't. At scale, the corpus becomes heterogeneous and untrustworthy.
+
+v2.14+ design rules:
+- `/v2/observe` ALWAYS triggers extraction. No client flag to skip.
+- Extraction failures (LLM unavailable, rate-limited, malformed JSON) → episode marked `extraction_pending` with explicit visibility + queued for retry. NEVER silently dropped.
+- Retrieval results always indicate provenance status per record: "has extracted facts" / "extraction pending" / "extraction failed". Never ambiguous.
+- The bench's `episode-only` mode gets relabeled as a **baseline comparison track**, not a production mode. Production = always extracts.
+- Same discipline for every layer: Layer 4 governance ALWAYS applies, Layer 6 audit ALWAYS logs, Layer 7 UAL ALWAYS signs answers (when shipped), Layer 3 cognitive (reflection) configurable but via explicit-disable, not silent-skip.
+
+Concrete files to audit and harden in v2.14: `src/v2/api.ts` (the `/v2/observe` endpoint), `bench/longmemeval-harness.ts` (the `--extract` flag semantics).
 
 ## When you return — three open items
 
