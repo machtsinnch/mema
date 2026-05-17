@@ -487,9 +487,8 @@ ${context}`;
 }
 
 /**
- * Parse a completeness verdict from raw LLM output (after retryVerdict
- * stripped retries). Returns the discriminated union value or
- * "judge-failed" if unparseable.
+ * Parse a completeness verdict from raw LLM output. Returns the
+ * discriminated union value or "judge-failed" if unparseable.
  */
 export function parseCompletenessVerdict(raw: string | null | undefined): CompletenessVerdict {
   if (!raw) return "judge-failed";
@@ -498,4 +497,53 @@ export function parseCompletenessVerdict(raw: string | null | undefined): Comple
   if (head.startsWith("PARTIAL")) return "partial";
   if (head.startsWith("INSUFFICIENT")) return "insufficient";
   return "judge-failed";
+}
+
+/**
+ * v2.12.0+ — three-class retry kernel for completeness grading.
+ * GPT-5.5 review (2026-05-18) caught that the harness's prior
+ * implementation passed `completenessPrompt` output through the binary
+ * `retryVerdict` (which only knows CORRECT/INCORRECT). Outputs like
+ * "COMPLETE — context has all needed info" were classified as
+ * NO_RESPONSE/ambiguous, then re-parsed by parseCompletenessVerdict
+ * which got "ambiguous: COMPLETE — ..." as input and returned
+ * judge-failed. The bug silently lost EVERY completeness verdict.
+ *
+ * This helper does the right thing: runs the same retry-on-empty
+ * loop but classifies the raw output with parseCompletenessVerdict
+ * directly. Ambiguous outputs that don't start with a recognized
+ * three-class prefix still return "judge-failed" but after retries.
+ */
+export interface CompletenessResult {
+  verdict: CompletenessVerdict;
+  reason: string;
+}
+
+export async function retryCompleteness(
+  name: string,
+  fn: () => Promise<string | null>,
+  retries = 3,
+): Promise<CompletenessResult> {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const out = await fn();
+      if (out && out.trim().length > 0) {
+        const verdict = parseCompletenessVerdict(out);
+        if (verdict !== "judge-failed") {
+          return { verdict, reason: out.slice(0, 200) };
+        }
+        if (i === retries - 1) {
+          return { verdict: "judge-failed", reason: `${name}-ambiguous: ${out.slice(0, 150)}` };
+        }
+      } else if (i === retries - 1) {
+        return { verdict: "judge-failed", reason: `${name} returned empty after ${retries} retries` };
+      }
+    } catch (e: any) {
+      if (i === retries - 1) {
+        return { verdict: "judge-failed", reason: `${name} threw: ${(e?.message ?? String(e)).slice(0, 100)}` };
+      }
+    }
+    await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+  }
+  return { verdict: "judge-failed", reason: `${name} fell through retry loop` };
 }

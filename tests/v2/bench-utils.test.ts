@@ -12,6 +12,8 @@ import {
   judgePrompt,
   retryVerdict,
   classifyAnswerShape,
+  parseCompletenessVerdict,
+  retryCompleteness,
 } from "../../bench/bench-utils";
 
 describe("sanitizeEventDate", () => {
@@ -228,5 +230,69 @@ describe("classifyAnswerShape", () => {
   });
   test("returns 'confident' for answer that contains 'know' but isn't an abstention", () => {
     expect(classifyAnswerShape("I know the answer is Toyota Camry.")).toBe("confident");
+  });
+});
+
+// ─── parseCompletenessVerdict + retryCompleteness ───────────────────────
+
+describe("parseCompletenessVerdict", () => {
+  test("returns 'complete' for COMPLETE prefix", () => {
+    expect(parseCompletenessVerdict("COMPLETE — has everything needed")).toBe("complete");
+  });
+  test("returns 'partial' for PARTIAL prefix", () => {
+    expect(parseCompletenessVerdict("PARTIAL: missing the date")).toBe("partial");
+  });
+  test("returns 'insufficient' for INSUFFICIENT prefix", () => {
+    expect(parseCompletenessVerdict("INSUFFICIENT - no relevant info")).toBe("insufficient");
+  });
+  test("case-insensitive", () => {
+    expect(parseCompletenessVerdict("complete and total")).toBe("complete");
+  });
+  test("trims whitespace", () => {
+    expect(parseCompletenessVerdict("  \n  COMPLETE  ")).toBe("complete");
+  });
+  test("returns 'judge-failed' for unparseable", () => {
+    expect(parseCompletenessVerdict("Maybe yes, maybe no")).toBe("judge-failed");
+  });
+  test("returns 'judge-failed' for null/undefined/empty", () => {
+    expect(parseCompletenessVerdict(null)).toBe("judge-failed");
+    expect(parseCompletenessVerdict(undefined)).toBe("judge-failed");
+    expect(parseCompletenessVerdict("")).toBe("judge-failed");
+  });
+});
+
+describe("retryCompleteness", () => {
+  test("returns complete on first attempt when LLM outputs COMPLETE", async () => {
+    let calls = 0;
+    const r = await retryCompleteness("test", async () => { calls++; return "COMPLETE — has it"; }, 3);
+    expect(r.verdict).toBe("complete");
+    expect(calls).toBe(1);
+  });
+  test("returns partial on PARTIAL output", async () => {
+    const r = await retryCompleteness("test", async () => "PARTIAL: missing date", 3);
+    expect(r.verdict).toBe("partial");
+  });
+  test("returns insufficient on INSUFFICIENT output", async () => {
+    const r = await retryCompleteness("test", async () => "INSUFFICIENT — nothing relevant", 3);
+    expect(r.verdict).toBe("insufficient");
+  });
+  test("retries on empty and succeeds later", async () => {
+    let calls = 0;
+    const r = await retryCompleteness("test", async () => {
+      calls++;
+      return calls < 2 ? "" : "COMPLETE";
+    }, 3);
+    expect(r.verdict).toBe("complete");
+    expect(calls).toBe(2);
+  });
+  test("returns judge-failed after retries exhausted on empty", async () => {
+    const r = await retryCompleteness("test", async () => "", 2);
+    expect(r.verdict).toBe("judge-failed");
+    expect(r.reason).toContain("empty after 2 retries");
+  });
+  test("returns judge-failed with ambiguous reason for unparseable last attempt", async () => {
+    const r = await retryCompleteness("test", async () => "I think the context is fine", 1);
+    expect(r.verdict).toBe("judge-failed");
+    expect(r.reason).toContain("ambiguous");
   });
 });

@@ -60,7 +60,7 @@ import {
   validateExtractorOutput,
   goldInContext,
   completenessPrompt,
-  parseCompletenessVerdict,
+  retryCompleteness,
   type AnswerShape,
   type CompletenessVerdict,
 } from "./bench-utils";
@@ -984,16 +984,18 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
     // When enabled, a separate LLM call grades the packet itself: did it
     // contain enough information to answer the question? Independent of
     // what the answer LLM did. Catches retrieval-good/compilation-bad.
+    //
+    // v2.12.0 (post-GPT-5.5) — uses retryCompleteness directly so the
+    // three-class COMPLETE/PARTIAL/INSUFFICIENT verdict isn't crushed
+    // through the binary retryVerdict (the prior bug).
     if (args.gradeCompleteness) {
       const cPrompt = completenessPrompt(rec.question, rec.answer, ctx || "(no retrieved context)");
-      const cResult = await retryVerdict(
+      const cResult = await retryCompleteness(
         args.judgeBackend,
         () => callBackend(args.judgeBackend, args, args.judgeModel, cPrompt),
         3,
       );
-      // retryVerdict returns CORRECT/INCORRECT/NO_RESPONSE; we re-parse for
-      // the three-class completeness verdict.
-      contextCompleteness = parseCompletenessVerdict(cResult.reason);
+      contextCompleteness = cResult.verdict;
     }
   }
 
