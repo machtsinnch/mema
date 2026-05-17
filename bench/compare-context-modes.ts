@@ -47,18 +47,60 @@ function parseArgs() {
   const argv = process.argv.slice(2);
   let dir = "/tmp";
   let json = false;
+  // v2.11.1+ — --rejudge PATH overrides judge_score for cases re-judged by
+  // bench/rejudge-noresponse.ts. Lets us report corrected metrics without
+  // re-running the full bench when only the judge infrastructure flaked.
+  let rejudge: string | null = null;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--json") json = true;
     if (argv[i] === "--dir") dir = argv[++i] ?? dir;
+    if (argv[i] === "--rejudge") rejudge = argv[++i] ?? null;
   }
-  return { dir, json };
+  return { dir, json, rejudge };
 }
 
-function loadMode(dir: string, mode: Mode): QuestionResult[] | null {
+interface RejudgeEntry {
+  mode: string;
+  question_id: string;
+  consensus: "CORRECT" | "INCORRECT" | "DISPUTED" | "UNRESOLVED";
+  consensus_basis: string;
+}
+
+function loadRejudge(path: string | null): Map<string, RejudgeEntry> {
+  const map = new Map<string, RejudgeEntry>();
+  if (!path || !existsSync(path)) return map;
+  const lines = readFileSync(path, "utf8").trim().split("\n").filter(Boolean);
+  for (const line of lines) {
+    const e = JSON.parse(line) as RejudgeEntry;
+    map.set(`${e.mode}:${e.question_id}`, e);
+  }
+  return map;
+}
+
+function loadMode(dir: string, mode: Mode, rejudge: Map<string, RejudgeEntry>): QuestionResult[] | null {
   const path = join(dir, `bench_v211_5mode_${mode}.jsonl`);
   if (!existsSync(path)) return null;
   const lines = readFileSync(path, "utf8").trim().split("\n").filter(Boolean);
-  return lines.map(l => JSON.parse(l) as QuestionResult);
+  const results: QuestionResult[] = [];
+  for (const l of lines) {
+    const r = JSON.parse(l) as QuestionResult;
+    // Apply rejudge override if present for this (mode, qid).
+    const re = rejudge.get(`${mode}:${r.question_id}`);
+    if (re) {
+      if (re.consensus === "CORRECT") {
+        r.judge_score = 1;
+        r.judge_reason = `rejudge:CORRECT (${re.consensus_basis})`;
+      } else if (re.consensus === "INCORRECT") {
+        r.judge_score = 0;
+        r.judge_reason = `rejudge:INCORRECT (${re.consensus_basis})`;
+      } else {
+        // DISPUTED or UNRESOLVED — leave score=0 but flag the reason
+        r.judge_reason = `rejudge:${re.consensus} (${re.consensus_basis})`;
+      }
+    }
+    results.push(r);
+  }
+  return results;
 }
 
 function pct(num: number, den: number): number {
@@ -245,9 +287,13 @@ function renderText(rows: Map<Mode, AggregateRow>): string {
 // ─── main ───────────────────────────────────────────────────────────────
 
 const args = parseArgs();
+const rejudge = loadRejudge(args.rejudge);
+if (args.rejudge) {
+  console.error(`  [info] loaded ${rejudge.size} rejudge overrides from ${args.rejudge}`);
+}
 const rows = new Map<Mode, AggregateRow>();
 for (const mode of MODES) {
-  const results = loadMode(args.dir, mode);
+  const results = loadMode(args.dir, mode, rejudge);
   if (!results) {
     console.error(`  [warn] no JSONL for mode=${mode} at ${args.dir}`);
     continue;

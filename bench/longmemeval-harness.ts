@@ -239,7 +239,10 @@ interface ScoredQuestion {
   approved_facts: number;
   rejected_facts: number;
   predicted_answer?: string;
-  judge_score?: number;
+  // v2.11.1+ — null means judge infrastructure failed after retries
+  // (distinct from 0 = genuine INCORRECT). Consumers of the JSONL should
+  // treat null and undefined differently from 0 when aggregating Answer%.
+  judge_score?: number | null;
   judge_reason?: string;
   answer_ms?: number;
   judge_ms?: number;
@@ -489,12 +492,28 @@ async function generateAnswer(
   return { answer: (a ?? "no answer").slice(0, 500), ms: Date.now() - t };
 }
 
-async function judgeAnswer(
+// v2.11.1+ — judge with retry + secondary-judge fallback. The original
+// implementation called the judge backend ONCE and silently returned
+// score=0 on empty response. The N=30 bench showed ~10% of judge calls
+// returned empty (9/90), polluting the headline number by ~10pp. Pattern:
+//   1. Call primary judge (args.judgeBackend), up to 3 attempts on empty
+//   2. If still no response, fall back to the OTHER backend (claude if
+//      primary was codex, codex if primary was claude), up to 2 attempts
+//   3. Only if both fail across all retries, return score=null +
+//      reason="judge-no-response-after-retries". score=null lets the
+//      consumer distinguish "judge failed" from a genuine "INCORRECT".
+async function judgeAnswerOnce(
+  args: Args, backend: AnswerBackend, question: string, gold: string, predicted: string,
+): Promise<string | null> {
+  return await callBackend(backend, args, args.judgeModel, JUDGE_PROMPT(question, gold, predicted));
+}
+
+export async function judgeWithRetry(
   args: Args,
   question: string,
   gold: string,
   predicted: string,
-): Promise<{ score: number; reason: string; ms: number }> {
+): Promise<{ score: number | null; reason: string; ms: number }> {
   const t = Date.now();
   if (args.judge === "substring") {
     const ok = gold.trim().toLowerCase().split(/\s+/).filter(w => w.length >= 3).every(
@@ -502,14 +521,52 @@ async function judgeAnswer(
     );
     return { score: ok ? 1 : 0, reason: ok ? "substring-match" : "substring-miss", ms: Date.now() - t };
   }
-  if (args.judge === "llm") {
-    const verdict = await callBackend(args.judgeBackend, args, args.judgeModel, JUDGE_PROMPT(question, gold, predicted));
-    const v = (verdict ?? "").toUpperCase();
-    const correct = v.startsWith("CORRECT");
-    return { score: correct ? 1 : 0, reason: (verdict ?? "judge-no-response").slice(0, 200), ms: Date.now() - t };
+  if (args.judge !== "llm") {
+    return { score: 0, reason: "judge-disabled", ms: 0 };
   }
-  return { score: 0, reason: "judge-disabled", ms: 0 };
+
+  // Primary judge: up to 3 attempts.
+  const primary = args.judgeBackend;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const verdict = await judgeAnswerOnce(args, primary, question, gold, predicted);
+    if (verdict && verdict.trim().length > 0) {
+      const v = verdict.trim().toUpperCase();
+      if (v.startsWith("CORRECT")) return { score: 1, reason: verdict.slice(0, 200), ms: Date.now() - t };
+      if (v.startsWith("INCORRECT")) return { score: 0, reason: verdict.slice(0, 200), ms: Date.now() - t };
+      // Ambiguous (judge wrote prose, didn't lead with verdict word). Treat as 0
+      // but log so it's visible.
+      if (attempt === 3) {
+        return { score: 0, reason: `${primary}-ambiguous: ${verdict.slice(0, 150)}`, ms: Date.now() - t };
+      }
+    }
+    // Brief backoff
+    await new Promise(r => setTimeout(r, 500 * attempt));
+  }
+
+  // Primary failed all 3 retries. Fall back to secondary judge (the OTHER backend).
+  const secondary: AnswerBackend = primary === "codex" ? "claude" : "codex";
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const verdict = await judgeAnswerOnce(args, secondary, question, gold, predicted);
+    if (verdict && verdict.trim().length > 0) {
+      const v = verdict.trim().toUpperCase();
+      if (v.startsWith("CORRECT")) {
+        return { score: 1, reason: `${secondary}-fallback: ${verdict.slice(0, 180)}`, ms: Date.now() - t };
+      }
+      if (v.startsWith("INCORRECT")) {
+        return { score: 0, reason: `${secondary}-fallback: ${verdict.slice(0, 180)}`, ms: Date.now() - t };
+      }
+    }
+    await new Promise(r => setTimeout(r, 500 * attempt));
+  }
+
+  // Both judges failed all retries. Return null score so consumer can
+  // distinguish judge failure from a genuine "INCORRECT".
+  return { score: null, reason: "judge-no-response-after-retries", ms: Date.now() - t };
 }
+
+// (judgeAnswer back-compat shim removed v2.11.1 — runQuestion calls
+// judgeWithRetry directly and preserves the score=null distinction in
+// ScoredQuestion.judge_score so JSONL consumers see judge failures.)
 
 async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> {
   // Per-question isolated owner so haystacks from different questions don't
@@ -736,7 +793,7 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
   // context and judge it. We use the top-K retrieved sessions' content
   // as the context packet, truncated to args.contextChars.
   let predictedAnswer: string | undefined;
-  let judgeScore: number | undefined;
+  let judgeScore: number | null | undefined;
   let judgeReason: string | undefined;
   let answerMs: number | undefined;
   let judgeMs: number | undefined;
@@ -928,8 +985,8 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
     const gen = await generateAnswer(args, rec.question, ctx || "(no retrieved context)", rec.question_date);
     predictedAnswer = gen.answer;
     answerMs = gen.ms;
-    const judge = await judgeAnswer(args, rec.question, rec.answer, gen.answer);
-    judgeScore = judge.score;
+    const judge = await judgeWithRetry(args, rec.question, rec.answer, gen.answer);
+    judgeScore = judge.score;  // may be null when both judges failed after retries
     judgeReason = judge.reason;
     judgeMs = judge.ms;
   }
@@ -971,7 +1028,7 @@ function aggregate(results: ScoredQuestion[]): void {
   console.log("  LongMemEval results — mema retrieval correctness");
   console.log("══════════════════════════════════════════════════════════════");
   console.log("");
-  const judgeUsed = results.some(r => r.judge_score !== undefined);
+  const judgeUsed = results.some(r => r.judge_score !== undefined && r.judge_score !== null);
   console.log("Per category:");
   console.log("  " + "category".padEnd(26) + " n   H@1   H@5   H@10  AllG@10 Cov@10" + (judgeUsed ? "  Answer%" : ""));
   console.log("  " + "─".repeat(judgeUsed ? 84 : 76));
@@ -989,7 +1046,7 @@ function aggregate(results: ScoredQuestion[]): void {
       " " + allg.padStart(6) +
       " " + cov.padStart(5);
     if (judgeUsed) {
-      const judged = rows.filter(r => r.judge_score !== undefined);
+      const judged = rows.filter(r => r.judge_score !== undefined && r.judge_score !== null);
       const ans = judged.length ? (judged.filter(r => r.judge_score === 1).length / judged.length * 100).toFixed(1) : "n/a";
       line += " " + ans.padStart(7);
     }
@@ -1002,7 +1059,7 @@ function aggregate(results: ScoredQuestion[]): void {
   const meanCov = (all.reduce((s, r) => s + r.coverage_at_10, 0) / all.length * 100).toFixed(1);
   let line = `Overall: n=${all.length}  Hit@1=${overall(all, "hit_at_1")}%  Hit@5=${overall(all, "hit_at_5")}%  Hit@10=${overall(all, "hit_at_10")}%  AllGold@10=${overall(all, "all_gold_at_10")}%  Coverage@10=${meanCov}%`;
   if (judgeUsed) {
-    const judged = all.filter(r => r.judge_score !== undefined);
+    const judged = all.filter(r => r.judge_score !== undefined && r.judge_score !== null);
     const ans = judged.length ? (judged.filter(r => r.judge_score === 1).length / judged.length * 100).toFixed(1) : "n/a";
     line += `  Answer-correct=${ans}% (n=${judged.length})`;
   }
@@ -1110,4 +1167,8 @@ async function main() {
   }
 }
 
-main().catch(e => { console.error("fatal:", e?.message ?? e); process.exit(1); });
+// v2.11.1+ — only run main() when invoked as a script; allow test files
+// to import judgeWithRetry/etc. without triggering the bench loop.
+if (import.meta.main) {
+  main().catch(e => { console.error("fatal:", e?.message ?? e); process.exit(1); });
+}
