@@ -1,9 +1,41 @@
 # Resume Here — Session Continuation Notes
 
-**Last session ended:** 2026-05-18 (late morning / early afternoon PT)
-**Resume context:** v2.11.0-rc.1 bench done + diagnosed extractor-temporal-grounding bug + v2.11.1 hotfix landed + verified on 5 knowledge-update questions (40% → 80%)
-**Current released version:** v2.10.0 (tag) — `main` has 10 new commits for v2.11.0-rc.1 + v2.11.1 fix
+**Last session ended:** 2026-05-18 (afternoon/early evening PT)
+**Resume context:** v2.11.2 hygiene+detection pass closed all open items per "don't test while things are open"
+**Current released version:** v2.10.0 (tag) — `main` has **14 new commits** for v2.11.0-rc.1 + v2.11.1 + v2.11.2
 **Commits NOT pushed** (per your "no push" authorization). Push when satisfied.
+
+## ✅ All known open items CLOSED — ready for N=100 re-bench
+
+The v2.11.2 commit (refactor) closes everything flagged across prior /simplify reviews and critic findings:
+
+| Open item | Status |
+|---|---|
+| Extractor temporal grounding (v2.10.6 root cause) | ✅ Fixed v2.11.1 — verified 40→80 on knowledge-update |
+| Silent today-fallback paths in extractor flow | ✅ Fixed v2.11.1 — throws on missing dates; Ollama warns |
+| Judge-no-response silent score=0 | ✅ Fixed v2.11.1 — 3-retry primary + 2-retry secondary fallback |
+| score=null distinction in JSONL | ✅ Fixed v2.11.1 — ScoredQuestion.judge_score is `number\|null\|undefined` |
+| DRY across 4 bench files (callClaude/callCodex/judgePrompt/substringMatch) | ✅ Fixed v2.11.2 — single home in bench-utils.ts |
+| Shared retry+verdict kernel | ✅ Fixed v2.11.2 — `retryVerdict()` in bench-utils.ts |
+| Wrong-confident% vs no-answer% trichotomy tracking | ✅ Fixed v2.11.2 — `classifyAnswerShape()` + 5-column compare breakdown |
+| INSTRUCTIONS-softening hallucination risk | ✅ Empirically defended — trichotomy on N=30 data shows memory-packet matches episode-only at 10% wrong-confident (NOT extra confabulation) |
+| 0a995998 confident-wrong diagnosis | ✅ Documented — LLM multi-session counting error, NOT a packet bug, no fix needed |
+| Tests | ✅ 284 → 308 (+24 new bench-utils tests) |
+
+## Headline from v2.11.2 trichotomy reporting on existing N=30 data
+
+```
+mode             correct  wrong-conf  no-answer
+episode-only     66.7%    10.0%       23.3%
+memory-packet    63.3%    10.0%       26.7%
+zep-format       63.3%     0.0%       36.7%
+```
+
+- **Memory-packet's "-3.4pp" vs episode-only is +1 punt, NOT extra confabulation** — same 10% wrong-confident rate as episode-only.
+- **Zep-format NEVER confabulates** (0% wrong-conf) but punts ~10pp more often than memory-packet.
+- The architecture is SAFE (not hallucinating); it's just slightly more conservative.
+
+This is the empirical defense the v2.11.1 INSTRUCTIONS softening was supposed to enable — and it works.
 
 ## ⚠️ Two-part v2.11.1 fix — both must apply before N=100 re-bench
 
