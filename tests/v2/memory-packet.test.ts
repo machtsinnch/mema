@@ -260,11 +260,11 @@ describe("buildMemoryPacket", () => {
     expect(packet.current_state.length).toBe(1);
     expect(packet.current_state[0].object).toBe("Toyota Camry");
 
-    // FACTS — both, sorted by valid_from
-    expect(packet.approved_facts.length).toBe(2);
-    expect(packet.approved_facts[0].object).toBe("Honda Civic");
-    expect(packet.approved_facts[1].object).toBe("Toyota Camry");
-    expect(packet.approved_facts[0].invalidated_at).toBe("2024-07-18");
+    // FACTS — v2.14.0+ hard-omits superseded facts (Honda Civic), so only
+    // the current Toyota Camry remains. The historical fact still appears
+    // in CONFLICTS (see below).
+    expect(packet.approved_facts.length).toBe(1);
+    expect(packet.approved_facts[0].object).toBe("Toyota Camry");
 
     // COGNITIVE_BELIEFS
     expect(packet.cognitive_beliefs.length).toBe(1);
@@ -291,8 +291,11 @@ describe("buildMemoryPacket", () => {
     // RAW_SUPPORTING_EXCERPTS — both episodes
     expect(packet.raw_supporting_excerpts.length).toBe(2);
 
-    // PROVENANCE
-    expect(packet.provenance.length).toBeGreaterThanOrEqual(3);  // 2 facts + 1 cognitive
+    // PROVENANCE — v2.14.0+ only covers facts the LLM can actually see
+    // (superseded facts are hard-omitted from <FACTS>, so they're not in
+    // PROVENANCE either; CONFLICTS still narrates them separately).
+    // Expected: 1 current fact (Camry) + 1 cognitive belief = 2.
+    expect(packet.provenance.length).toBeGreaterThanOrEqual(2);
   });
 
   test("UNCERTAINTY is surfaced when no structured memory was retrieved", () => {
@@ -393,7 +396,11 @@ describe("compilePacketToPrompt", () => {
     expect(rendered).not.toContain("<ENTITIES>");
   });
 
-  test("renders an invalidated fact with the invalidation date inline", () => {
+  test("v2.14.0: hard-omits superseded facts from <FACTS>, still narrates them in CONFLICTS", () => {
+    // Per Codex's spec + the v2.13a bench evidence: LLMs ignore
+    // isSuperseded markers in <FACTS> and use both old and new contradicting
+    // facts equally. Hard-omit is unambiguous. The CONFLICTS section still
+    // narrates the supersession for audit/transparency purposes.
     const hits: TwoChannelHits = {
       evidence_channel: [],
       memory_channel: [
@@ -404,8 +411,15 @@ describe("compilePacketToPrompt", () => {
       ],
     };
     const packet = buildMemoryPacket({ query: "Where does the user live?", hits });
+    // The superseded fact is HARD-OMITTED from approved_facts.
+    expect(packet.approved_facts.length).toBe(0);
+    // But still appears in CONFLICTS so audit/explanation works.
+    expect(packet.conflicts.length).toBe(1);
+    expect(packet.conflicts[0].narrative).toContain("Zurich");
+    expect(packet.conflicts[0].narrative).toContain("2024-03-15");
+    // Rendered prompt should NOT include the superseded fact in <FACTS>
+    // but should include the CONFLICTS narrative.
     const rendered = compilePacketToPrompt(packet);
-    expect(rendered).toContain("(Date range: 2020-01-01 - 2024-03-15");
     expect(rendered).toContain("Earlier claim");  // CONFLICTS section
   });
 
@@ -443,7 +457,10 @@ describe("compilePacketToPrompt", () => {
       hits,
     });
     expect(packet.current_state.length).toBe(0);
-    expect(packet.approved_facts.length).toBe(2);
+    // v2.14.0+ hard-omits superseded facts (Honda Civic was invalidated by
+    // Toyota Camry); only the current Toyota Camry remains in approved_facts.
+    expect(packet.approved_facts.length).toBe(1);
+    expect(packet.approved_facts[0].object).toBe("Toyota Camry");
 
     const rendered = compilePacketToPrompt(packet);
     // Must NOT tell the LLM to use CURRENT_STATE first (it's empty).

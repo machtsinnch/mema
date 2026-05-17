@@ -16,6 +16,7 @@ import type { SemanticFact, RecordStatus } from "./types";
 import { clampConfidence, toWikilinks, slugify, recordFilename, idFromFilename } from "./types";
 import { appendAudit } from "./layer6-audit";
 import { factValidAt } from "./temporal";
+import { classifyOnWrite, type SupersessionDecision } from "./layer4-supersession";
 
 export interface RecordFactInput {
   subject: string;
@@ -338,4 +339,153 @@ export function evidenceCheck(
   if (s && !haystack.includes(s)) missing.push("subject");
   if (o && !haystack.includes(o)) missing.push("object");
   return missing.length ? { ok: false, missing } : { ok: true };
+}
+
+// v2.14.0+ — write-time supersession wrapper.
+//
+// Per Ardin's architectural commitment (2026-05-17): every fact write MUST
+// be supersession-checked. No opt-out flag. The deterministic system
+// behavior is what differentiates mema from a stochastic LLM stack — and
+// that determinism includes "the supersession state of the graph after
+// any observe is a pure function of all observes that came before it."
+//
+// Returns a richer result than `recordFact`:
+//   { written, decision, supersededIds }
+//
+// Behavior:
+//   - decision.kind === "ADD"  → wrote new fact, supersededIds = []
+//   - decision.kind === "NONE" → did NOT write, supersededIds = [];
+//     `written` is null. The audit chain logs SKIP with the reason.
+//   - decision.kind === "UPDATE" → wrote new fact, then invalidated each
+//     superseded candidate with invalidated_at = new.valid_from and
+//     superseded_by = new.id. supersededIds[] is the list of invalidated IDs.
+//     Failures during the invalidation loop are logged but do NOT roll back
+//     the new fact (date-based factValidAt at read time recovers correctness
+//     because the newer valid_from naturally wins via factValidAt).
+//
+// Reference architecture: Graphiti's resolve_edge_contradictions() in
+// graphiti_core/utils/maintenance/edge_operations.py (source-verified by
+// Codex 2026-05-17). NOT Mem0's ADD/UPDATE/DELETE/NONE pattern (which
+// Mem0 itself abandoned in their current main branch).
+export interface RecordFactWithSupersessionResult {
+  written: SemanticFact | null;
+  decision: SupersessionDecision;
+  supersededIds: string[];
+}
+
+export function recordFactWithSupersession(
+  vaultRoot: string,
+  input: RecordFactInput,
+): RecordFactWithSupersessionResult {
+  // 1. Pre-filter candidates: existing approved + not-invalidated + not-
+  //    superseded facts with the SAME (subject, predicate, owner) as the
+  //    new fact. findContradictions already does exactly this filter; the
+  //    return type omits invalidated_at/superseded_by/derived_from/owner,
+  //    so we re-load full records for the ones that matter.
+  const matchObjects = findContradictions(vaultRoot, input.owner, {
+    subject: input.subject,
+    predicate: input.predicate,
+    object: input.object,
+  });
+  // findContradictions filters OUT same-object candidates (it's looking for
+  // contradictions). For supersession classification we also need same-
+  // object matches (duplicate/stale detection). Hydrate full records for
+  // the contradicting candidates AND scan again for same-object matches.
+  const candidateIds = new Set(matchObjects.map(c => c.fact_id));
+  const fullCandidates: SemanticFact[] = [];
+  for (const id of candidateIds) {
+    const f = readFact(vaultRoot, input.owner, id);
+    if (f) fullCandidates.push(f);
+  }
+  // Also scan for same-object matches (duplicate/stale detection).
+  const sameObjMatches = readApprovedFactsByExactSubjectPredicate(
+    vaultRoot, input.owner, input.subject, input.predicate,
+  ).filter(f =>
+    f.object?.trim().toLowerCase() === input.object?.trim().toLowerCase()
+    && !f.invalidated_at && !f.superseded_by
+  );
+  for (const f of sameObjMatches) {
+    if (!candidateIds.has(f.id)) fullCandidates.push(f);
+  }
+
+  // 2. Classify (pure function — fully testable).
+  const decision = classifyOnWrite(
+    {
+      subject: input.subject,
+      predicate: input.predicate,
+      object: input.object,
+      event_date: input.valid_from ?? new Date().toISOString(),
+    },
+    fullCandidates,
+  );
+
+  // 3. Branch on decision.
+  if (decision.kind === "NONE") {
+    appendAudit({
+      op: "EXTRACT",  // re-use existing op; reason carries the skip context
+      actor: input.actor,
+      owner: input.owner,
+      record_ids: [],
+      reason: `supersession_skip:${decision.reason}`,
+    });
+    return { written: null, decision, supersededIds: [] };
+  }
+
+  // ADD or UPDATE: persist the new fact first.
+  const newFact = recordFact(vaultRoot, input);
+
+  if (decision.kind === "ADD") {
+    return { written: newFact, decision, supersededIds: [] };
+  }
+
+  // UPDATE: invalidate each superseded candidate. Best-effort — failures
+  // logged, do NOT roll back the new fact. The date-based factValidAt at
+  // read time recovers correctness because the newer valid_from wins.
+  const supersededIds: string[] = [];
+  for (const old of decision.superseded) {
+    try {
+      const result = invalidateFact(
+        vaultRoot,
+        old.id,
+        input.owner,
+        input.actor,
+        newFact.id,
+      );
+      if (result) supersededIds.push(old.id);
+    } catch (e) {
+      console.warn(
+        `[supersession] failed to mark ${old.id} as superseded by ${newFact.id}: ${e}`,
+      );
+    }
+  }
+  return { written: newFact, decision, supersededIds };
+}
+
+/** Internal helper: load all approved facts (regardless of validity status)
+ *  with exact (subject, predicate, owner) match. Used by
+ *  recordFactWithSupersession to detect duplicates that findContradictions
+ *  filters out (because findContradictions looks for DIFFERENT objects). */
+function readApprovedFactsByExactSubjectPredicate(
+  vaultRoot: string,
+  owner: string,
+  subject: string,
+  predicate: string,
+): SemanticFact[] {
+  const dir = join(vaultRoot, "facts", owner);
+  if (!existsSync(dir)) return [];
+  const out: SemanticFact[] = [];
+  const subj = subject.trim().toLowerCase();
+  const pred = predicate.trim().toLowerCase();
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith(".md")) continue;
+    try {
+      const parsed = matter(readFileSync(join(dir, f), "utf8"));
+      const fact = parsed.data as SemanticFact;
+      if ((fact.status ?? "approved") !== "approved") continue;
+      if (fact.subject?.trim().toLowerCase() !== subj) continue;
+      if (fact.predicate?.trim().toLowerCase() !== pred) continue;
+      out.push(fact);
+    } catch { /* skip malformed */ }
+  }
+  return out;
 }

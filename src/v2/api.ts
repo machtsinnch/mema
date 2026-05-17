@@ -4,7 +4,7 @@
 import type { Hono, Context } from "hono";
 import { observe } from "./layer1-episodic";
 import {
-  recordFact, invalidateFact, getFactsValidAt, readFact,
+  recordFact, recordFactWithSupersession, invalidateFact, getFactsValidAt, readFact,
   approveFact, rejectFact, listDraftFacts, evidenceCheck,
   findContradictions,
 } from "./layer2-semantic";
@@ -276,8 +276,31 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
-    const fact = recordFact(cfg.vaultRoot, { ...parsed.body, actor, owner });
-    return c.json({ fact });
+    // v2.14.0+ — supersession-aware write. Every fact write goes through
+    // the supersession classifier so the graph stays consistent without
+    // requiring callers to manually findContradictions + invalidate.
+    // Per Ardin's determinism principle: mandatory, not opt-in.
+    const result = recordFactWithSupersession(cfg.vaultRoot, {
+      ...parsed.body,
+      actor,
+      owner,
+    });
+    if (!result.written) {
+      // NONE/duplicate or NONE/stale — explicit visibility via response,
+      // never silent.
+      return c.json({
+        fact: null,
+        decision: result.decision,
+        message: `fact_skipped:${(result.decision as any).reason ?? "duplicate_or_stale"}`,
+      });
+    }
+    return c.json({
+      fact: result.written,
+      decision: result.decision,
+      ...(result.supersededIds.length > 0
+        ? { superseded: result.supersededIds }
+        : {}),
+    });
   });
 
   app.post("/v2/fact/:id/invalidate", async c => {

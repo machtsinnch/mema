@@ -171,11 +171,26 @@ export const rules = {
     return this.isCurrent(hit, dateISO) && !this.isSuperseded(hit);
   },
 
-  /** Inclusion rule for FACTS: every retrieved fact is shown (superseded
-   *  ones rendered with explicit invalidation marker; the LLM needs the
-   *  historical context). */
+  /** Inclusion rule for FACTS: only CURRENT facts. v2.14.0+ hard-omits
+   *  superseded facts from the rendered <FACTS> section.
+   *
+   *  Why hard-omit instead of marker-rendering: empirical bench evidence
+   *  from v2.13a (2026-05-17) showed the answer LLM ignores `invalidated_at`
+   *  / `isSuperseded` markers and uses BOTH old and new contradicting
+   *  facts with equal weight, regressing knowledge-update accuracy from
+   *  80% → 60% in memory-packet mode. Hard exclusion is unambiguous.
+   *  Codex source-verified this is also Graphiti's behavior in
+   *  graphiti_core/utils/maintenance/edge_operations.py.
+   *
+   *  If a future bench explicitly tests temporal-history queries
+   *  ("what did the user previously use?"), add a separate <HISTORY>
+   *  section. For current benchmarks and production grounding, hard-omit
+   *  is correct. */
   includeInFacts(hit: RetrievalHit): boolean {
-    return hit.kind === "fact" && !!hit.payload;
+    if (hit.kind !== "fact" || !hit.payload) return false;
+    if (hit.payload.invalidated_at) return false;
+    if (hit.payload.superseded_by) return false;
+    return true;
   },
 
   /** Inclusion rule for COGNITIVE_BELIEFS: only retrieved cognitive records
@@ -247,6 +262,14 @@ export function buildMemoryPacket(input: BuildMemoryPacketInput): MemoryPacket {
     question_type: input.question_type,
   });
 
+  // v2.14.0+ separation: `factHits` is for the rendered <FACTS> section
+  // (current/non-superseded only — hard-omit via includeInFacts), but
+  // `allFactPayloadHits` is the pre-filter pool used by CONFLICTS and
+  // EVIDENCE_TIMELINE which DO need to see superseded facts (CONFLICTS is
+  // the audit narrative; the timeline shows the full event history).
+  const allFactPayloadHits = input.hits.memory_channel.filter(h =>
+    h.kind === "fact" && !!h.payload,
+  );
   const factHits = input.hits.memory_channel.filter(h => rules.includeInFacts(h));
   const cogHits  = input.hits.memory_channel.filter(h => rules.includeInCognitiveBeliefs(h));
   const entHits  = input.hits.memory_channel.filter(h => rules.includeInEntities(h));
@@ -302,13 +325,19 @@ export function buildMemoryPacket(input: BuildMemoryPacketInput): MemoryPacket {
   }));
 
   // EVIDENCE_TIMELINE — one line per fact event, chronological.
-  const evidenceTimeline: EvidenceSnippet[] = approvedFacts.map(f => ({
-    date: f.valid_from,
-    summary: `${f.subject} ${f.predicate} ${f.object}`,
+  // v2.14.0+ uses allFactPayloadHits so the timeline reflects the full
+  // history including superseded facts (CURRENT and SUPERSEDED are both
+  // legitimate dated events). The <FACTS> section still hard-omits
+  // superseded facts; the timeline is a separate audit-style view.
+  const evidenceTimeline: EvidenceSnippet[] = allFactPayloadHits.map(h => ({
+    date: (h.payload!.valid_from ?? "").slice(0, 10) || "unknown-date",
+    summary: `${h.payload!.subject ?? "?"} ${h.payload!.predicate ?? "?"} ${h.payload!.object ?? "?"}`,
   })).sort((a, b) => a.date.localeCompare(b.date));
 
   // CONFLICTS — explicit supersession narratives.
-  const conflicts: ConflictNote[] = factHits
+  // v2.14.0+ uses allFactPayloadHits so CONFLICTS sees the superseded
+  // facts that the <FACTS> renderer hard-omits.
+  const conflicts: ConflictNote[] = allFactPayloadHits
     .filter(h => rules.includeInConflicts(h))
     .map(h => {
       const subj = h.payload!.subject ?? "?";
