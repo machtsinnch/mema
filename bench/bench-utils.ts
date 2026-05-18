@@ -67,6 +67,53 @@ const PAI_CONTAMINATION_MARKERS = [
   "════ PAI",
 ];
 
+// v2.14.1+ — leak-proof process-with-timeout helper. Replaces three
+// near-identical setTimeout(proc.kill) patterns in callClaudeCLI,
+// callGeminiCLI, callCodexCLI that all had the same leak: if the
+// child process is hung (uninterruptible state, unflushed buffers,
+// orphaned grandchildren), proc.exited never resolves and the
+// Promise.all() blocks forever. Worse, a "killed" process can survive
+// `proc.kill()` (SIGTERM) when in certain states.
+//
+// Empirically observed: a single 20KB-content extraction call hung
+// for 18+ minutes during overnight ingestion (2026-05-17→18). The
+// resulting zombie `claude` PID survived kill -9 attempts later.
+// Root cause: this watchdog pattern.
+//
+// Fix: race a hard timeout against the read+exit, and if the timeout
+// wins, escalate SIGTERM → SIGKILL with a 2s grace window, log loud,
+// return null. We don't block on proc.exited if the timeout fires.
+export async function runProcessWithTimeout(
+  proc: { stdout: ReadableStream<Uint8Array> | null; exited: Promise<unknown>; kill: (sig?: number) => void },
+  timeoutMs: number,
+  label: string,
+): Promise<string | null> {
+  const decoder = new TextDecoder();
+  let timedOut = false;
+  const hardTimeout = new Promise<"__timeout__">((resolve) =>
+    setTimeout(() => { timedOut = true; resolve("__timeout__"); }, timeoutMs),
+  );
+  const readProcess = (async () => {
+    if (!proc.stdout) return "";
+    const text = decoder.decode(await new Response(proc.stdout).arrayBuffer());
+    await proc.exited;
+    return text;
+  })();
+  const result = await Promise.race([readProcess, hardTimeout]);
+  if (timedOut) {
+    // Escalating kill — SIGTERM, wait 2s grace, then SIGKILL. Fire
+    // and forget; we already lost the race so we don't wait for cleanup.
+    (async () => {
+      try { proc.kill(); } catch {}
+      await new Promise(r => setTimeout(r, 2000));
+      try { proc.kill(9); } catch {}
+    })();
+    console.warn(`[bench-utils] ${label}: hard-timeout after ${timeoutMs}ms — escalating SIGTERM→SIGKILL, returning null`);
+    return null;
+  }
+  return result as string;
+}
+
 // v2.12.0+ — format-neutral sterile system prompt. The user message
 // will tell the worker what to produce (one-sentence answer, JSON,
 // CORRECT/INCORRECT, etc.). This prompt's job is purely to REMOVE
@@ -125,13 +172,8 @@ export async function callClaudeCLI(prompt: string, timeoutMs = 120000): Promise
       env: process.env,
       cwd: scratchDir,
     });
-    const decoder = new TextDecoder();
-    const watchdog = setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs);
-    const [out] = await Promise.all([
-      (async () => decoder.decode(await new Response(proc.stdout).arrayBuffer()))(),
-      proc.exited,
-    ]);
-    clearTimeout(watchdog);
+    const out = await runProcessWithTimeout(proc, timeoutMs, "callClaudeCLI");
+    if (out === null) return null;
     const cleaned = out
       .split("\n")
       .filter(l => !l.includes("hook [") && !l.includes("Permission denied"))
@@ -177,13 +219,8 @@ export async function callGeminiCLI(prompt: string, timeoutMs = 180000): Promise
       stderr: "pipe",
       env: process.env,
     });
-    const decoder = new TextDecoder();
-    const watchdog = setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs);
-    const [out] = await Promise.all([
-      (async () => decoder.decode(await new Response(proc.stdout).arrayBuffer()))(),
-      proc.exited,
-    ]);
-    clearTimeout(watchdog);
+    const out = await runProcessWithTimeout(proc, timeoutMs, "callGeminiCLI");
+    if (out === null) return null;
     // Strip startup noise: "YOLO mode is enabled..." and "Ripgrep is not
     // available. Falling back to GrepTool." lines appear before the
     // model output. Also strip any "Loaded extension..." lines.
@@ -226,9 +263,25 @@ export async function callCodexCLI(prompt: string, timeoutMs = 180000): Promise<
       stderr: "pipe",
       env: process.env,
     });
-    const watchdog = setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs);
-    await proc.exited;
-    clearTimeout(watchdog);
+    // v2.14.1+ — leak-proof watchdog (see runProcessWithTimeout above).
+    // codex CLI writes to a file rather than stdout, so we don't use
+    // runProcessWithTimeout directly — but we replicate its escalating-
+    // kill pattern so a hung codex CLI doesn't leak zombies.
+    let timedOut = false;
+    const hardTimeout = new Promise<"timeout">((resolve) =>
+      setTimeout(() => { timedOut = true; resolve("timeout"); }, timeoutMs),
+    );
+    await Promise.race([proc.exited, hardTimeout]);
+    if (timedOut) {
+      (async () => {
+        try { proc.kill(); } catch {}
+        await new Promise(r => setTimeout(r, 2000));
+        try { proc.kill(9); } catch {}
+      })();
+      console.warn(`[bench-utils] callCodexCLI: hard-timeout after ${timeoutMs}ms — escalating SIGTERM→SIGKILL, returning null`);
+      try { await Bun.file(outPath).unlink(); } catch {}
+      return null;
+    }
     try {
       const text = await Bun.file(outPath).text();
       return text.trim() || null;
