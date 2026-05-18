@@ -38,6 +38,12 @@ interface Args {
   key: string;
   limit: number | null;
   dryRun: boolean;
+  /** v2.14.0+ — skip the LLM extractor entirely; observe-only ingestion.
+   *  Used overnight 2026-05-17→18 when the bench-utils callClaudeCLI was
+   *  observed to hang for 18min on a single 20KB source file. Allows
+   *  episode-only ingestion as a fallback so retrieval testing works
+   *  without waiting on the extractor pipeline to be fixed. */
+  skipExtract: boolean;
 }
 
 const SKIP_DIRS = new Set([
@@ -94,6 +100,7 @@ function parseArgs(): Args {
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--dry-run") { flags["dry-run"] = true; continue; }
+    if (a === "--skip-extract") { flags["skip-extract"] = true; continue; }
     if (a.startsWith("--") && argv[i + 1] && !argv[i + 1].startsWith("--")) {
       flags[a.slice(2)] = argv[++i];
     }
@@ -105,6 +112,7 @@ function parseArgs(): Args {
     key: String(flags.key ?? "dev-ardin"),
     limit: flags.limit ? parseInt(flags.limit, 10) : null,
     dryRun: !!flags["dry-run"],
+    skipExtract: !!flags["skip-extract"],
   };
 }
 
@@ -139,7 +147,15 @@ function walk(root: string): string[] {
 async function post(args: Args, path: string, body: any): Promise<any> {
   const r = await fetch(`${args.api}${path}`, {
     method: "POST",
-    headers: { "x-api-key": args.key, "content-type": "application/json" },
+    headers: {
+      "x-api-key": args.key,
+      // v2.14.0+ — pass x-owner so the server's owner-override (when
+      // MEMA_BENCH_ALLOW_OWNER_OVERRIDE=true) honors our isolated test
+      // namespace. Without this header, writes go to the api-key's
+      // mapped owner (e.g. "ardin"), polluting production data.
+      "x-owner": args.owner,
+      "content-type": "application/json",
+    },
     body: JSON.stringify(body),
   });
   if (!r.ok) throw new Error(`${path} → ${r.status}: ${await r.text()}`);
@@ -191,9 +207,13 @@ async function main() {
     }
 
     // Run the extractor (same prompt as the bench).
-    // Dry-run skips the LLM call entirely (was slowing dry-runs to real-run pace).
+    // Dry-run and --skip-extract both bypass the LLM call entirely.
     if (args.dryRun) {
       console.log(`(dry-run, skip extract)`);
+      continue;
+    }
+    if (args.skipExtract) {
+      console.log(`OBSERVED (skip-extract)`);
       continue;
     }
     const prompt = buildExtractorPrompt({

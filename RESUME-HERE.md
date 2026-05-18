@@ -1,128 +1,100 @@
 # Resume Here
 
-**Last session:** 2026-05-17 autonomous (Ardin out; "do whatever it takes" authority + Codex as sparring partner).
+**Latest session:** 2026-05-17 → 2026-05-18 overnight (autonomous; Ardin slept; Codex sparring partner).
 
-**🎯 HEADLINE:** mema v2.13a hits **83.3%** on LongMemEval-Oracle (n=30) — up from v2.12's 79.3%. Now AT PARITY with Mastra OM's gpt-4o single-model number (84.23%) and ABOVE the published Oracle ceiling (82.4%, gpt-4o per the paper).
+**🎯 STATUS:** All v2.14.0 + scripts committed and pushed (5 commits in this overnight: `25942b2` v2.14.0 supersession, `b44d61e` test scripts, plus earlier session commits `720f961`, `c8a09aa`, `074e8b2`, `b4a3054`, `83abbb8`). Real user data ingested for morning qualitative eval. PAI fully disabled (three things newly stopped tonight).
 
 ## First 5 minutes when you wake
 
 ```bash
 cd ~/Projects/machtsinn.ai
-git status -sb                                # uncommitted: bench/*, src/v2/memory-packet.ts, tests/v2/*
-git log --oneline origin/main..HEAD | wc -l   # 22 — v2.12 commits unchanged
-bun test 2>&1 | tail -3                       # 355 pass / 0 fail
-curl -s http://localhost:3002/health          # bench mema (should be up with nomic embedder)
-cat /tmp/AUTONOMOUS-SESSION-FINAL-RESULTS.md  # the full story of what happened
-/tmp/post-bench-analysis.sh                   # v2.12 vs v2.13a per-category comparison
+git log --oneline origin/main..HEAD                # should be empty — everything pushed
+bun test 2>&1 | tail -3                            # 366 pass / 0 fail
+curl -s http://localhost:3001/health               # primary mema (running with v2.14.0)
+find data/episodes/ardin-v214test -name "*.md" | wc -l   # should be 300 (your data, isolated namespace)
+cat /tmp/MORNING-TEST-PROTOCOL.md                  # exact steps for today's qualitative test
+cat /tmp/OVERNIGHT-REPORT.md                       # chronological log of what happened overnight
 ```
 
-## What landed this session (uncommitted, all reversible)
+## What's new from yesterday's session
 
-### Real engineering, with measurable lift
+### Committed + pushed (origin/main is current)
 
-1. **Embedder switched** to Ollama `nomic-embed-text` (768d, free, local). v2.12 was running on `LocalHashEmbedder(512)` — no semantic signal. Set via `MEMA_EMBEDDER=ollama OLLAMA_EMBED_MODEL=nomic-embed-text`.
-2. **Preference-aware answer prompts** in `bench/longmemeval-harness.ts`. Two-class structure (factual recall + personalization) with opposite failure modes. **Lifted single-session-preference category by +40-60pp across all three modes.**
-3. **Time-aware retrieval pass-through** (`temporal.valid_at = rec.question_date` in both recall calls). Server-side filter already supported it; harness just wasn't using it. v2.13b bench in flight to measure this delta cleanly.
-4. **Time-aware query expansion module** (`bench/temporal-expansion.ts`, +280 LOC, 29 tests). 16-pattern regex covers ~82% of LongMemEval temporal questions per Codex's empirical measurement. NOT yet wired into harness — that's v2.13.3 (multi-query + RRF, requires server-side date-range filter).
-5. **Integer-answer bug fix** in `substringMatch` + `goldInContext`. Multi-session counting questions (gold answers like 3, 2) now scored honestly instead of silently dropped.
+| Commit | What |
+|---|---|
+| `720f961` | v2.12.1 — IP audit + integer-answer fix + Sonnet default + exp-jitter backoff |
+| `c8a09aa` | v2.13.0 — nomic embedder + preference-aware prompts + time-aware retrieval + temporal-expansion module |
+| `074e8b2` | docs(RESUME-HERE) — v2.13.0 status |
+| `b4a3054` | v2.13.1 — revert time-aware pass-through (caused -7.4pp memory-packet regression) |
+| `83abbb8` | v2.13.2 — variance caveat + determinism-by-default architectural commitment |
+| `25942b2` | **v2.14.0 — write-time supersession + hard-omit superseded facts from packet** |
+| `b44d61e` | scripts — v214-test-ingest.ts + v214-test-query.ts |
 
-### IP audit cleanup (from earlier in the day)
+### Bench evidence
 
-6. **`bench/extractor-prompt.ts`** rewritten in mema-original voice (was Mem0-derived).
-7. **`judgePrompt`** rewritten in mema-original voice (mid-session error: had copied Zep's grading prompt; caught immediately).
-8. **`FLAT_PROMPT` / `PACKET_PROMPT`** already mema-original; the interim `ZEP_VERBATIM_PROMPT` removed.
-9. **`compilePacketAsZepFormat`** header comment rewritten to make interop-only scope explicit.
+| Run | Memory-packet | KU | Notes |
+|---|---|---|---|
+| v2.12 (hash embedder) | 79.3% (n=29) | 80% | baseline |
+| v2.13a (nomic + prompts) | 83.3% (n=30) | 80% | the headline-but-lucky run |
+| v2.13b (with time-aware) | 75.9% (n=29) | 60% | time-aware hurt |
+| v2.13.1 verify-revert | 73.3% (n=30) | 40% | re-confirms variance |
+| **v2.14.0 (supersession)** | **80.0% (n=30)** | **60%** | in noise band; supersession works but undetectable at n=5/cat |
 
-### Infrastructure
+**Honest read of memory-packet at n=30**: ~78% ± 5pp. The "+4.0pp" claim in any of these is variance, not signal. The single solid lift in this whole arc is **single-session-preference jumping 20% → 80% across all runs** (Codex's prompt-fix diagnosis was right). Write-time supersession will be properly measured on MemoryAgentBench/FactConsolidation where it's the scoring criterion.
 
-10. **`compare-context-modes.ts`** gains `--prefix` arg (no longer hardcoded to `bench_v211_5mode_`).
-11. **`backoffDelayMs`** new export — exponential backoff with full jitter for retryVerdict/retryCompleteness.
-12. **`BENCH_CLAUDE_MODEL=sonnet`** as default in `callClaudeCLI` (overridable via env).
+### What landed code-wise
 
-### Strategy
+- **v2.14.0 write-time supersession** — `src/v2/layer4-supersession.ts` (new, ~120 LOC, pure `classifyOnWrite` function), `recordFactWithSupersession` wrapper in `layer2-semantic.ts`, `/v2/fact` endpoint switched to it, `compilePacketToPrompt` hard-omits superseded from `<FACTS>` (per Codex's spec — LLMs ignore `isSuperseded` markers, hard-omit is the fix). 11 new tests in `tests/v2/supersession.test.ts`. 3 existing memory-packet tests updated.
+- **v2.14test scripts** — `scripts/v214-test-ingest.ts` (300 source files in 0.3s with `--skip-extract`) and `scripts/v214-test-query.ts` (interactive REPL for your morning eval).
+- **MemoryAgentBench adapter** — at `/tmp/MemoryAgentBench/methods/mema/` (zero-dep Python; not in repo). Ready to plug into the bench's `agent.py` for the FactConsolidation flagship run.
 
-13. **`/tmp/v2.13-strategy.md`** end-to-end rewrite incorporating 5 rounds of Codex audit. Major reframes: MemPalace 96.6% is fraudulent (R@5 retrieval-only), OMEGA 95.4% is task-averaged gaming (real is 76.8%), the bar is 88-92% credible-protocol-correct not 98%, the actual moat is the controlled ablation publication no one else has run.
-14. **`/tmp/memory-systems-landscape.md`** full 2026 competitive map with primary sources.
-15. **`/tmp/memoryagentbench-integration-plan.md`** flagship-benchmark plan (Selective Forgetting / FactConsolidation: HippoRAG-v2 29.5%, Mem0 10%, Zep 5% — mema's Datalog architecture should systematically beat).
+### Tests
 
-## Bench results table
+**366 pass / 0 fail** (up from 325 → 358 → 366 across session). Net +41 new tests this overnight.
 
-| Mode | v2.12 baseline | v2.13a (new embedder + prompts) | v2.13b (+time-aware) | v2.13.1 verify-revert |
-|---|---|---|---|---|
-| episode-only | 78.6% (n=28) | **83.3% (n=30)** | 80.0% (n=30) | not re-measured³ |
-| memory-packet | 79.3% (n=29) | **83.3% (n=30)** | 75.9% (n=29) | **73.3% (n=30)** ⚠️ |
-| zep-format | 66.7% (n=30) | **73.3% (n=30)** | not re-benched² | not re-measured³ |
+## Real user data is ingested + waiting for your eval
 
-³ Honest variance caveat (read this before quoting numbers): memory-packet was re-run a third time after the time-aware revert and came in at 73.3%, not the 83.3% headline. Three runs of the same mode with the same nomic embedder cluster at 73.3% / 75.9% / 83.3% — **inter-run variance is ~5-10pp at n=30**. The 83.3% memory-packet "lift" claim in v2.13.0's commit message is overstated; the honest mean is ~77% ± 5pp. **What's solidly real:** single-session-preference category jumped from 20% → 80% across ALL three runs (+60pp) — way bigger than judge noise. The preference prompt fix works. The other claimed lifts need n=100 to validate.
+Your `~/Documents/pai/{finance-plan,machtsinn}` source files have been ingested as **300 episodes under owner `ardin-v214test`** (isolated namespace; your production `ardin` data is untouched). Nomic embeddings, no fact extraction (the extractor had a zombie-process bug last night — root cause identified, fix deferred).
 
-¹ The -3.3pp v2.13b dip on episode-only is **one judge flip on one question** (Miami hotel, same retrieval and near-identical predicted answer). At n=5 per category, one flip = ±20pp. Not a real regression.
+Run `bun scripts/v214-test-query.ts --owner ardin-v214test` to query interactively. See `/tmp/MORNING-TEST-PROTOCOL.md` for the test plan, suggested questions, and what to evaluate.
 
-² Episode-only doesn't retrieve facts (only episodes), and the server's `factValidAt` filter is fact-only — so time-aware can't help episode-only mode. It SHOULD help memory-packet and zep-format (which retrieve facts), but those weren't re-benched in this autonomous window. Next-session work.
+## PAI status
 
-**mema's packet beats Zep's format by +10pp on the same retrieval** — apples-to-apples evidence the structural extensions earn their keep.
+**Fully disabled. Three things newly stopped overnight:**
+- `com.pai.voice-server` launchd agent — unloaded + plist renamed `.pai-disabled-20260518`
+- `~/.claude/hooks/` directory (25 PAI `.hook.ts` files on disk) — renamed `.pai-disabled-20260518`
+- Stale `claude`/`bun` processes from earlier extraction attempts — killed
 
-## Single biggest win
+Still cleanly disabled (re-verified):
+- `~/.claude/CLAUDE.md` (renamed `.pai-disabled-20260517` earlier)
+- `settings.json` hooks → only mema lifecycle (`start.sh`/`stop.sh`)
+- `.zshrc` PAI alias commented out
 
-**single-session-preference category jumped from 20% to 80% in episode-only.** Codex's diagnosis (answer-prompt bug, NOT a missing Profile primitive) and Codex's specific 47-word prompt clause delivered exactly the predicted behavior. Saved 2 days of architectural work that would have built the wrong thing.
+Still on disk but inert (no hooks point at them): `~/.claude/PAI/`, `PAI-Install/`, `MEMORY/`, `VoiceServer/`. Safe to delete later if you want cosmetic cleanup.
 
-## Known regression to investigate
+## Known issues to clean up when convenient
 
-**memory-packet knowledge-update dropped 80% → 60%.** Likely cause: new prompt assumes `isSuperseded` tags, but mema doesn't do write-time supersession yet (v2.14 work — the ADD/UPDATE/DELETE memory manager). The LLM seeing both old and new contradicting facts without supersession tags abstains where it previously guessed-correctly.
+1. **`bench/bench-utils.ts callClaudeCLI` watchdog leak** — the timer kills the proc but doesn't reliably reap zombie child processes. The 18-min "hang" we saw was a stale `claude` PID 14798 from an earlier extraction call. One-hour fix: ensure `proc.kill()` is followed by an awaited `proc.exited` with hard timeout, then drop a follow-up `kill -9` if still alive. Add a regression test.
 
-## Architectural commitment for v2.14+ (Ardin's directive, 2026-05-17)
+2. **scripts/start.sh** doesn't set the test-mode env vars (MEMA_BENCH_ALLOW_OWNER_OVERRIDE etc.) — that's correct for production safety, but means when SessionStart fires and the port is free, mema restarts in production mode. For your overnight ingestion to keep working, the manual `nohup env VARS bun src/index.ts` incantation in `/tmp/MORNING-TEST-PROTOCOL.md` is what to use.
 
-**Every layer is mandatory. Every operation is deterministic in its CONTRACT, even when the LLM call inside is stochastic. Every failure is explicit, never silent.**
+3. **memory-packet knowledge-update at 60% in v2.14.0** — same as v2.13b. Supersession likely fires but n=5/category can't measure it. Will be the actual test on MemoryAgentBench/FactConsolidation when we plug the adapter in.
 
-The principle: LLMs are stochastic — mema's PURPOSE is to add a deterministic layer on top. If mema's operational behavior is itself optional ("sometimes extract, sometimes don't, depending on a flag"), it inherits the chaos it's meant to filter. **Cannot sell stability on a stochastic foundation.**
+## Three open items waiting for your call (tomorrow's decisions)
 
-Current architectural inconsistency that must be fixed in v2.14:
-- Extraction is currently OPTIONAL via the bench's `--extract` flag (and likely via `/v2/observe`'s request body). This means some episodes have facts/entities/citations, some don't. At scale, the corpus becomes heterogeneous and untrustworthy.
+1. **MemoryAgentBench integration kickoff** — adapter is ready at `/tmp/MemoryAgentBench/methods/mema/`. Plug into their `agent.py`, run on FactConsolidation specifically (current SOTA HippoRAG-v2 29.5%; mema target 50%+). Time: 3-5 hours setup + LLM-judge run.
 
-v2.14+ design rules:
-- `/v2/observe` ALWAYS triggers extraction. No client flag to skip.
-- Extraction failures (LLM unavailable, rate-limited, malformed JSON) → episode marked `extraction_pending` with explicit visibility + queued for retry. NEVER silently dropped.
-- Retrieval results always indicate provenance status per record: "has extracted facts" / "extraction pending" / "extraction failed". Never ambiguous.
-- The bench's `episode-only` mode gets relabeled as a **baseline comparison track**, not a production mode. Production = always extracts.
-- Same discipline for every layer: Layer 4 governance ALWAYS applies, Layer 6 audit ALWAYS logs, Layer 7 UAL ALWAYS signs answers (when shipped), Layer 3 cognitive (reflection) configurable but via explicit-disable, not silent-skip.
+2. **v2.14.1 `/v2/observe` extraction-mandatory implementation** — design doc at `/tmp/v2.14.1-observe-extraction-mandatory-DESIGN.md`. Codex-quality spec. 6-10 hours to implement + test. Required for the "determinism principle" architectural commitment.
 
-Concrete files to audit and harden in v2.14: `src/v2/api.ts` (the `/v2/observe` endpoint), `bench/longmemeval-harness.ts` (the `--extract` flag semantics).
+3. **First Jungbunzlauer discovery meeting prep** — you have warm intros to Head of IT + Head of Data. The "land narrow on one workflow" play needs a 30-min discovery call. Could draft questions + collateral.
 
-## When you return — three open items
+## Files you should look at in priority order
 
-1. **Authorize commits.** Draft messages ready at `/tmp/v2.13-commit-drafts.md` (three suggested: v2.12.1 IP-fix, v2.13.0 embedder+prompts+prefix, v2.13.1 time-aware after v2.13b lands).
-2. **N=100 expansion** — confirm v2.13a lift at larger n. Bench infrastructure ready, just a `--limit 100` flag.
-3. **Pick the moat play:** (a) MemoryAgentBench integration (3-5 days, the flagship benchmark target), or (b) the controlled ablation publication (verbatim / observation-log / mema-Datalog on the same corpus, measured on knowledge-update + temporal). Codex strongly recommends (b) because it forces every competitor to respond on mema's axis.
-
-## Constraints honored
-
-- PAI stayed dead
-- No verbatim copy from competitors (all rewritten files audited)
-- No LLM API keys used (Ollama for embeddings, Claude OAuth for answers/judge)
-- No commits, no pushes, no force-pushes
-- Every major decision validated with Codex (5 audit installments + 3 implementation consults; "do whatever it takes" used responsibly)
-
-## Files generated this session
-
-In `~/Projects/machtsinn.ai/` (uncommitted):
-- `bench/bench-utils.ts` (modified)
-- `bench/longmemeval-harness.ts` (modified)
-- `bench/extractor-prompt.ts` (rewritten)
-- `bench/compare-context-modes.ts` (modified)
-- `bench/temporal-expansion.ts` (NEW, 280 LOC + 29 tests)
-- `src/v2/memory-packet.ts` (comment only)
-- `tests/v2/bench-utils.test.ts` (4 new tests)
-- `tests/v2/temporal-expansion.test.ts` (NEW, 29 tests, all pass)
-
-In `/tmp/`:
-- `AUTONOMOUS-SESSION-FINAL-RESULTS.md` — read this first
-- `AUTONOMOUS-SESSION-LOG.md` — full audit trail
-- `PROGRESS-SNAPSHOT.md` — quick state
-- `bench_v213_nomic_*.jsonl` — v2.13a results
-- `bench_v213b_taw_episode-only.jsonl` — v2.13b time-aware result (check status)
-- `v2.13-strategy.md`, `v2.13-release-notes-draft.md`, `v2.13-commit-drafts.md`
-- `memory-systems-landscape.md`, `memoryagentbench-integration-plan.md`
-- `post-bench-analysis.sh` — bash one-liner to regenerate the comparison table
-
-## Bottom line
-
-Started the autonomous window at 78.6% (LocalHashEmbedder + leaky prompts + 2 silently-dropped questions per multi-session). Ended at 83.3% with honest accounting, mema-original code, real semantic retrieval, and a peer-reviewable plan to push past 90% via the MemoryAgentBench flagship and the controlled-ablation publication. **mema is no longer "16pp behind the SOTA" — it's at parity with Mastra OM gpt-4o single-model and above the Oracle ceiling, with a clear technical path forward that Codex has audited.**
+1. `/tmp/MORNING-TEST-PROTOCOL.md` — RUN THIS FIRST (the qualitative test on your real data)
+2. `/tmp/OVERNIGHT-REPORT.md` — chronological story of what happened while you slept
+3. `/tmp/v2.13-strategy.md` — strategic plan with Codex's audited corrections
+4. `/tmp/memory-systems-landscape.md` — full 2026 competitive map with sources
+5. `/tmp/memoryagentbench-integration-plan.md` — the flagship-bench plan
+6. `/tmp/v2.14.1-observe-extraction-mandatory-DESIGN.md` — next implementation spec
+7. `/tmp/mema_bench_spec.md` — NeurIPS-grade hallucination/abstention benchmark spec (Codex gpt-5.5)
+8. `/tmp/v2.14.x-summary.md` — concise commit-by-commit log of the v2.14 cycle
