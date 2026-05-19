@@ -172,6 +172,70 @@ export class AnthropicExtractor implements LLMExtractor {
   }
 }
 
+// ── ClaudeCLIExtractor ────────────────────────────────────────────────
+//
+// v2.14.2+: shells out to the locally-installed `claude` CLI so users on
+// OAuth Max plans (no ANTHROPIC_API_KEY) can still use Claude as their
+// extractor. The CLI's auth + quota are inherited from the user's session.
+//
+// Default model is `haiku` (5-10× higher quota than sonnet on Max plan;
+// strong enough for grounded extraction without regurgitating few-shot
+// demos the way llama3.1:8b does). Override via constructor or
+// MEMA_CLAUDE_EXTRACTOR_MODEL env.
+//
+// Sterilization flags match bench/bench-utils.ts::callClaudeCLI:
+//   --no-session-persistence    don't write a resumable session
+//   --disable-slash-commands    no skill resolution
+//   --allowedTools ""           empty allowlist = no tools
+//   --system-prompt <SYSTEM>    OVERRIDE the user's default system prompt
+//                               (where CLAUDE.md / PAI persona would load)
+//
+// MACHTSINN_PORT=65535 in child env so any SessionStart/SessionEnd hooks
+// (start.sh / stop.sh) target a throwaway port instead of the real mema
+// on 3001.
+
+export class ClaudeCLIExtractor implements LLMExtractor {
+  readonly name: string;
+  private model: string;
+  private timeoutMs: number;
+  constructor(opts: { model?: string; timeoutMs?: number } = {}) {
+    this.model = opts.model ?? process.env.MEMA_CLAUDE_EXTRACTOR_MODEL ?? "haiku";
+    this.timeoutMs = opts.timeoutMs ?? 90000;
+    this.name = `claude-cli:${this.model}`;
+  }
+  async extract(text: string): Promise<ExtractionResult> {
+    const userPrompt =
+      `${FEW_SHOT_USER}\n\n${FEW_SHOT_ASSISTANT}\n\nNow extract from this text:\n${text.slice(0, 8000)}`;
+    const proc = Bun.spawn([
+      "claude",
+      "--model", this.model,
+      "--no-session-persistence",
+      "--disable-slash-commands",
+      "--allowedTools", "",
+      "--system-prompt", SYSTEM_PROMPT,
+      "-p", userPrompt,
+    ], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, MACHTSINN_PORT: "65535" },
+      cwd: "/tmp",
+    });
+    const timer = new Promise<"__timeout__">(resolve =>
+      setTimeout(() => resolve("__timeout__"), this.timeoutMs));
+    const reader = (async () => {
+      if (!proc.stdout) return "";
+      return new TextDecoder().decode(await new Response(proc.stdout).arrayBuffer());
+    })();
+    const result = await Promise.race([reader, timer]);
+    if (result === "__timeout__") {
+      try { proc.kill(); } catch {}
+      setTimeout(() => { try { proc.kill(9); } catch {} }, 2000);
+      throw new Error(`claude CLI extractor timed out after ${this.timeoutMs}ms`);
+    }
+    return parseStrictJson(result as string);
+  }
+}
+
 // ── OpenAIExtractor ──────────────────────────────────────────────────
 
 export class OpenAIExtractor implements LLMExtractor {
@@ -209,27 +273,47 @@ export class OpenAIExtractor implements LLMExtractor {
 }
 
 // ── Auto-pick ────────────────────────────────────────────────────────
-// Priority: Ollama (local, free, private) → Anthropic → OpenAI → throw.
-// User can force via MEMA_EXTRACTOR env var: "ollama" | "anthropic" | "openai".
+// v2.14.2+ Priority: Anthropic API > Claude CLI (OAuth) > OpenAI > Ollama > throw.
+//
+// Ollama llama3.1:8b empirically regurgitates few-shot examples instead of
+// extracting from the input (verified 2026-05-19 on LongMemEval bench:
+// every observe extracted the same 3 prompt-example facts about Marcel/
+// machtsinn AG regardless of source content). Demoted from default.
+// Force via MEMA_EXTRACTOR env: "ollama" | "anthropic" | "claude_cli" | "openai".
 
 export async function pickExtractor(): Promise<LLMExtractor> {
   const forced = process.env.MEMA_EXTRACTOR?.toLowerCase();
-  if (forced === "ollama" || (!forced && await ollamaAvailable())) {
-    return new OllamaExtractor();
-  }
   if (forced === "anthropic" || (!forced && process.env.ANTHROPIC_API_KEY)) {
     return new AnthropicExtractor({ apiKey: process.env.ANTHROPIC_API_KEY! });
+  }
+  if (forced === "claude_cli" || forced === "claude-cli"
+      || (!forced && await claudeCliAvailable())) {
+    return new ClaudeCLIExtractor();
   }
   if (forced === "openai" || (!forced && process.env.OPENAI_API_KEY)) {
     return new OpenAIExtractor({ apiKey: process.env.OPENAI_API_KEY! });
   }
+  if (forced === "ollama" || (!forced && await ollamaAvailable())) {
+    return new OllamaExtractor();
+  }
   throw new Error(
-    "No LLM extractor available. Install Ollama (recommended):\n" +
-    "  brew install ollama\n" +
-    "  ollama serve &\n" +
-    "  ollama pull llama3.1:8b\n" +
-    "OR set ANTHROPIC_API_KEY or OPENAI_API_KEY."
+    "No LLM extractor available. Either:\n" +
+    "  • install the Claude CLI and log in: brew install claude / claude login\n" +
+    "  • set ANTHROPIC_API_KEY or OPENAI_API_KEY\n" +
+    "  • install Ollama as fallback: brew install ollama && ollama pull llama3.1:8b\n" +
+    "(Ollama is the weakest option — regurgitates few-shot examples.)"
   );
+}
+
+async function claudeCliAvailable(): Promise<boolean> {
+  try {
+    const proc = Bun.spawn(["claude", "--version"], { stdout: "pipe", stderr: "pipe" });
+    const exited = await Promise.race([
+      proc.exited,
+      new Promise<number>(r => setTimeout(() => r(-1), 2000)),
+    ]);
+    return exited === 0;
+  } catch { return false; }
 }
 
 async function ollamaAvailable(): Promise<boolean> {

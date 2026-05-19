@@ -599,23 +599,42 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
   // 1. Ingest haystack_sessions as episodes. We map session_id → episode_id
   //    so retrieval scoring can lift back to LongMemEval's session-level
   //    judgment.
+  //
+  // v2.14.1+: ingestion happens in PARALLEL with a concurrency cap. Since
+  // /v2/observe is now extraction-mandatory (each call blocks on Ollama
+  // ~3-30s depending on session length), serial ingestion is ~30 hours
+  // for n=100. Parallel ingest with INGEST_CONCURRENCY=8 reduces this to
+  // ~6-8h. Per-owner namespace means cross-question observes don't
+  // collide, and within a question Ollama queues concurrent extracts.
+  // The bench protocol measures answer correctness, not ingestion speed —
+  // parallel Phase 1 is methodologically equivalent.
+  const INGEST_CONCURRENCY = 8;
   const sessionToEpisode = new Map<string, string>();
   const t0 = Date.now();
+  const ingestTasks: Array<() => Promise<void>> = [];
   for (let i = 0; i < rec.haystack_sessions.length; i++) {
     const sid = rec.haystack_session_ids[i];
     const date = rec.haystack_dates[i];
     const content = sessionToContent(rec.haystack_sessions[i], sid, date);
-    const r = await apiOwner("/v2/observe", {
-      kind: "conversation",
-      content,
-      source: `longmemeval:${sid}`,
+    ingestTasks.push(async () => {
+      const r = await apiOwner("/v2/observe", {
+        kind: "conversation",
+        content,
+        source: `longmemeval:${sid}`,
+      });
+      if (!r.ok) {
+        console.error(`  observe failed for session ${sid}: ${r.status}`);
+        return;
+      }
+      const j = await r.json() as { episode: { id: string } };
+      sessionToEpisode.set(sid, j.episode.id);
     });
-    if (!r.ok) {
-      console.error(`  observe failed for session ${sid}: ${r.status}`);
-      continue;
-    }
-    const j = await r.json() as { episode: { id: string } };
-    sessionToEpisode.set(sid, j.episode.id);
+  }
+  // Run tasks with a sliding-window concurrency cap.
+  for (let i = 0; i < ingestTasks.length; i += INGEST_CONCURRENCY) {
+    await Promise.all(
+      ingestTasks.slice(i, i + INGEST_CONCURRENCY).map(fn => fn()),
+    );
   }
   const ingestMs = Date.now() - t0;
 

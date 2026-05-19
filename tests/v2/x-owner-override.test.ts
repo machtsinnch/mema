@@ -49,7 +49,7 @@ describe("x-owner override (P0-A)", () => {
         "x-owner": "should_be_ignored",
         "content-type": "application/json",
       },
-      body: JSON.stringify({ kind: "observation", content: "test", source: "t" }),
+      body: JSON.stringify({ kind: "observation", content: "test", source: "t", skip_extraction: true }),
     });
     expect(r.status).toBe(200);
     const j = await r.json() as { episode: { owner: string } };
@@ -68,7 +68,7 @@ describe("x-owner override (P0-A)", () => {
         "x-owner": "lmebench_q42",
         "content-type": "application/json",
       },
-      body: JSON.stringify({ kind: "observation", content: "test", source: "t" }),
+      body: JSON.stringify({ kind: "observation", content: "test", source: "t", skip_extraction: true }),
     });
     expect(r.status).toBe(200);
     const j = await r.json() as { episode: { owner: string } };
@@ -98,7 +98,7 @@ describe("x-owner override (P0-A)", () => {
           "x-owner": bad,
           "content-type": "application/json",
         },
-        body: JSON.stringify({ kind: "observation", content: "test", source: "t" }),
+        body: JSON.stringify({ kind: "observation", content: "test", source: "t", skip_extraction: true }),
       });
       expect(r.status).toBe(400);
     }
@@ -119,7 +119,7 @@ describe("x-owner override (P0-A)", () => {
         "x-actor": "different_owner:label",
         "content-type": "application/json",
       },
-      body: JSON.stringify({ kind: "observation", content: "test", source: "t" }),
+      body: JSON.stringify({ kind: "observation", content: "test", source: "t", skip_extraction: true }),
     });
     expect(r.status).toBe(403);
     delete process.env.MEMA_BENCH_ALLOW_OWNER_OVERRIDE;

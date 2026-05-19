@@ -43,6 +43,7 @@ describe("v2.10.0 cognitive approval lifecycle", () => {
     const app = buildApi({ vaultRoot: vault, apiKeys: KEYS });
     const ep = await req(app, "POST", "/v2/observe", {
       kind: "document", content: "Ardin prefers Bun runtime.", source: "t",
+      skip_extraction: true,
     });
     // Write a draft cognitive record.
     const fs = require("node:fs");
