@@ -24,7 +24,7 @@ import { buildGovernance, hardErase } from "./layer4-governance";
 import { recall } from "./layer5-retrieval";
 import { initVectorStore, pickEmbedder, indexRecord, reindexAll, vectorIndexHealth } from "./layer5-embeddings";
 import { walkDerivedFrom, walkSiblingFacts } from "./layer5-graph";
-import { queryAudit, verifyChain, initAudit } from "./layer6-audit";
+import { queryAudit, verifyChain, initAudit, appendAudit } from "./layer6-audit";
 import {
   wrapRecordAsAsset, verifyAssetIntegrity, parseUAL,
   anchorAsset, listAnchors, setVerificationStatus, initAnchorStore,
@@ -32,6 +32,16 @@ import {
 import { buildGraphView } from "./layer5-graph-view";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import type { z } from "zod";
+import {
+  observeBody, factBody, factInvalidateBody, reasonForceBody, reasonBody, factFindBody,
+  entityBody, entityResolveBody,
+  cognitiveBody, derivedFromAddBody, supersedeBody,
+  reflectBody,
+  governanceBuildBody, eraseBody,
+  recallBody, recallPacketBody,
+  assetWrapBody, assetPathBody, assetAnchorBody, assetStatusBody,
+} from "./schemas";
 
 export interface V2Config { vaultRoot: string; }
 
@@ -221,22 +231,44 @@ cv.addEventListener('wheel', ev => {
 // via env MACHTSINN_V2_MAX_BODY_BYTES.
 const MAX_BODY_BYTES = Number(process.env.MACHTSINN_V2_MAX_BODY_BYTES ?? 2_000_000);
 
-async function parseBody<T>(c: Context): Promise<{ ok: true; body: T } | { ok: false; response: Response }> {
+async function parseBody<S extends z.ZodTypeAny>(
+  c: Context,
+  schema: S,
+): Promise<{ ok: true; body: z.infer<S> } | { ok: false; response: Response }> {
+  // Pre-read as text to enforce size limit before parsing.
+  let text: string;
   try {
-    // Pre-read as text to enforce size limit before parsing.
-    const text = await c.req.text();
-    if (text.length > MAX_BODY_BYTES) {
-      return { ok: false, response: c.json({
-        error: "payload too large",
-        max_bytes: MAX_BODY_BYTES,
-        actual_bytes: text.length,
-      }, 413) };
-    }
-    const body = JSON.parse(text) as T;
-    return { ok: true, body };
+    text = await c.req.text();
+  } catch {
+    return { ok: false, response: c.json({ error: "invalid request body" }, 400) };
+  }
+  if (text.length > MAX_BODY_BYTES) {
+    return { ok: false, response: c.json({
+      error: "payload too large",
+      max_bytes: MAX_BODY_BYTES,
+      actual_bytes: text.length,
+    }, 413) };
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
   } catch {
     return { ok: false, response: c.json({ error: "invalid JSON body" }, 400) };
   }
+  // Runtime schema validation (Pydantic-equivalent). Surfaces field-level
+  // issues as 400 instead of letting undefined-access crash with 500.
+  const result = schema.safeParse(raw);
+  if (!result.success) {
+    return { ok: false, response: c.json({
+      error: "invalid request body",
+      issues: result.error.issues.map(i => ({
+        path: i.path.join("."),
+        message: i.message,
+        code: i.code,
+      })),
+    }, 400) };
+  }
+  return { ok: true, body: result.data };
 }
 
 export function mountV2(app: Hono, cfg: V2Config): void {
@@ -255,13 +287,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   // benchmarks (e.g. measuring raw retrieval recall). NOT for production.
   // To be deprecated in v2.14.4.
   app.post("/v2/observe", async c => {
-    const parsed = await parseBody<{
-      kind: "conversation" | "document" | "tool_call" | "observation";
-      content: string;
-      source?: string;
-      refs?: string[];
-      skip_extraction?: boolean;
-    }>(c);
+    const parsed = await parseBody(c, observeBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
@@ -345,19 +371,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
 
   // ── Layer 2: Temporal Semantic ───────────────────────────────────
   app.post("/v2/fact", async c => {
-    const parsed = await parseBody<{
-      subject: string;
-      predicate: string;
-      object: string;
-      valid_from?: string;
-      valid_to?: string | null;
-      derived_from: string[];
-      confidence?: number;
-      // v2.7+: opt-in draft mode for LLM extractors and other untrusted producers.
-      status?: "draft" | "approved";
-      evidence_excerpt?: string;
-      proposed_by?: string;
-    }>(c);
+    const parsed = await parseBody(c, factBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
@@ -390,7 +404,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
 
   app.post("/v2/fact/:id/invalidate", async c => {
     const id = c.req.param("id");
-    const parsed = await parseBody<{ superseded_by?: string }>(c);
+    const parsed = await parseBody(c, factInvalidateBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
@@ -409,7 +423,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   // `reason` is REQUIRED on force, so every bypass is auditable.
   app.post("/v2/fact/:id/approve", async c => {
     const id = c.req.param("id");
-    const parsed = await parseBody<{ reason?: string; force?: boolean }>(c);
+    const parsed = await parseBody(c, reasonForceBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
@@ -456,7 +470,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
 
   app.post("/v2/fact/:id/reject", async c => {
     const id = c.req.param("id");
-    const parsed = await parseBody<{ reason: string }>(c);
+    const parsed = await parseBody(c, reasonBody);
     if (!parsed.ok) return parsed.response;
     if (!parsed.body.reason || !parsed.body.reason.trim()) {
       return c.json({ error: "reason is required for reject" }, 400);
@@ -480,7 +494,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   // the new candidate then offers an auto-invalidate-with-supersedes
   // for the older fact.
   app.post("/v2/fact/contradictions", async c => {
-    const parsed = await parseBody<{ subject: string; predicate: string; object: string }>(c);
+    const parsed = await parseBody(c, factFindBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const cs = findContradictions(cfg.vaultRoot, owner, parsed.body);
@@ -495,7 +509,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   app.post("/v2/fact/:newId/approve-supersedes/:oldId", async c => {
     const newId = c.req.param("newId");
     const oldId = c.req.param("oldId");
-    const parsed = await parseBody<{ reason?: string; force?: boolean }>(c);
+    const parsed = await parseBody(c, reasonForceBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
@@ -547,16 +561,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
 
   // ── Layer 2: Entities ────────────────────────────────────────────
   app.post("/v2/entity", async c => {
-    const parsed = await parseBody<{
-      name: string;
-      type: string;
-      aliases?: string[];
-      // v2.7+ acceptance lifecycle opt-in fields.
-      status?: "draft" | "approved";
-      evidence_excerpt?: string;
-      proposed_by?: string;
-      derived_from?: string[];
-    }>(c);
+    const parsed = await parseBody(c, entityBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
@@ -572,7 +577,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   // mandatory `reason` bypasses for human-verified cases.
   app.post("/v2/entity/:id/approve", async c => {
     const id = c.req.param("id");
-    const parsed = await parseBody<{ reason?: string; force?: boolean }>(c);
+    const parsed = await parseBody(c, reasonForceBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
@@ -621,7 +626,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
 
   app.post("/v2/entity/:id/reject", async c => {
     const id = c.req.param("id");
-    const parsed = await parseBody<{ reason: string }>(c);
+    const parsed = await parseBody(c, reasonBody);
     if (!parsed.ok) return parsed.response;
     if (!parsed.body.reason || !parsed.body.reason.trim()) {
       return c.json({ error: "reason is required for reject" }, 400);
@@ -663,10 +668,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   // to the same real-world thing. Ranked. Used by extractors before
   // creating a new entity to avoid duplicates.
   app.post("/v2/entity/resolve", async c => {
-    const parsed = await parseBody<{
-      name: string; aliases?: string[]; type?: string;
-      include_drafts?: boolean; max_levenshtein?: number;
-    }>(c);
+    const parsed = await parseBody(c, entityResolveBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const candidates = resolveEntity(cfg.vaultRoot, owner, parsed.body, {
@@ -686,12 +688,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
 
   // ── Layer 3: Cognitive ───────────────────────────────────────────
   app.post("/v2/cognitive", async c => {
-    const parsed = await parseBody<{
-      kind: "experience" | "observation" | "belief";
-      content: string;
-      confidence: number;
-      derived_from: string[];
-    }>(c);
+    const parsed = await parseBody(c, cognitiveBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
@@ -707,7 +704,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   // force:true + non-empty reason is passed.
   app.post("/v2/cognitive/:id/approve", async c => {
     const id = c.req.param("id");
-    const parsed = await parseBody<{ reason?: string; force?: boolean }>(c);
+    const parsed = await parseBody(c, reasonForceBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
@@ -751,7 +748,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
 
   app.post("/v2/cognitive/:id/reject", async c => {
     const id = c.req.param("id");
-    const parsed = await parseBody<{ reason: string }>(c);
+    const parsed = await parseBody(c, reasonBody);
     if (!parsed.ok) return parsed.response;
     if (!parsed.body.reason || !parsed.body.reason.trim()) {
       return c.json({ error: "reason is required for reject" }, 400);
@@ -770,7 +767,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
 
   // the PAI migration to wire cross-memory wikilinks AFTER all records exist.
   app.post("/v2/cognitive/:id/derived-from", async c => {
-    const parsed = await parseBody<{ add: string[] }>(c);
+    const parsed = await parseBody(c, derivedFromAddBody);
     if (!parsed.ok) return parsed.response;
     if (!Array.isArray(parsed.body.add)) {
       return c.json({ error: "body.add must be an array of IDs" }, 400);
@@ -783,7 +780,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   });
 
   app.post("/v2/cognitive/:oldId/supersede", async c => {
-    const parsed = await parseBody<{ new_id: string }>(c);
+    const parsed = await parseBody(c, supersedeBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
@@ -795,13 +792,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
 
   // ── Layer 3: Reflection (automated synthesis) ────────────────────
   app.post("/v2/reflect", async c => {
-    const parsed = await parseBody<{
-      since?: string; min_support?: number; max_records_emitted?: number;
-      // v2.9.0+ (NEW) — opt-in LLM-driven reflection on top of the
-      // rule-based pass. LLM-proposed beliefs land as drafts.
-      llm?: boolean;
-      llm_max_per_window?: number;
-    }>(c);
+    const parsed = await parseBody(c, reflectBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
@@ -856,14 +847,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
 
   // ── Layer 4: Governance ──────────────────────────────────────────
   app.post("/v2/governance/build", async c => {
-    const parsed = await parseBody<{
-      source_content: string;
-      purpose: string[];
-      retention_until?: string;
-      jurisdiction?: string;
-      data_classes?: string[];
-      allowed_actors?: string[];
-    }>(c);
+    const parsed = await parseBody(c, governanceBuildBody);
     if (!parsed.ok) return parsed.response;
     const actor = c.get("actor");
     const gov = buildGovernance({ ...parsed.body, actor });
@@ -875,7 +859,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     // API callers can record the GDPR Article / nFADP / etc. citation
     // that authorized the erasure. hardErase already supported it; the
     // API just wasn't plumbing it through.
-    const parsed = await parseBody<{ record_path: string; reason: string; legal_basis?: string }>(c);
+    const parsed = await parseBody(c, eraseBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
@@ -907,32 +891,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
 
   // ── Layer 5: Retrieval ───────────────────────────────────────────
   app.post("/v2/recall", async c => {
-    const parsed = await parseBody<{
-      query: string;
-      purpose: string;
-      // v2.11.0+ — "entity" added to align with RetrievalKind. v2.9.0 made
-      // entities first-class retrieval candidates but the API type only
-      // listed three kinds. Pre-2.11 callers that supplied "entity" still
-      // worked at runtime (recall() honored it), but TS clients couldn't
-      // type-check the value.
-      kinds?: ("episode" | "fact" | "cognitive" | "entity")[];
-      temporal?: { valid_at?: string };
-      limit?: number;
-      use_vector?: boolean;
-      // v2.7.3+ policy-routing context (P4 + P5).
-      jurisdiction?: string;
-      model?: {
-        model?: string;
-        model_region?: string;
-        deployment?: "local" | "cloud";
-        human_review?: boolean;
-        approved_models?: string[];
-      };
-      policy_mode?: "permissive" | "strict";
-      // v2.10.0+ ablation switch (NEW). "weighted" default = back-compat;
-      // "rrf" = Reciprocal Rank Fusion over keyword/vector/graph/temporal/title.
-      fusion?: "weighted" | "rrf";
-    }>(c);
+    const parsed = await parseBody(c, recallBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
@@ -952,24 +911,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   // consumes this shape directly. Callers that want the legacy single-
   // pool behavior keep using /v2/recall.
   app.post("/v2/recall/packet", async c => {
-    const parsed = await parseBody<{
-      query: string;
-      purpose: string;
-      temporal?: { valid_at?: string };
-      limit_evidence?: number;  // top-K episodes (default 10)
-      limit_memory?: number;    // top-K facts+cognitive+entities (default 20)
-      use_vector?: boolean;
-      jurisdiction?: string;
-      model?: {
-        model?: string;
-        model_region?: string;
-        deployment?: "local" | "cloud";
-        human_review?: boolean;
-        approved_models?: string[];
-      };
-      policy_mode?: "permissive" | "strict";
-      fusion?: "weighted" | "rrf";
-    }>(c);
+    const parsed = await parseBody(c, recallPacketBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
@@ -1005,7 +947,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   // ── Layer 7: Verifiable Memory Assets ────────────────────────────
   // Wrap a record file as an asset (compute hashes, mint UAL, version it).
   app.post("/v2/asset/wrap", async c => {
-    const parsed = await parseBody<{ path: string; kind: string; scope: string; id: string }>(c);
+    const parsed = await parseBody(c, assetWrapBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const p = parsed.body.path.startsWith("/") ? parsed.body.path : join(cfg.vaultRoot, parsed.body.path);
@@ -1017,12 +959,21 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     const meta = wrapRecordAsAsset(p, {
       owner, kind: parsed.body.kind, scope: parsed.body.scope, id: parsed.body.id,
     });
+    // v2.14.3: L7 mutations are audited (codex review: invariant #5 was
+    // being silently violated — wrap mutates frontmatter without a row).
+    appendAudit({
+      op: "WRAP",
+      actor: c.get("actor"),
+      owner,
+      record_ids: [parsed.body.id],
+      reason: `asset_version=${meta.asset_version} ual=${meta.ual}`,
+    });
     return c.json({ asset: meta });
   });
 
   // Verify an asset's integrity by recomputing hashes.
   app.post("/v2/asset/verify-integrity", async c => {
-    const parsed = await parseBody<{ path: string }>(c);
+    const parsed = await parseBody(c, assetPathBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const p = parsed.body.path.startsWith("/") ? parsed.body.path : join(cfg.vaultRoot, parsed.body.path);
@@ -1044,7 +995,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
 
   // Anchor an asset to a target (local | customer-audit-bundle | origintrail | ...)
   app.post("/v2/asset/anchor", async c => {
-    const parsed = await parseBody<{ path: string; target: string }>(c);
+    const parsed = await parseBody(c, assetAnchorBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const p = parsed.body.path.startsWith("/") ? parsed.body.path : join(cfg.vaultRoot, parsed.body.path);
@@ -1054,6 +1005,14 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     if (rec.data.owner && rec.data.owner !== owner) return c.json({ error: "not found" }, 404);
     try {
       const anchor = anchorAsset({ vaultRoot: cfg.vaultRoot, filePath: p, target: parsed.body.target });
+      // v2.14.3: audit L7 anchor ops (was silent before codex review).
+      appendAudit({
+        op: "ANCHOR",
+        actor: c.get("actor"),
+        owner,
+        record_ids: [anchor.ual],
+        reason: `target=${anchor.target} version=${anchor.asset_version}`,
+      });
       return c.json({ anchor });
     } catch (e: any) {
       return c.json({ error: e.message ?? String(e) }, 400);
@@ -1075,7 +1034,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
 
   // Set the verification status of an asset (typically after human review).
   app.post("/v2/asset/verification-status", async c => {
-    const parsed = await parseBody<{ path: string; status: "unverified" | "verified" | "anchored" }>(c);
+    const parsed = await parseBody(c, assetStatusBody);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const p = parsed.body.path.startsWith("/") ? parsed.body.path : join(cfg.vaultRoot, parsed.body.path);
@@ -1084,6 +1043,14 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     const rec = matter(readFileSync(p, "utf8"));
     if (rec.data.owner && rec.data.owner !== owner) return c.json({ error: "not found" }, 404);
     setVerificationStatus(p, parsed.body.status);
+    // v2.14.3: audit L7 verification status changes (was silent before).
+    appendAudit({
+      op: "VERIFY",
+      actor: c.get("actor"),
+      owner,
+      record_ids: [(rec.data.ual as string) ?? p],
+      reason: `status=${parsed.body.status}`,
+    });
     return c.json({ ok: true, status: parsed.body.status });
   });
 

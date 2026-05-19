@@ -67,23 +67,114 @@ Output ONLY valid JSON. No prose, no markdown fences. Schema:
 
 If the document contains zero extractable facts, return {"facts": [], "entities": []}.`;
 
+// Few-shot demo content. Chosen to be in a domain (open-source tech history)
+// that is extremely unlikely to appear verbatim in user content. Weaker
+// open-weight models (llama3.1:8b, qwen2.5:7b) sometimes regurgitate this
+// demo when they can't extract anything substantive from the real input —
+// the defense below catches that.
 const FEW_SHOT_USER = `Text:
-Marcel founded machtsinn AG in 2024. The company uses Azure for infrastructure. Customer A rejected the Pro tier because they only need Starter.`;
+PostgreSQL supports JSONB indexing. The Apache Software Foundation manages the Kafka project. Linus Torvalds founded the Linux kernel project.`;
 
 const FEW_SHOT_ASSISTANT = `{
   "facts": [
-    {"subject": "Marcel", "predicate": "founded", "object": "machtsinn AG", "confidence": 0.95},
-    {"subject": "machtsinn AG", "predicate": "uses", "object": "Azure", "confidence": 0.95},
-    {"subject": "Customer A", "predicate": "rejected", "object": "Pro tier", "confidence": 0.9}
+    {"subject": "PostgreSQL", "predicate": "supports", "object": "JSONB indexing", "confidence": 0.95},
+    {"subject": "Apache Software Foundation", "predicate": "manages", "object": "Kafka project", "confidence": 0.95},
+    {"subject": "Linus Torvalds", "predicate": "founded", "object": "Linux kernel project", "confidence": 0.95}
   ],
   "entities": [
-    {"name": "Marcel", "type": "person"},
-    {"name": "machtsinn AG", "type": "organization"},
-    {"name": "Azure", "type": "system"},
-    {"name": "Customer A", "type": "organization"},
-    {"name": "Pro tier", "type": "product"}
+    {"name": "PostgreSQL", "type": "system"},
+    {"name": "JSONB indexing", "type": "concept"},
+    {"name": "Apache Software Foundation", "type": "organization"},
+    {"name": "Kafka project", "type": "product"},
+    {"name": "Linus Torvalds", "type": "person"},
+    {"name": "Linux kernel project", "type": "product"}
   ]
 }`;
+
+// Defense-in-depth: if a weak model echoes the few-shot demo verbatim,
+// drop those exact triples and entities post-hoc. Real user content with
+// these exact triples is extremely unlikely; if it happens, update the
+// demo (it's cheap).
+const FEW_SHOT_TRIPLES = new Set([
+  "postgresql|supports|jsonb indexing",
+  "apache software foundation|manages|kafka project",
+  "linus torvalds|founded|linux kernel project",
+]);
+// Partial-regurgitation defense: weaker models sometimes keep the few-shot's
+// (predicate, object) pair but swap in a subject from the real input
+// (e.g. "PAI supports JSONB indexing" — JSONB was nowhere in the source).
+// Drop any fact where (predicate, object) matches the demo regardless of
+// subject. Loses recall on the unlikely case that real user content
+// genuinely contains those exact (predicate, object) pairs; acceptable
+// because the few-shot uses tech-history examples that are easy to swap
+// if collision occurs.
+const FEW_SHOT_PRED_OBJ = new Set([
+  "supports|jsonb indexing",
+  "manages|kafka project",
+  "founded|linux kernel project",
+]);
+const FEW_SHOT_ENTITY_NAMES = new Set([
+  "postgresql", "jsonb indexing", "apache software foundation",
+  "kafka project", "linus torvalds", "linux kernel project",
+]);
+
+// v2.14.3+ entity-type whitelist (codex review). The extractor prompt says
+// types must be one of seven, but qwen2.5:7b regularly returns invented
+// types like "command", "path", "issue", "fix", "stock", "index", "pattern",
+// "platform", "feature", "document", "runtime". Drop those at the boundary
+// so downstream (createEntity, retrieval scoring, graph view) never sees
+// invalid types. Common mistypes can be remapped to the right canonical
+// type if obvious; everything else is dropped.
+const ALLOWED_ENTITY_TYPES = new Set([
+  "person", "organization", "product", "system", "place", "concept", "event",
+]);
+const TYPE_REMAP: Record<string, string> = {
+  // OS/platform names — qwen2.5:7b labels these as "place" too. Anything
+  // that's clearly a software runtime/OS becomes "system".
+  command: "concept",
+  path: "concept",
+  pattern: "concept",
+  runtime: "system",
+  platform: "system",
+  feature: "concept",
+  document: "concept",
+  stock: "product",
+  index: "product",
+  fund: "product",
+  // bug-tracker artifacts the model invented from PLATFORM/SECURITY docs
+  issue: "concept",
+  fix: "concept",
+  bug: "concept",
+};
+
+function filterFewShotLeak(r: ExtractionResult): ExtractionResult {
+  return {
+    facts: r.facts.filter(f => {
+      const s = (f.subject ?? "").toLowerCase();
+      const p = (f.predicate ?? "").toLowerCase();
+      const o = (f.object ?? "").toLowerCase();
+      if (FEW_SHOT_TRIPLES.has(`${s}|${p}|${o}`)) return false;
+      if (FEW_SHOT_PRED_OBJ.has(`${p}|${o}`)) return false;
+      // v2.14.3+: drop role-inverted facts — "Linux fully_supported by PAI"
+      // patterns are nearly always model errors (real meaning: PAI supports
+      // Linux, with the subject and object swapped). The retrieval scorer
+      // can't surface these usefully and they pollute the graph.
+      if (o.startsWith("by ")) return false;
+      return true;
+    }),
+    entities: (r.entities
+      .filter(e => !FEW_SHOT_ENTITY_NAMES.has((e.name ?? "").toLowerCase()))
+      .map(e => {
+        const t = (e.type ?? "").toLowerCase().trim();
+        if (ALLOWED_ENTITY_TYPES.has(t)) return { ...e, type: t };
+        const remapped = TYPE_REMAP[t];
+        if (remapped) return { ...e, type: remapped };
+        return null;
+      })
+      .filter((e): e is ExtractedEntity => e !== null)
+    ),
+  };
+}
 
 function parseStrictJson(raw: string): ExtractionResult {
   // Strip code fences if model emitted them despite instructions.
@@ -96,10 +187,10 @@ function parseStrictJson(raw: string): ExtractionResult {
   const end = cleaned.lastIndexOf("}");
   if (start < 0 || end < 0) throw new Error(`no JSON object in response: ${raw.slice(0, 200)}`);
   const obj = JSON.parse(cleaned.slice(start, end + 1));
-  return {
+  return filterFewShotLeak({
     facts: Array.isArray(obj.facts) ? obj.facts : [],
     entities: Array.isArray(obj.entities) ? obj.entities : [],
-  };
+  });
 }
 
 // ── OllamaExtractor ──────────────────────────────────────────────────

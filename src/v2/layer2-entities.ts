@@ -31,9 +31,46 @@ export interface CreateEntityInput {
 }
 
 export function createEntity(vaultRoot: string, input: CreateEntityInput): Entity {
-  const id = ulid();
   const now = new Date().toISOString();
   const status: RecordStatus = input.status ?? "approved";
+
+  // v2.14.3+ (codex review): per-vault dedup. Without this, every ingest
+  // that mentions the same entity name creates a fresh file with a new ULID
+  // (e.g. "PAI" ends up as system-pai--01KS01.md, system-pai--01KS02.md, ...
+  // across N documents). Look up by (owner, type, name-or-alias) first and
+  // update the existing record's last_seen + aliases + derived_from union.
+  const existing = findEntityByNameAndType(vaultRoot, input.owner, input.name, input.type);
+  if (existing) {
+    const existingPath = entityPath(vaultRoot, input.owner, existing.id);
+    if (existingPath) {
+      const parsed = matter(readFileSync(existingPath, "utf8"));
+      const fm = parsed.data as Record<string, unknown>;
+      const mergedAliases = [...new Set([
+        ...((fm.aliases as string[] | undefined) ?? existing.aliases ?? []),
+        input.name,
+        ...(input.aliases ?? []),
+      ])];
+      const existingDerived = (fm.derived_from as string[] | undefined) ?? [];
+      const mergedDerived = [...new Set([...existingDerived, ...(input.derived_from ?? [])])];
+      const updated: Record<string, unknown> = {
+        ...fm,
+        aliases: mergedAliases,
+        last_seen: now,
+        ...(mergedDerived.length ? { derived_from: mergedDerived } : {}),
+      };
+      atomicWriteFile(existingPath, matter.stringify(parsed.content, updated));
+      appendAudit({
+        op: "EXTRACT",
+        actor: input.actor,
+        owner: input.owner,
+        record_ids: [existing.id],
+        reason: `entity_deduped:${existing.type}`,
+      });
+      return { ...existing, aliases: mergedAliases, last_seen: now };
+    }
+  }
+
+  const id = ulid();
   const entity: Entity = {
     id,
     name: input.name,
@@ -76,6 +113,38 @@ export function createEntity(vaultRoot: string, input: CreateEntityInput): Entit
   });
 
   return entity;
+}
+
+// v2.14.3+ helper for dedup: match by (owner, type, normalized-name).
+// Normalization strips non-alphanumeric so "Macht Foundation Engine",
+// "macht-foundation-engine", and "Macht_Foundation_Engine" all dedupe to
+// the same record. Type must still match exactly so a "system" named
+// "Apache" doesn't collide with an "organization" named "Apache".
+function normalizeForDedup(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function findEntityByNameAndType(
+  vaultRoot: string,
+  owner: string,
+  name: string,
+  type: string,
+): Entity | null {
+  const dir = join(vaultRoot, "v2-entities", owner);
+  if (!existsSync(dir)) return null;
+  const q = normalizeForDedup(name);
+  const t = type.toLowerCase().trim();
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith(".md")) continue;
+    try {
+      const parsed = matter(readFileSync(join(dir, f), "utf8"));
+      const e = parsed.data as Entity;
+      if ((e.type ?? "").toLowerCase().trim() !== t) continue;
+      if (normalizeForDedup(e.name) === q) return e;
+      if ((e.aliases ?? []).some(a => normalizeForDedup(a) === q)) return e;
+    } catch { /* skip malformed */ }
+  }
+  return null;
 }
 
 // v2.7+ acceptance lifecycle — approve a draft entity.

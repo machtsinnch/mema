@@ -1,100 +1,168 @@
 # Resume Here
 
-**Latest session:** 2026-05-17 → 2026-05-18 overnight (autonomous; Ardin slept; Codex sparring partner).
+**Latest session:** 2026-05-19 (interactive, with Ardin).
+**Branch state:** clean, pushed to origin/main through `e6868c3`. 366/366 tests pass.
 
-**🎯 STATUS:** All v2.14.0 + scripts committed and pushed (5 commits in this overnight: `25942b2` v2.14.0 supersession, `b44d61e` test scripts, plus earlier session commits `720f961`, `c8a09aa`, `074e8b2`, `b4a3054`, `83abbb8`). Real user data ingested for morning qualitative eval. PAI fully disabled (three things newly stopped tonight).
+## 🎯 STATUS (CRITICAL — read first)
 
-## First 5 minutes when you wake
+**Headline:** The 7-layer architecture now actually fires on every `/v2/observe` (v2.14.1) AND uses a non-leaky extractor (v2.14.2). But the vault is fresh — all bench/personal data was wiped because the old Ollama extractor was producing hallucinated facts.
+
+**What changed today:**
+
+1. **v2.14.1** (commit `b6c7e7e`) — `/v2/observe` extraction-mandatory by default
+   - Episode persisted → extractor called → facts via `recordFactWithSupersession` → entities via `createEntity` → audit
+   - Opt-out: `skip_extraction:true` (for tests + episode-only benches; will be removed in v2.14.4)
+   - Also fixed: supersession classifier uses full ISO timestamp instead of YYYY-MM-DD prefix (same-day contradictions now supersede correctly)
+
+2. **v2.14.2** (commit `e6868c3`) — ClaudeCLIExtractor + parallel bench ingest
+   - **Bug discovered:** Ollama llama3.1:8b extractor REGURGITATES the few-shot examples in the extraction prompt — every observe extracted the same 3 facts ("Marcel founded machtsinn AG" / "machtsinn AG uses Azure" / "Customer A rejected Pro tier") regardless of input content. Verified on B-29 photo-etching content → got Marcel facts.
+   - **Fix:** new `ClaudeCLIExtractor` in `src/v2/llm-extractor.ts` shells out to `claude --model haiku`. Strong enough not to regurgitate. Smoke tested on B-29 content → grounded extraction.
+   - **Priority order changed:** Anthropic API > Claude CLI (OAuth) > OpenAI > Ollama (demoted). Ollama still available via `MEMA_EXTRACTOR=ollama`.
+   - Bench harness ingestion parallelized (INGEST_CONCURRENCY=8) — n=100 dropped from ~30h sequential to ~6-8h.
+
+3. **Vault was nuked.** `data/{episodes,facts,v2-entities,cognitive,audit,entities,vector,anchor,governance}` all deleted. Only ~3 facts remain under `smoke-postnuke` owner from a verification test. Your real `ardin` vault data is gone — needs re-ingest from `~/Documents/pai/{finance-plan,machtsinn}`.
+
+4. **The 97.9% LongMemEval n=100 result from today is INVALID** — it ran with Ollama extractor that was hallucinating. Retrieval was correct (100% Hit@1 across categories) but the extraction layer was producing garbage facts. We don't have a real moat number yet.
+
+## 🚧 Where we stopped — TCC permissions blocked re-ingest
+
+The Bash sandbox in this Claude Code session can't read `~/Documents/pai` (macOS TCC blocks Documents folder). Earlier sessions had access; this one doesn't. Ardin granted Documents access to Terminal but not to Claude Code itself.
+
+**Why we ended the session:** Ardin chose to restart so Claude Code can pick up new TCC entitlements.
+
+## First 5 minutes after restart
 
 ```bash
 cd ~/Projects/machtsinn.ai
-git log --oneline origin/main..HEAD                # should be empty — everything pushed
-bun test 2>&1 | tail -3                            # 366 pass / 0 fail
-curl -s http://localhost:3001/health               # primary mema (running with v2.14.0)
-find data/episodes/ardin-v214test -name "*.md" | wc -l   # should be 300 (your data, isolated namespace)
-cat /tmp/MORNING-TEST-PROTOCOL.md                  # exact steps for today's qualitative test
-cat /tmp/OVERNIGHT-REPORT.md                       # chronological log of what happened overnight
+git log --oneline -5                        # should show e6868c3 at top
+git status -s                                # should be clean
+bun test 2>&1 | tail -3                      # should be 366 pass / 0 fail
+
+# Verify TCC access is now granted
+ls ~/Documents/pai/finance-plan/ | head -3  # if you see files, you're good
+                                              # if "Operation not permitted" → still blocked
+
+# Verify mema is running with the right env
+curl -s http://localhost:3001/health         # should return ok / version 2.11.0-rc.1
+
+# If mema isn't running, start it with the right config:
+lsof -ti:3001 | xargs kill -9 2>/dev/null; sleep 2
+{ nohup env \
+  MEMA_BENCH_ALLOW_OWNER_OVERRIDE=true \
+  MEMA_API_KEY=dev-ardin \
+  MEMA_OLLAMA_EMBED_MODEL=nomic-embed-text \
+  MACHTSINN_RATE_LIMIT_RPS=1000 \
+  MACHTSINN_RATE_LIMIT_BURST=10000 \
+  MEMA_EXTRACTOR=claude_cli \
+  MEMA_CLAUDE_EXTRACTOR_MODEL=haiku \
+  bun --cwd ~/Projects/machtsinn.ai src/index.ts > /tmp/mema-server.log 2>&1 < /dev/null & } 2>/dev/null
+sleep 5 && curl -s http://localhost:3001/health
 ```
 
-## What's new from yesterday's session
+## Next steps after restart
 
-### Committed + pushed (origin/main is current)
+### Step 1: Re-populate the vault (~6-8h, background)
+
+```bash
+cd ~/Projects/machtsinn.ai
+bun scripts/v214-test-ingest.ts ~/Documents/pai \
+  --owner ardin \
+  --skip-extract \
+  > /tmp/repopulate-ardin.log 2>&1 &
+
+# Monitor:
+tail -f /tmp/repopulate-ardin.log
+```
+
+`--skip-extract` tells the script NOT to do its own client-side extraction (the server now handles extraction on every observe via the Claude CLI haiku extractor). The script just walks files and POSTs to `/v2/observe`.
+
+### Step 2: Re-run benches (after step 1 is done)
+
+#### LongMemEval n=100 (the real one, with extraction firing through Claude CLI):
+
+```bash
+cd ~/Projects/machtsinn.ai
+bun bench/longmemeval-harness.ts \
+  --data /private/tmp/longmemeval/data/longmemeval_oracle.json \
+  --limit 100 \
+  --balanced \
+  --context-mode memory-packet \
+  --judge llm \
+  --answer-backend claude \
+  --judge-backend ollama \
+  --model sonnet \
+  --save-results /tmp/lme-n100-v2142-REAL.jsonl \
+  > /tmp/lme-n100-v2142-REAL.log 2>&1 &
+```
+
+ETA ~6-8h. The bench's INGEST_CONCURRENCY=8 keeps it from blocking.
+
+#### MemoryAgentBench FactConsolidation SH-6k (the moat bench):
+
+The Python deps are installed (`pip3 install ... --break-system-packages` already done in this session).
+
+```bash
+cd /tmp/MemoryAgentBench
+python3 main.py \
+  --agent_config configs/agent_conf/RAG_Agents/gpt-4o-mini/Structure_rag_gpt-4o-mini-mema.yaml \
+  --dataset_config configs/data_conf/Conflict_Resolution/Factconsolidation_sh_6k.yaml \
+  --force > /tmp/mab-fc-sh-6k-v2142.log 2>&1 &
+```
+
+Baseline from RAG-only run is preserved at:
+`/tmp/MemoryAgentBench/outputs/gpt-4o-mini-mema/Conflict_Resolution/factconsolidation_sh_6k_RAG-only-baseline.json` (53% — without extraction)
+
+The v2.14.2 run with extraction firing should beat that meaningfully. ICLR 2026 paper Table 3: HippoRAG-v2 (SOTA) 54%, Mem0 18%, Zep 7%, GPT-4o long-context 60%.
+
+#### BGU bench (built but never run):
+
+```bash
+cd ~/Projects/machtsinn.ai
+bun bench/bgu-bench.ts build-dataset --pairs 150 --seed 42 \
+  --data /private/tmp/longmemeval/data/longmemeval_oracle.json
+bun bench/bgu-bench.ts run mema
+bun bench/bgu-bench.ts judge mema
+bun bench/bgu-bench.ts report mema
+```
+
+### Step 3: Scientific validation (per Codex spec + Ardin's "be scientific" instruction)
+
+Before any public number:
+- 3× repeat at temp=0 with variance reporting
+- Multi-judge agreement (κ ≥ 0.70) — currently single Ollama judge
+- Vendor adversarial review (Zep, Mem0 inspect adapter configs)
+- SHA-256 manifest of dataset + responses + verdicts (BGU bench already does this)
+
+## Reference: what's in the commits
 
 | Commit | What |
 |---|---|
-| `720f961` | v2.12.1 — IP audit + integer-answer fix + Sonnet default + exp-jitter backoff |
-| `c8a09aa` | v2.13.0 — nomic embedder + preference-aware prompts + time-aware retrieval + temporal-expansion module |
-| `074e8b2` | docs(RESUME-HERE) — v2.13.0 status |
-| `b4a3054` | v2.13.1 — revert time-aware pass-through (caused -7.4pp memory-packet regression) |
-| `83abbb8` | v2.13.2 — variance caveat + determinism-by-default architectural commitment |
-| `25942b2` | **v2.14.0 — write-time supersession + hard-omit superseded facts from packet** |
-| `b44d61e` | scripts — v214-test-ingest.ts + v214-test-query.ts |
+| `e6868c3` | **v2.14.2** — ClaudeCLIExtractor + parallel bench ingest + remaining test fixes |
+| `b6c7e7e` | **v2.14.1** — /v2/observe extraction-mandatory + supersession timestamp fix |
+| `35716b1` | v2.14.1 fix — leak-proof watchdog in callClaudeCLI/Gemini/Codex |
+| `25942b2` | **v2.14.0** — write-time supersession + hard-omit superseded facts from packet |
 
-### Bench evidence
+## Notable findings from today (DO NOT lose)
 
-| Run | Memory-packet | KU | Notes |
-|---|---|---|---|
-| v2.12 (hash embedder) | 79.3% (n=29) | 80% | baseline |
-| v2.13a (nomic + prompts) | 83.3% (n=30) | 80% | the headline-but-lucky run |
-| v2.13b (with time-aware) | 75.9% (n=29) | 60% | time-aware hurt |
-| v2.13.1 verify-revert | 73.3% (n=30) | 40% | re-confirms variance |
-| **v2.14.0 (supersession)** | **80.0% (n=30)** | **60%** | in noise band; supersession works but undetectable at n=5/cat |
+1. **Ollama llama3.1:8b regurgitates few-shot prompt examples.** Empirical: verified by inspecting facts under `lme_bench_*` owners — they all said "Marcel founded machtsinn AG" even when source content was about B-29 bombers. Fix: use Claude (Haiku via OAuth CLI, or API).
 
-**Honest read of memory-packet at n=30**: ~78% ± 5pp. The "+4.0pp" claim in any of these is variance, not signal. The single solid lift in this whole arc is **single-session-preference jumping 20% → 80% across all runs** (Codex's prompt-fix diagnosis was right). Write-time supersession will be properly measured on MemoryAgentBench/FactConsolidation where it's the scoring criterion.
+2. **Same-day supersession bug.** v2.14.0 classifier used `slice(0,10)` date-prefix comparison — two contradicting facts on the same day failed to supersede (strict `<` of identical date prefixes is false). Fixed in v2.14.1 by using full ISO timestamp.
 
-### What landed code-wise
+3. **SessionEnd hook killed mema mid-bench.** Bench-spawned `claude` subprocesses ran the user's `~/.claude/settings.json` SessionEnd hook which executed `scripts/stop.sh` and killed the mema dev server. Fix: pass `MACHTSINN_PORT=65535` to child env so start.sh/stop.sh target a throwaway port. Already in `bench/bench-utils.ts`.
 
-- **v2.14.0 write-time supersession** — `src/v2/layer4-supersession.ts` (new, ~120 LOC, pure `classifyOnWrite` function), `recordFactWithSupersession` wrapper in `layer2-semantic.ts`, `/v2/fact` endpoint switched to it, `compilePacketToPrompt` hard-omits superseded from `<FACTS>` (per Codex's spec — LLMs ignore `isSuperseded` markers, hard-omit is the fix). 11 new tests in `tests/v2/supersession.test.ts`. 3 existing memory-packet tests updated.
-- **v2.14test scripts** — `scripts/v214-test-ingest.ts` (300 source files in 0.3s with `--skip-extract`) and `scripts/v214-test-query.ts` (interactive REPL for your morning eval).
-- **MemoryAgentBench adapter** — at `/tmp/MemoryAgentBench/methods/mema/` (zero-dep Python; not in repo). Ready to plug into the bench's `agent.py` for the FactConsolidation flagship run.
+4. **macOS TCC blocks `~/Documents/` from Bash sandbox.** Claude Code needs explicit Files & Folders → Documents permission, granted via System Settings, then Claude Code restarted to pick it up.
 
-### Tests
+## Open work after re-ingest
 
-**366 pass / 0 fail** (up from 325 → 358 → 366 across session). Net +41 new tests this overnight.
+- LongMemEval n=100 with REAL extraction (the v2.14.2 number)
+- MemoryAgentBench FactConsolidation SH-6k + MH variants  
+- BGU bench full run (build-dataset → run → judge → report)
+- 3× variance runs across all three
+- Multi-judge scoring
 
-## Real user data is ingested + waiting for your eval
+## Things explicitly NOT to repeat from today
 
-Your `~/Documents/pai/{finance-plan,machtsinn}` source files have been ingested as **300 episodes under owner `ardin-v214test`** (isolated namespace; your production `ardin` data is untouched). Nomic embeddings, no fact extraction (the extractor had a zombie-process bug last night — root cause identified, fix deferred).
-
-Run `bun scripts/v214-test-query.ts --owner ardin-v214test` to query interactively. See `/tmp/MORNING-TEST-PROTOCOL.md` for the test plan, suggested questions, and what to evaluate.
-
-## PAI status
-
-**Fully disabled. Three things newly stopped overnight:**
-- `com.pai.voice-server` launchd agent — unloaded + plist renamed `.pai-disabled-20260518`
-- `~/.claude/hooks/` directory (25 PAI `.hook.ts` files on disk) — renamed `.pai-disabled-20260518`
-- Stale `claude`/`bun` processes from earlier extraction attempts — killed
-
-Still cleanly disabled (re-verified):
-- `~/.claude/CLAUDE.md` (renamed `.pai-disabled-20260517` earlier)
-- `settings.json` hooks → only mema lifecycle (`start.sh`/`stop.sh`)
-- `.zshrc` PAI alias commented out
-
-Still on disk but inert (no hooks point at them): `~/.claude/PAI/`, `PAI-Install/`, `MEMORY/`, `VoiceServer/`. Safe to delete later if you want cosmetic cleanup.
-
-## Known issues to clean up when convenient
-
-1. **`bench/bench-utils.ts callClaudeCLI` watchdog leak** — the timer kills the proc but doesn't reliably reap zombie child processes. The 18-min "hang" we saw was a stale `claude` PID 14798 from an earlier extraction call. One-hour fix: ensure `proc.kill()` is followed by an awaited `proc.exited` with hard timeout, then drop a follow-up `kill -9` if still alive. Add a regression test.
-
-2. **scripts/start.sh** doesn't set the test-mode env vars (MEMA_BENCH_ALLOW_OWNER_OVERRIDE etc.) — that's correct for production safety, but means when SessionStart fires and the port is free, mema restarts in production mode. For your overnight ingestion to keep working, the manual `nohup env VARS bun src/index.ts` incantation in `/tmp/MORNING-TEST-PROTOCOL.md` is what to use.
-
-3. **memory-packet knowledge-update at 60% in v2.14.0** — same as v2.13b. Supersession likely fires but n=5/category can't measure it. Will be the actual test on MemoryAgentBench/FactConsolidation when we plug the adapter in.
-
-## Three open items waiting for your call (tomorrow's decisions)
-
-1. **MemoryAgentBench integration kickoff** — adapter is ready at `/tmp/MemoryAgentBench/methods/mema/`. Plug into their `agent.py`, run on FactConsolidation specifically (current SOTA HippoRAG-v2 29.5%; mema target 50%+). Time: 3-5 hours setup + LLM-judge run.
-
-2. **v2.14.1 `/v2/observe` extraction-mandatory implementation** — design doc at `/tmp/v2.14.1-observe-extraction-mandatory-DESIGN.md`. Codex-quality spec. 6-10 hours to implement + test. Required for the "determinism principle" architectural commitment.
-
-3. **First Jungbunzlauer discovery meeting prep** — you have warm intros to Head of IT + Head of Data. The "land narrow on one workflow" play needs a 30-min discovery call. Could draft questions + collateral.
-
-## Files you should look at in priority order
-
-1. `/tmp/MORNING-TEST-PROTOCOL.md` — RUN THIS FIRST (the qualitative test on your real data)
-2. `/tmp/OVERNIGHT-REPORT.md` — chronological story of what happened while you slept
-3. `/tmp/v2.13-strategy.md` — strategic plan with Codex's audited corrections
-4. `/tmp/memory-systems-landscape.md` — full 2026 competitive map with sources
-5. `/tmp/memoryagentbench-integration-plan.md` — the flagship-bench plan
-6. `/tmp/v2.14.1-observe-extraction-mandatory-DESIGN.md` — next implementation spec
-7. `/tmp/mema_bench_spec.md` — NeurIPS-grade hallucination/abstention benchmark spec (Codex gpt-5.5)
-8. `/tmp/v2.14.x-summary.md` — concise commit-by-commit log of the v2.14 cycle
+1. Don't run benches with `Extract: no` and report the numbers. They measure mema-as-RAG, not the full architecture. Ardin will (rightly) call this out.
+2. Don't claim "full 7-layer cascade" when only 4 layers actively fire. Episode + Facts + Entities + Supersession (via `recordFactWithSupersession`) + Audit (passive) on `/v2/observe`. Cognitive (3) and UAL Assets (7) require explicit triggers. Retrieval (5) is passive.
+3. Don't kill mema with broad `pkill -f bun.*src/index` while a bench is running — narrow the pattern.
+4. Don't trust Ollama's few-shot extraction output without spot-checking against source content.

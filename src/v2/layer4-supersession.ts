@@ -30,6 +30,46 @@
 
 import type { SemanticFact } from "./types";
 
+// Supersession policy (v2.14.3+ — codex review):
+//
+// The v2.14.0 default was "supersede every (subject, predicate)" which
+// silently destroyed corpora using lists (contains/lacks/supports/...).
+// Allow-listing multi-valued predicates was whack-a-mole (real extractor
+// output includes "monthly_contributions_to", "tests_code",
+// "entry_price_at", etc. that we'd have to constantly add).
+//
+// Inverted policy: DEFAULT to ADD. Only a small set of canonical
+// FUNCTIONAL predicates supersede — those where a subject can only
+// have ONE current object semantically (employment, residence, marital
+// status, current ownership). Everything else accumulates.
+//
+// This loses some legitimate updates (e.g. "X is_now version 2" doesn't
+// invalidate "X is_now version 1") in favor of never losing source
+// information. Down-stream retrieval already ranks by recency via
+// last_seen, so accumulated facts surface in correct order.
+const FUNCTIONAL_PREDICATES = new Set<string>([
+  "works_at",
+  "employed_by",
+  "employed_at",
+  "works_for",
+  "lives_in",
+  "lives_at",
+  "located_at",
+  "based_in",
+  "married_to",
+  "reports_to",
+  "managed_by",
+  "ceo_of",
+  "current_status",
+  "current_version",
+  "current_owner",
+  "owns",        // X owns Y is sometimes multi-valued but usually replacement
+]);
+
+function isFunctional(predicate: string): boolean {
+  return FUNCTIONAL_PREDICATES.has(predicate.trim().toLowerCase());
+}
+
 /**
  * The decision a new fact triggers given the current state of same-
  * (subject, predicate) facts in the owner's vault.
@@ -92,7 +132,16 @@ export function classifyOnWrite(
     return { kind: "NONE", reason: "stale" };
   }
 
-  // 3. Update — different object, OLDER event than the new fact, still
+  // 3. Functional-predicate gate. Only supersede when the predicate is in
+  //    the FUNCTIONAL_PREDICATES allow-list (employment, residence, current
+  //    status, etc.). For everything else, accumulate — multi-valued by
+  //    default. Loses some legitimate version replacements; prevents the
+  //    "13 facts deleted from one document" failure mode from codex review.
+  if (!isFunctional(newFact.predicate)) {
+    return { kind: "ADD", reason: "non_functional_predicate" };
+  }
+
+  // 4. Update — different object, OLDER event than the new fact, still
   //    current. These get superseded by the new fact.
   //
   // v2.14.1: compare FULL ISO timestamps, not just YYYY-MM-DD. Earlier

@@ -284,7 +284,13 @@ export type AuditOp =
   | "ERASE"             // L4 hard erasure
   | "PROPOSE"           // L2 draft fact/entity proposed by extractor (v2.7+)
   | "APPROVE"           // L2 draft promoted to approved (v2.7+)
-  | "REJECT";           // L2 draft rejected (v2.7+)
+  | "REJECT"            // L2 draft rejected (v2.7+)
+  // L7 UAL asset ops (v2.14.3+ — restores invariant #5: every mutation audited).
+  // Previously layer7-assets.ts mutated frontmatter (ual, hashes, anchor_targets,
+  // verification_status) without an audit row, breaking tamper-evidence.
+  | "WRAP"              // L7 record wrapped as asset (UAL minted, hashes computed)
+  | "ANCHOR"            // L7 asset anchored to a target (local/customer-audit/origintrail)
+  | "VERIFY";           // L7 verification status changed (unverified/verified/anchored)
 
 export interface AuditEntry {
   seq: number;
