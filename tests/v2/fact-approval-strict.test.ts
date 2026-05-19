@@ -50,6 +50,7 @@ describe("v2.9.0 fail-closed fact approval", () => {
     const app = buildApi({ vaultRoot: vault, apiKeys: KEYS });
     const ep = await jsonReq(app, "POST", "/v2/observe", {
       kind: "document", content: "Marcel manages Azure infrastructure.", source: "t",
+      skip_extraction: true,
     });
     expect(ep.status).toBe(200);
     const epId = ep.data.episode.id;
@@ -105,7 +106,7 @@ describe("v2.9.0 fail-closed fact approval", () => {
     const app = buildApi({ vaultRoot: vault, apiKeys: KEYS });
     const ep = await jsonReq(app, "POST", "/v2/observe", {
       kind: "document", content: "An unrelated paragraph about something else.",
-      source: "t",
+      source: "t", skip_extraction: true,
     });
     const fact = await jsonReq(app, "POST", "/v2/fact", {
       subject: "Marcel", predicate: "manages", object: "Azure",

@@ -14,6 +14,7 @@ import {
   resolveEntity,
 } from "./layer2-entities";
 import { findEpisode } from "./layer1-episodic";
+import { pickExtractor } from "./llm-extractor";
 import {
   recordCognitive, supersedeBelief, addDerivedFrom,
   approveCognitive, rejectCognitive, listDraftCognitive, pathForCognitive,
@@ -244,18 +245,102 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   initAnchorStore(cfg.vaultRoot);
 
   // ── Layer 1: Episodic ────────────────────────────────────────────
+  // v2.14.1+ — extraction-mandatory by default. The whole point of mema is
+  // the 7-layer architecture; ingesting raw episodes without firing layers 2
+  // (facts), 2.5 (entities), and 4 (supersession via recordFactWithSupersession)
+  // means none of the architectural guarantees engage. Determinism principle:
+  // every layer always fires, every operation explicit, every failure visible.
+  //
+  // Opt-out (`skip_extraction: true`) exists for explicit episode-only
+  // benchmarks (e.g. measuring raw retrieval recall). NOT for production.
+  // To be deprecated in v2.14.4.
   app.post("/v2/observe", async c => {
     const parsed = await parseBody<{
       kind: "conversation" | "document" | "tool_call" | "observation";
       content: string;
       source?: string;
       refs?: string[];
+      skip_extraction?: boolean;
     }>(c);
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
     const ep = observe(cfg.vaultRoot, { ...parsed.body, actor, owner });
-    return c.json({ episode: ep });
+
+    if (parsed.body.skip_extraction === true) {
+      return c.json({ episode: ep, extraction_status: "skipped" });
+    }
+
+    let extractionStatus: "complete" | "failed" | "pending_retry" = "pending_retry";
+    let factCount = 0;
+    let entityCount = 0;
+    let extractionError: string | undefined;
+    const rejectedFacts: Array<{ reason: string }> = [];
+
+    try {
+      const extractor = await pickExtractor();
+      const result = await extractor.extract(parsed.body.content);
+
+      // Each fact goes through recordFactWithSupersession (v2.14.0+). Same
+      // contract as /v2/fact — exact-match supersession on (subject, predicate),
+      // duplicate detection on (subject, predicate, object). Stale rejects
+      // visible via rejectedFacts[].
+      for (const f of result.facts) {
+        try {
+          const w = recordFactWithSupersession(cfg.vaultRoot, {
+            subject: f.subject,
+            predicate: f.predicate,
+            object: f.object,
+            confidence: f.confidence ?? 0.8,
+            derived_from: [ep.id],
+            actor,
+            owner,
+            // Server-side extraction is first-class — facts default to
+            // approved (no human-in-the-loop draft state for the auto path).
+            status: "approved",
+          });
+          if (w.written) {
+            factCount++;
+          } else {
+            rejectedFacts.push({ reason: (w.decision as any)?.reason ?? "skipped" });
+          }
+        } catch (e: any) {
+          rejectedFacts.push({ reason: String(e?.message ?? e).slice(0, 200) });
+        }
+      }
+
+      for (const ent of result.entities) {
+        try {
+          createEntity(cfg.vaultRoot, {
+            name: ent.name,
+            type: ent.type,
+            derived_from: [ep.id],
+            actor,
+            owner,
+            status: "approved",
+          });
+          entityCount++;
+        } catch {
+          // Entity create is best-effort here; collisions are normal.
+        }
+      }
+
+      extractionStatus = "complete";
+    } catch (e: any) {
+      extractionStatus = "pending_retry";
+      extractionError = String(e?.message ?? e).slice(0, 500);
+    }
+
+    return c.json({
+      episode: ep,
+      extraction_status: extractionStatus,
+      extracted: {
+        fact_count: factCount,
+        entity_count: entityCount,
+        rejected_count: rejectedFacts.length,
+        ...(extractionError ? { error: extractionError } : {}),
+      },
+    });
   });
 
   // ── Layer 2: Temporal Semantic ───────────────────────────────────

@@ -169,7 +169,29 @@ export async function callClaudeCLI(prompt: string, timeoutMs = 120000): Promise
     ], {
       stdout: "pipe",
       stderr: "pipe",
-      env: process.env,
+      // v2.14.2+ — every spawned `claude` CLI child inherits the user's
+      // ~/.claude/settings.json hooks. On Ardin's machine those include
+      // SessionStart→scripts/start.sh and SessionEnd→scripts/stop.sh which
+      // start/kill the mema dev server on $MACHTSINN_PORT (default 3001).
+      // So each bench answer/judge call to claude was running stop.sh on
+      // exit and killing the mema server mid-bench. Repro: limit>=2 with
+      // --answer-backend claude either exits 137 or fails subsequent
+      // questions with "Unable to connect" because the server was dead.
+      //
+      // Per-CLI flags that "should" fix this don't work for Ardin's auth:
+      //   --bare              skips hooks but REQUIRES ANTHROPIC_API_KEY
+      //                       (Ardin uses OAuth Max plan, no API key)
+      //   --setting-sources "" only gates SETTINGS, not HOOKS
+      //   --settings <file>   ADDS to settings, doesn't override
+      //
+      // Fix: override MACHTSINN_PORT to an unused port in the child's
+      // environment. start.sh checks lsof on that port (free), spawns a
+      // throwaway bun on the throwaway port, writes its PID to the PID
+      // file; stop.sh later kills only that throwaway bun via PID file +
+      // lsof on the same throwaway port. Real mema on 3001 is untouched.
+      // Trade-off: each call spawns/kills a short-lived bun on the throw-
+      // away port. Cheap, and contained entirely in the bench surface.
+      env: { ...process.env, MACHTSINN_PORT: "65535" },
       cwd: scratchDir,
     });
     const out = await runProcessWithTimeout(proc, timeoutMs, "callClaudeCLI");

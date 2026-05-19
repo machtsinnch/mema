@@ -85,6 +85,7 @@ describe("v2.9.0 fail-closed entity approval endpoint", () => {
     const app = buildApi({ vaultRoot: vault, apiKeys: KEYS });
     const ep = await req(app, "POST", "/v2/observe", {
       kind: "document", content: "Marcel runs Azure for machtsinn AG.", source: "t",
+      skip_extraction: true,
     });
     const ent = await req(app, "POST", "/v2/entity", {
       name: "Marcel", type: "person", status: "draft",
@@ -102,6 +103,7 @@ describe("v2.9.0 fail-closed entity approval endpoint", () => {
     const app = buildApi({ vaultRoot: vault, apiKeys: KEYS });
     const ep = await req(app, "POST", "/v2/observe", {
       kind: "document", content: "An unrelated paragraph.", source: "t",
+      skip_extraction: true,
     });
     const ent = await req(app, "POST", "/v2/entity", {
       name: "Marcel", type: "person", status: "draft",
@@ -119,6 +121,7 @@ describe("v2.9.0 fail-closed entity approval endpoint", () => {
     const app = buildApi({ vaultRoot: vault, apiKeys: KEYS });
     const ep = await req(app, "POST", "/v2/observe", {
       kind: "document", content: "Pricing tier is CHF 22 per month.", source: "t",
+      skip_extraction: true,
     });
     const ent = await req(app, "POST", "/v2/entity", {
       name: "CHF 22", type: "concept", status: "draft",

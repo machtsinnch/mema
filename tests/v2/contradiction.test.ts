@@ -103,7 +103,7 @@ describe("POST /v2/fact/contradictions", () => {
   test("returns the conflicting older fact", async () => {
     const vault = fresh();
     const app = buildApi({ vaultRoot: vault, apiKeys: KEYS });
-    const ep = await req(app, "POST", "/v2/observe", { kind: "document", content: "Ardin uses Node.", source: "t" });
+    const ep = await req(app, "POST", "/v2/observe", { kind: "document", content: "Ardin uses Node.", source: "t", skip_extraction: true });
     await req(app, "POST", "/v2/fact", {
       subject: "Ardin", predicate: "uses", object: "Node",
       derived_from: [ep.data.episode.id], confidence: 0.9,
@@ -122,7 +122,7 @@ describe("POST /v2/fact/:newId/approve-supersedes/:oldId", () => {
   test("approves new fact + invalidates old + audit captures both", async () => {
     const vault = fresh();
     const app = buildApi({ vaultRoot: vault, apiKeys: KEYS });
-    const ep = await req(app, "POST", "/v2/observe", { kind: "document", content: "Ardin uses Bun now (was Node).", source: "t" });
+    const ep = await req(app, "POST", "/v2/observe", { kind: "document", content: "Ardin uses Bun now (was Node).", source: "t", skip_extraction: true });
     const oldFact = await req(app, "POST", "/v2/fact", {
       subject: "Ardin", predicate: "uses", object: "Node",
       derived_from: [ep.data.episode.id], confidence: 0.9,
@@ -152,7 +152,7 @@ describe("POST /v2/fact/:newId/approve-supersedes/:oldId", () => {
   test("rejects mismatched (subject, predicate) pair (400)", async () => {
     const vault = fresh();
     const app = buildApi({ vaultRoot: vault, apiKeys: KEYS });
-    const ep = await req(app, "POST", "/v2/observe", { kind: "document", content: "test content", source: "t" });
+    const ep = await req(app, "POST", "/v2/observe", { kind: "document", content: "test content", source: "t", skip_extraction: true });
     const a = await req(app, "POST", "/v2/fact", {
       subject: "A", predicate: "p", object: "1",
       derived_from: [ep.data.episode.id], confidence: 0.9,

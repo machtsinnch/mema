@@ -92,11 +92,23 @@ export function classifyOnWrite(
     return { kind: "NONE", reason: "stale" };
   }
 
-  // 3. Update — different object, OLDER event_date than the new fact, still
+  // 3. Update — different object, OLDER event than the new fact, still
   //    current. These get superseded by the new fact.
+  //
+  // v2.14.1: compare FULL ISO timestamps, not just YYYY-MM-DD. Earlier
+  // versions sliced to date-prefix, which meant two contradicting facts
+  // ingested on the same day (e.g. "John works at Google" at 07:38:10 then
+  // "John works at Anthropic" at 07:38:21) failed to supersede — strict
+  // `<` of identical date prefixes is false. Real-world ingestion regularly
+  // gets multiple same-day updates from different documents. Full-timestamp
+  // ordering preserves last-write-wins semantics.
+  //
+  // The duplicate check (step 1) keeps date-prefix because "same day same
+  // object" really IS a duplicate semantically; only UPDATE needs precision.
+  const newTs = newFact.event_date ?? "";
   const olderDifferent = candidates.filter(f =>
     f.object?.trim().toLowerCase() !== normNewObject
-    && (f.valid_from ?? "").slice(0, 10) < normNewDate
+    && (f.valid_from ?? "") < newTs
     // The caller pre-filtered for !invalidated_at && !superseded_by, but
     // belt-and-suspenders: enforce here too.
     && !f.invalidated_at
