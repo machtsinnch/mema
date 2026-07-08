@@ -9,6 +9,10 @@
 //
 //   OpenAIExtractor   — fallback when OPENAI_API_KEY is set. gpt-4o-mini.
 //
+// v2.16.1: consensus vote keys use canonicalPredicate (see predicates.ts).
+
+import { canonicalPredicate } from "./predicates";
+//
 // All three return the SAME JSON shape:
 //   { facts: [{subject, predicate, object, confidence}],
 //     entities: [{name, type}] }
@@ -331,8 +335,12 @@ export function consensusMerge(perPass: ExtractionResult[]): ExtractionResult {
   }
   const threshold = Math.floor(ok / 2) + 1;
 
+  // v2.16.1 — vote on the CANONICAL predicate so synonym phrasings tally
+  // together ("developed"/"created"/"founded" = one candidate, 3 votes)
+  // instead of dying as 1-vote strangers. Display keeps the first surface
+  // form; only the key is normalized.
   const factKey = (f: ExtractedFact) =>
-    `${(f.subject ?? "").trim().toLowerCase()}|${(f.predicate ?? "").trim().toLowerCase()}|${(f.object ?? "").trim().toLowerCase()}`;
+    `${(f.subject ?? "").trim().toLowerCase()}|${canonicalPredicate(f.predicate ?? "")}|${(f.object ?? "").trim().toLowerCase()}`;
 
   // Tally facts: one vote per pass per triple (dupes within a pass don't
   // double-count). First surface form wins for display.

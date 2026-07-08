@@ -29,6 +29,7 @@
 // ambiguous candidates.
 
 import type { SemanticFact } from "./types";
+import { canonicalPredicate } from "./predicates";
 
 // Supersession policy (v2.14.3+ — codex review):
 //
@@ -67,7 +68,10 @@ const FUNCTIONAL_PREDICATES = new Set<string>([
 ]);
 
 function isFunctional(predicate: string): boolean {
-  return FUNCTIONAL_PREDICATES.has(predicate.trim().toLowerCase());
+  // v2.16.1 — check the canonical form too, so "works_for"/"employed_by"
+  // hit the works_at gate even if the synonym table canonicalizes them.
+  const raw = predicate.trim().toLowerCase();
+  return FUNCTIONAL_PREDICATES.has(raw) || FUNCTIONAL_PREDICATES.has(canonicalPredicate(predicate));
 }
 
 /**

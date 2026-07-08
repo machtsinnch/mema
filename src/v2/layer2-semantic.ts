@@ -17,6 +17,7 @@ import { clampConfidence, toWikilinks, slugify, recordFilename, idFromFilename }
 import { appendAudit } from "./layer6-audit";
 import { factValidAt } from "./temporal";
 import { classifyOnWrite, type SupersessionDecision } from "./layer4-supersession";
+import { canonicalPredicate } from "./predicates";
 
 export interface RecordFactInput {
   subject: string;
@@ -409,15 +410,16 @@ export function recordFactWithSupersession(
     const f = readFact(vaultRoot, input.owner, id);
     if (f) fullCandidates.push(f);
   }
-  // Also scan for same-object matches (duplicate/stale detection).
-  const sameObjMatches = readApprovedFactsByExactSubjectPredicate(
+  // Also scan by (subject, canonical predicate) for duplicate/stale detection
+  // AND (v2.16.1) synonym-predicate contradictions that findContradictions'
+  // exact-predicate match misses ("employed_by Google" vs "works_at X").
+  const canonMatches = readApprovedFactsByExactSubjectPredicate(
     vaultRoot, input.owner, input.subject, input.predicate,
-  ).filter(f =>
-    f.object?.trim().toLowerCase() === input.object?.trim().toLowerCase()
-    && !f.invalidated_at && !f.superseded_by
-  );
-  for (const f of sameObjMatches) {
-    if (!candidateIds.has(f.id)) fullCandidates.push(f);
+  ).filter(f => !f.invalidated_at && !f.superseded_by);
+  for (const f of canonMatches) {
+    if (!candidateIds.has(f.id) && !fullCandidates.some(c => c.id === f.id)) {
+      fullCandidates.push(f);
+    }
   }
 
   // v2.15.1 — entity-linked candidates. Exact string matching misses facts
@@ -504,7 +506,9 @@ function readApprovedFactsBySubjectEntity(
   const dir = join(vaultRoot, "facts", owner);
   if (!existsSync(dir)) return [];
   const out: SemanticFact[] = [];
-  const pred = predicate.trim().toLowerCase();
+  // v2.16.1 — canonical predicate match, so "employed_by" facts are found
+  // when a "works_at" fact arrives about the same entity.
+  const pred = canonicalPredicate(predicate);
   for (const f of readdirSync(dir)) {
     if (!f.endsWith(".md")) continue;
     try {
@@ -512,7 +516,7 @@ function readApprovedFactsBySubjectEntity(
       const fact = parsed.data as SemanticFact;
       if ((fact.status ?? "approved") !== "approved") continue;
       if (fact.subject_entity_id !== subjectEntityId) continue;
-      if (fact.predicate?.trim().toLowerCase() !== pred) continue;
+      if (canonicalPredicate(fact.predicate ?? "") !== pred) continue;
       out.push(fact);
     } catch { /* skip malformed */ }
   }
@@ -529,7 +533,9 @@ function readApprovedFactsByExactSubjectPredicate(
   if (!existsSync(dir)) return [];
   const out: SemanticFact[] = [];
   const subj = subject.trim().toLowerCase();
-  const pred = predicate.trim().toLowerCase();
+  // v2.16.1 — canonical predicate match (synonym phrasings are the same
+  // relation for duplicate/stale/supersession purposes).
+  const pred = canonicalPredicate(predicate);
   for (const f of readdirSync(dir)) {
     if (!f.endsWith(".md")) continue;
     try {
@@ -537,7 +543,7 @@ function readApprovedFactsByExactSubjectPredicate(
       const fact = parsed.data as SemanticFact;
       if ((fact.status ?? "approved") !== "approved") continue;
       if (fact.subject?.trim().toLowerCase() !== subj) continue;
-      if (fact.predicate?.trim().toLowerCase() !== pred) continue;
+      if (canonicalPredicate(fact.predicate ?? "") !== pred) continue;
       out.push(fact);
     } catch { /* skip malformed */ }
   }
