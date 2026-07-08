@@ -28,6 +28,10 @@ export interface RecordFactInput {
   confidence?: number;
   actor: string;
   owner: string;
+  // v2.15.1 — fact↔entity links, resolved by the caller (observe path uses
+  // exact name/alias match against the owner's entity records).
+  subject_entity_id?: string | null;
+  object_entity_id?: string | null;
   // v2.7+ acceptance lifecycle. Omitting status defaults to "approved" so
   // existing direct-API callers keep their current semantics. LLM extractors
   // and other untrusted producers should pass "draft" + evidence_excerpt.
@@ -53,6 +57,8 @@ export function recordFact(vaultRoot: string, input: RecordFactInput): SemanticF
     confidence: clampConfidence(input.confidence ?? 0.8),
     owner: input.owner,
     status,
+    ...(input.subject_entity_id ? { subject_entity_id: input.subject_entity_id } : {}),
+    ...(input.object_entity_id ? { object_entity_id: input.object_entity_id } : {}),
     ...(input.evidence_excerpt ? { evidence_excerpt: input.evidence_excerpt.slice(0, 500) } : {}),
     ...(input.proposed_by ? { proposed_by: input.proposed_by, proposed_at: now } : {}),
   };
@@ -60,12 +66,16 @@ export function recordFact(vaultRoot: string, input: RecordFactInput): SemanticF
   const dir = join(vaultRoot, "facts", input.owner);
   mkdirSync(dir, { recursive: true });
   const body = `# ${fact.subject} ${fact.predicate} ${fact.object}\n\nFact derived from ${fact.derived_from.length} episode(s).`;
-  // Obsidian graph: wikilinks for every supporting episode + supersession edge.
+  // Obsidian graph: wikilinks for every supporting episode + supersession edge
+  // + (v2.15.1) the subject/object entity records, so facts and entities are
+  // connected in the graph view instead of floating as separate islands.
   // toWikilinks validates and dedupes — caller errors (dup IDs in derived_from)
   // don't propagate to disk.
   const links = toWikilinks([
     ...fact.derived_from,
     ...(fact.superseded_by ? [fact.superseded_by] : []),
+    ...(fact.subject_entity_id ? [fact.subject_entity_id] : []),
+    ...(fact.object_entity_id ? [fact.object_entity_id] : []),
   ]);
   // Readable filename: `{subject}-{predicate}-{object}--{ulid}.md`
   const slug = slugify(`${fact.subject}-${fact.predicate}-${fact.object}`, "fact");
@@ -83,6 +93,8 @@ export function recordFact(vaultRoot: string, input: RecordFactInput): SemanticF
     confidence: fact.confidence,
     owner: fact.owner,
     status: fact.status,
+    ...(fact.subject_entity_id ? { subject_entity_id: fact.subject_entity_id } : {}),
+    ...(fact.object_entity_id ? { object_entity_id: fact.object_entity_id } : {}),
     ...(fact.evidence_excerpt ? { evidence_excerpt: fact.evidence_excerpt } : {}),
     ...(fact.proposed_by ? { proposed_by: fact.proposed_by, proposed_at: fact.proposed_at } : {}),
     links,
@@ -408,6 +420,22 @@ export function recordFactWithSupersession(
     if (!candidateIds.has(f.id)) fullCandidates.push(f);
   }
 
+  // v2.15.1 — entity-linked candidates. Exact string matching misses facts
+  // about the same real-world entity under a different surface string
+  // ("Marcel" vs "Marcel Schmidt"). When the new fact carries a resolved
+  // subject_entity_id, also gather approved current facts with the SAME
+  // predicate whose subject resolved to the SAME entity — those are equally
+  // valid supersession/duplicate candidates.
+  if (input.subject_entity_id) {
+    for (const f of readApprovedFactsBySubjectEntity(
+      vaultRoot, input.owner, input.subject_entity_id, input.predicate,
+    )) {
+      if (f.invalidated_at || f.superseded_by) continue;
+      if (candidateIds.has(f.id) || fullCandidates.some(c => c.id === f.id)) continue;
+      fullCandidates.push(f);
+    }
+  }
+
   // 2. Classify (pure function — fully testable).
   const decision = classifyOnWrite(
     {
@@ -465,6 +493,32 @@ export function recordFactWithSupersession(
  *  with exact (subject, predicate, owner) match. Used by
  *  recordFactWithSupersession to detect duplicates that findContradictions
  *  filters out (because findContradictions looks for DIFFERENT objects). */
+// v2.15.1 — same scan, keyed on the resolved subject entity instead of the
+// surface string. Lets supersession see through aliases.
+function readApprovedFactsBySubjectEntity(
+  vaultRoot: string,
+  owner: string,
+  subjectEntityId: string,
+  predicate: string,
+): SemanticFact[] {
+  const dir = join(vaultRoot, "facts", owner);
+  if (!existsSync(dir)) return [];
+  const out: SemanticFact[] = [];
+  const pred = predicate.trim().toLowerCase();
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith(".md")) continue;
+    try {
+      const parsed = matter(readFileSync(join(dir, f), "utf8"));
+      const fact = parsed.data as SemanticFact;
+      if ((fact.status ?? "approved") !== "approved") continue;
+      if (fact.subject_entity_id !== subjectEntityId) continue;
+      if (fact.predicate?.trim().toLowerCase() !== pred) continue;
+      out.push(fact);
+    } catch { /* skip malformed */ }
+  }
+  return out;
+}
+
 function readApprovedFactsByExactSubjectPredicate(
   vaultRoot: string,
   owner: string,

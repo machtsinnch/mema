@@ -24,6 +24,10 @@ export const factBody = z.object({
   subject: z.string(),
   predicate: z.string(),
   object: z.string(),
+  // v2.15.1 — optional fact↔entity links (the observe path resolves these
+  // automatically; direct callers may pass known entity IDs).
+  subject_entity_id: z.string().nullable().optional(),
+  object_entity_id: z.string().nullable().optional(),
   valid_from: z.string().optional(),
   valid_to: z.string().nullable().optional(),
   derived_from: z.array(z.string()),

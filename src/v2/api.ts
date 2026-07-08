@@ -309,9 +309,45 @@ export function mountV2(app: Hono, cfg: V2Config): void {
       const result = await extractor.extract(parsed.body.content);
       chunkStats = result.chunk_stats;
 
+      // v2.15.1 — entities are written FIRST so facts can link to them.
+      // createEntity dedupes per-vault by (name-or-alias, type) and returns
+      // the canonical record, so the map below always points at the real ID.
+      const entityIdByRef = new Map<string, string | null>();
+      for (const ent of result.entities) {
+        try {
+          const e = createEntity(cfg.vaultRoot, {
+            name: ent.name,
+            type: ent.type,
+            derived_from: [ep.id],
+            actor,
+            owner,
+            status: "approved",
+          });
+          entityCount++;
+          entityIdByRef.set(e.name.toLowerCase().trim(), e.id);
+          for (const a of e.aliases ?? []) entityIdByRef.set(a.toLowerCase().trim(), e.id);
+        } catch {
+          // Entity create is best-effort; collisions are normal.
+        }
+      }
+      // Resolve a fact's subject/object string to an entity ID. Exact
+      // name/alias match ONLY (case-insensitive) — a wrong link is worse
+      // than no link, so no fuzzy matching at write time. Falls back to a
+      // vault scan for entities created by EARLIER ingests; misses are
+      // cached so each unique string is scanned at most once per request.
+      const resolveRef = (s: string): string | null => {
+        const key = (s ?? "").toLowerCase().trim();
+        if (!key) return null;
+        if (entityIdByRef.has(key)) return entityIdByRef.get(key) ?? null;
+        const found = findEntityByName(cfg.vaultRoot, owner, s);
+        entityIdByRef.set(key, found?.id ?? null);
+        return found?.id ?? null;
+      };
+
       // Each fact goes through recordFactWithSupersession (v2.14.0+). Same
       // contract as /v2/fact — exact-match supersession on (subject, predicate),
-      // duplicate detection on (subject, predicate, object). Stale rejects
+      // duplicate detection on (subject, predicate, object), plus (v2.15.1)
+      // entity-linked candidate matching via subject_entity_id. Stale rejects
       // visible via rejectedFacts[].
       for (const f of result.facts) {
         try {
@@ -320,10 +356,14 @@ export function mountV2(app: Hono, cfg: V2Config): void {
           // bi-temporal ordering and supersession follow reality. No date
           // extracted → recordFact falls back to now() as before.
           const eventDate = sanitizeEventDate(f.event_date);
+          const subjectEntityId = resolveRef(f.subject);
+          const objectEntityId = resolveRef(f.object);
           const w = recordFactWithSupersession(cfg.vaultRoot, {
             subject: f.subject,
             predicate: f.predicate,
             object: f.object,
+            ...(subjectEntityId ? { subject_entity_id: subjectEntityId } : {}),
+            ...(objectEntityId ? { object_entity_id: objectEntityId } : {}),
             ...(eventDate ? { valid_from: eventDate } : {}),
             confidence: f.confidence ?? 0.8,
             derived_from: [ep.id],
@@ -340,22 +380,6 @@ export function mountV2(app: Hono, cfg: V2Config): void {
           }
         } catch (e: any) {
           rejectedFacts.push({ reason: String(e?.message ?? e).slice(0, 200) });
-        }
-      }
-
-      for (const ent of result.entities) {
-        try {
-          createEntity(cfg.vaultRoot, {
-            name: ent.name,
-            type: ent.type,
-            derived_from: [ep.id],
-            actor,
-            owner,
-            status: "approved",
-          });
-          entityCount++;
-        } catch {
-          // Entity create is best-effort here; collisions are normal.
         }
       }
 

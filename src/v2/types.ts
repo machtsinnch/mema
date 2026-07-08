@@ -110,9 +110,18 @@ export type RecordStatus = "draft" | "approved" | "rejected";
 
 export interface SemanticFact {
   id: string;
-  subject: string;             // entity ID or string
+  subject: string;             // display string, verbatim from the source
   predicate: string;           // e.g., "lives_in", "founded", "rejected"
-  object: string;              // entity ID or literal value
+  object: string;              // display string or literal value
+  // v2.15.1 — the fact↔entity link (implements the "entity ID or string"
+  // promise that was previously only a comment). Resolved at write time
+  // against the owner's entity records by exact name/alias match; null when
+  // the subject/object is a literal or no entity record exists. Supersession
+  // matches through subject_entity_id, so facts about "Marcel" and
+  // "Marcel Schmidt" (same entity, different surface strings) can supersede
+  // each other.
+  subject_entity_id?: string | null;
+  object_entity_id?: string | null;
   valid_from: string;          // when the fact became true in the world
   valid_to?: string | null;    // when the fact stops being true (open if null)
   invalidated_at?: string | null;  // when we learned it was wrong (epistemic)
