@@ -27,6 +27,11 @@ export interface ExtractedFact {
   // does not state or clearly imply one. Callers pass this as valid_from so
   // bi-temporal ordering follows world time, not ingestion time.
   event_date?: string | null;
+  // v2.16.0 — consensus metadata: how many of the successful extraction
+  // passes emitted this triple, out of how many. Written into the fact's
+  // proposed_by provenance by /v2/observe.
+  votes?: number;
+  passes?: number;
 }
 export interface ExtractedEntity {
   name: string;
@@ -303,6 +308,111 @@ export function mergeExtractionResults(results: ExtractionResult[]): ExtractionR
   return { facts, entities };
 }
 
+// ── Consensus extraction (v2.16.0) ──────────────────────────────────
+//
+// The LLM gate is the ONE nondeterministic step in the L1→L2 transition:
+// the same chunk yielded 4 facts on one run and 25 on the next. mema's
+// determinism principle applies to everything after the gate — so the gate
+// itself gets stabilized by majority vote: N parallel passes per chunk,
+// and only triples a majority of successful passes agree on survive.
+//
+// Threshold = majority of SUCCESSFUL passes (3→2, 2→2, 1→1), so a single
+// flaky CLI call cannot zero a document. Deterministic given the pass
+// outputs: keys are normalized, ties resolve by first appearance.
+export function consensusMerge(perPass: ExtractionResult[]): ExtractionResult {
+  const ok = perPass.length;
+  if (ok === 0) return { facts: [], entities: [] };
+  if (ok === 1) {
+    // No vote possible — annotate and pass through.
+    return {
+      facts: perPass[0].facts.map(f => ({ ...f, votes: 1, passes: 1 })),
+      entities: perPass[0].entities,
+    };
+  }
+  const threshold = Math.floor(ok / 2) + 1;
+
+  const factKey = (f: ExtractedFact) =>
+    `${(f.subject ?? "").trim().toLowerCase()}|${(f.predicate ?? "").trim().toLowerCase()}|${(f.object ?? "").trim().toLowerCase()}`;
+
+  // Tally facts: one vote per pass per triple (dupes within a pass don't
+  // double-count). First surface form wins for display.
+  const factTally = new Map<string, {
+    first: ExtractedFact; votes: number; confidences: number[]; dates: (string | null)[];
+  }>();
+  for (const pass of perPass) {
+    const seenThisPass = new Set<string>();
+    for (const f of pass.facts ?? []) {
+      const k = factKey(f);
+      if (seenThisPass.has(k)) continue;
+      seenThisPass.add(k);
+      const entry = factTally.get(k);
+      if (entry) {
+        entry.votes++;
+        entry.confidences.push(f.confidence ?? 0.8);
+        entry.dates.push(sanitizeEventDate(f.event_date));
+      } else {
+        factTally.set(k, {
+          first: f, votes: 1,
+          confidences: [f.confidence ?? 0.8],
+          dates: [sanitizeEventDate(f.event_date)],
+        });
+      }
+    }
+  }
+
+  const facts: ExtractedFact[] = [];
+  for (const { first, votes, confidences, dates } of factTally.values()) {
+    if (votes < threshold) continue;
+    // event_date must ITSELF win a majority — "never invent" extends to
+    // dates: a date one pass hallucinated onto an agreed triple is dropped.
+    const dateCounts = new Map<string, number>();
+    for (const d of dates) if (d) dateCounts.set(d, (dateCounts.get(d) ?? 0) + 1);
+    let eventDate: string | null = null;
+    for (const [d, n] of dateCounts) {
+      if (n >= threshold && (eventDate === null || n > (dateCounts.get(eventDate) ?? 0))) {
+        eventDate = d;
+      }
+    }
+    facts.push({
+      ...first,
+      confidence: confidences.reduce((a, b) => a + b, 0) / confidences.length,
+      event_date: eventDate,
+      votes,
+      passes: ok,
+    });
+  }
+
+  // Entities: same majority rule, PLUS a rescue — an entity referenced as
+  // subject/object by a surviving fact is kept even below threshold, so a
+  // winning fact never loses its link target.
+  const entKey = (e: ExtractedEntity) =>
+    `${(e.name ?? "").trim().toLowerCase()}|${(e.type ?? "").trim().toLowerCase()}`;
+  const entTally = new Map<string, { first: ExtractedEntity; votes: number }>();
+  for (const pass of perPass) {
+    const seenThisPass = new Set<string>();
+    for (const e of pass.entities ?? []) {
+      const k = entKey(e);
+      if (seenThisPass.has(k)) continue;
+      seenThisPass.add(k);
+      const entry = entTally.get(k);
+      if (entry) entry.votes++;
+      else entTally.set(k, { first: e, votes: 1 });
+    }
+  }
+  const referencedNames = new Set<string>();
+  for (const f of facts) {
+    referencedNames.add((f.subject ?? "").trim().toLowerCase());
+    referencedNames.add((f.object ?? "").trim().toLowerCase());
+  }
+  const entities: ExtractedEntity[] = [];
+  for (const { first, votes } of entTally.values()) {
+    const name = (first.name ?? "").trim().toLowerCase();
+    if (votes >= threshold || referencedNames.has(name)) entities.push(first);
+  }
+
+  return { facts, entities };
+}
+
 // Bounded-concurrency map. Unbounded parallel `claude` subprocesses risk OAuth
 // quota throttling + resource spikes; cap to `limit` in flight. Preserves
 // input order in the output array.
@@ -444,12 +554,16 @@ export class ClaudeCLIExtractor implements LLMExtractor {
   // are env-overridable for tuning without a redeploy.
   private chunkChars: number;
   private concurrency: number;
+  private consensusPasses: number;
   // 600 KB ≈ 150k tokens — full episodes (walk caps source files at 200 KB)
   // fit comfortably; the bound only guards against pathological input and
   // macOS ARG_MAX when the text is passed as a CLI argument.
   private static readonly MAX_CHARS = 600_000;
-  constructor(opts: { model?: string; timeoutMs?: number; chunkChars?: number; concurrency?: number } = {}) {
+  constructor(opts: { model?: string; timeoutMs?: number; chunkChars?: number; concurrency?: number; consensusPasses?: number } = {}) {
     this.model = opts.model ?? process.env.MEMA_CLAUDE_EXTRACTOR_MODEL ?? "sonnet";
+    // v2.16.0 — number of independent extraction passes per chunk. 3 gives
+    // a real majority; 1 restores single-pass behavior (no voting).
+    this.consensusPasses = Math.max(1, opts.consensusPasses ?? Number(process.env.MEMA_EXTRACT_CONSENSUS_PASSES ?? 3));
     // v2.15.0 — defaults re-tuned from the 2026-07-08 live run: an 8,000-char
     // chunk timed out at the old 120s default even on haiku (CLI overhead
     // dominates), silently zeroing the run; 4,500-char chunks at 300s
@@ -461,36 +575,62 @@ export class ClaudeCLIExtractor implements LLMExtractor {
     this.name = `entity-extractor:${this.model}`;
   }
 
-  // v2.14.4 — chunk-then-merge. The prior single full-content call timed out
-  // at 180s / 0 facts on a 65 KB episode (CLI cold-start + dense structured
-  // output over 16k+ tokens). We still read the FULL content, but split it on
-  // text boundaries into <= chunkChars pieces, extract each in bounded
-  // parallel, then merge + dedup. Per-chunk failures are isolated so one slow
-  // chunk can't zero the whole episode. Bug A (truncation) stays closed.
+  // v2.16.0 — chunk-then-consensus-then-merge. The full content is split on
+  // text boundaries into <= chunkChars pieces; EACH chunk is extracted by
+  // `consensusPasses` independent parallel passes; only majority-agreed
+  // triples survive (see consensusMerge). Per-pass failures are isolated; a
+  // chunk counts as failed only when ALL of its passes died. Bug A
+  // (truncation) stays closed; the v2.15.1 variance finding (4 vs 25 facts
+  // from the same document) is what this stabilizes.
   async extract(text: string): Promise<ExtractionResult> {
     const capped = text.length > ClaudeCLIExtractor.MAX_CHARS
       ? text.slice(0, ClaudeCLIExtractor.MAX_CHARS)
       : text;
-    // Fast path: small episodes go in a single call, no chunking overhead.
-    if (capped.length <= this.chunkChars) return this.extractOne(capped);
-
     const chunks = chunkOnBoundaries(capped, this.chunkChars);
-    let ok = 0, failed = 0;
-    const perChunk = await mapWithConcurrency(chunks, this.concurrency, async chunk => {
-      try { const r = await this.extractOne(chunk); ok++; return r; }
-      catch { failed++; return { facts: [], entities: [] } as ExtractionResult; }
-    });
-    // Every chunk failed (CLI unavailable / all timed out) — surface it so
-    // /v2/observe records pending_retry instead of silently zero facts.
-    if (ok === 0 && failed > 0) {
-      throw new Error(`claude CLI extractor: all ${failed} chunk(s) failed`);
+    const passes = this.consensusPasses;
+
+    // Flatten chunk × pass into one bounded-concurrency job list so passes
+    // of different chunks interleave (no barrier between chunks).
+    const jobs: Array<{ ci: number; pi: number }> = [];
+    for (let ci = 0; ci < chunks.length; ci++) {
+      for (let pi = 0; pi < passes; pi++) jobs.push({ ci, pi });
     }
-    // v2.15.0 — SOME chunks failed: report it instead of masquerading as a
-    // full extraction. /v2/observe turns this into extraction_status:
-    // "partial" (the 2026-07-08 live run lost 95% of a document to a chunk
-    // timeout while reporting "complete").
-    const merged = mergeExtractionResults(perChunk);
-    merged.chunk_stats = { total: chunks.length, failed };
+    const raw = await mapWithConcurrency(jobs, this.concurrency, async job => {
+      try { return await this.extractOne(chunks[job.ci]); }
+      catch { return null; }
+    });
+
+    // Optional per-pass debug dump: MEMA_EXTRACT_DEBUG_DIR=/path writes one
+    // JSON per (chunk, pass) so "why did this fact get dropped?" is
+    // answerable after the fact.
+    const debugDir = process.env.MEMA_EXTRACT_DEBUG_DIR;
+    if (debugDir) {
+      const { mkdirSync, writeFileSync } = await import("node:fs");
+      try {
+        mkdirSync(debugDir, { recursive: true });
+        jobs.forEach((job, i) => writeFileSync(
+          `${debugDir}/chunk${job.ci}-pass${job.pi}.json`,
+          JSON.stringify(raw[i] ?? { failed: true }, null, 2),
+        ));
+      } catch { /* debug only — never fail extraction over it */ }
+    }
+
+    let failedChunks = 0;
+    const perChunkConsensus: ExtractionResult[] = [];
+    for (let ci = 0; ci < chunks.length; ci++) {
+      const okPasses = jobs
+        .map((job, i) => (job.ci === ci ? raw[i] : null))
+        .filter((r): r is ExtractionResult => r !== null);
+      if (okPasses.length === 0) { failedChunks++; continue; }
+      perChunkConsensus.push(consensusMerge(okPasses));
+    }
+    // Every chunk failed (CLI unavailable / all passes timed out) — surface
+    // it so /v2/observe records pending_retry instead of silently zero facts.
+    if (perChunkConsensus.length === 0) {
+      throw new Error(`claude CLI extractor: all ${chunks.length} chunk(s) failed (${passes} passes each)`);
+    }
+    const merged = mergeExtractionResults(perChunkConsensus);
+    merged.chunk_stats = { total: chunks.length, failed: failedChunks };
     return merged;
   }
 
