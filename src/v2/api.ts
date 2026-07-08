@@ -14,7 +14,7 @@ import {
   resolveEntity,
 } from "./layer2-entities";
 import { findEpisode } from "./layer1-episodic";
-import { pickExtractor } from "./llm-extractor";
+import { pickExtractor, sanitizeEventDate } from "./llm-extractor";
 import {
   recordCognitive, supersedeBelief, addDerivedFrom,
   approveCognitive, rejectCognitive, listDraftCognitive, pathForCognitive,
@@ -297,15 +297,17 @@ export function mountV2(app: Hono, cfg: V2Config): void {
       return c.json({ episode: ep, extraction_status: "skipped" });
     }
 
-    let extractionStatus: "complete" | "failed" | "pending_retry" = "pending_retry";
+    let extractionStatus: "complete" | "partial" | "failed" | "pending_retry" = "pending_retry";
     let factCount = 0;
     let entityCount = 0;
     let extractionError: string | undefined;
+    let chunkStats: { total: number; failed: number } | undefined;
     const rejectedFacts: Array<{ reason: string }> = [];
 
     try {
       const extractor = await pickExtractor();
       const result = await extractor.extract(parsed.body.content);
+      chunkStats = result.chunk_stats;
 
       // Each fact goes through recordFactWithSupersession (v2.14.0+). Same
       // contract as /v2/fact — exact-match supersession on (subject, predicate),
@@ -313,10 +315,16 @@ export function mountV2(app: Hono, cfg: V2Config): void {
       // visible via rejectedFacts[].
       for (const f of result.facts) {
         try {
+          // v2.15.0 (Bug B fix) — world time, not ingestion time. When the
+          // extractor found a date IN THE TEXT, it becomes valid_from, so
+          // bi-temporal ordering and supersession follow reality. No date
+          // extracted → recordFact falls back to now() as before.
+          const eventDate = sanitizeEventDate(f.event_date);
           const w = recordFactWithSupersession(cfg.vaultRoot, {
             subject: f.subject,
             predicate: f.predicate,
             object: f.object,
+            ...(eventDate ? { valid_from: eventDate } : {}),
             confidence: f.confidence ?? 0.8,
             derived_from: [ep.id],
             actor,
@@ -351,7 +359,9 @@ export function mountV2(app: Hono, cfg: V2Config): void {
         }
       }
 
-      extractionStatus = "complete";
+      // v2.15.0 — a run that lost chunks is NOT complete. "partial" tells the
+      // caller which fraction of the document actually reached L2.
+      extractionStatus = chunkStats && chunkStats.failed > 0 ? "partial" : "complete";
     } catch (e: any) {
       extractionStatus = "pending_retry";
       extractionError = String(e?.message ?? e).slice(0, 500);
@@ -364,6 +374,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
         fact_count: factCount,
         entity_count: entityCount,
         rejected_count: rejectedFacts.length,
+        ...(chunkStats ? { chunks: chunkStats } : {}),
         ...(extractionError ? { error: extractionError } : {}),
       },
     });

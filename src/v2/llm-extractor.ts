@@ -22,6 +22,11 @@ export interface ExtractedFact {
   predicate: string;
   object: string;
   confidence: number;
+  // v2.15.0 — the date the fact became true IN THE WORLD, extracted from the
+  // text itself (Bug B fix). YYYY, YYYY-MM, or YYYY-MM-DD; null when the text
+  // does not state or clearly imply one. Callers pass this as valid_from so
+  // bi-temporal ordering follows world time, not ingestion time.
+  event_date?: string | null;
 }
 export interface ExtractedEntity {
   name: string;
@@ -30,6 +35,23 @@ export interface ExtractedEntity {
 export interface ExtractionResult {
   facts: ExtractedFact[];
   entities: ExtractedEntity[];
+  // v2.15.0 — populated by chunked extraction so /v2/observe can report
+  // "partial" instead of pretending a run with dead chunks was "complete".
+  chunk_stats?: { total: number; failed: number };
+}
+
+// v2.15.0 — validate a model-supplied event_date at the boundary. Accepts
+// YYYY, YYYY-MM, or YYYY-MM-DD with a sane year; anything else (prose,
+// ISO timestamps with invented precision, years like 0001 or 9999) → null,
+// which callers treat as "no world date known" and fall back to now().
+export function sanitizeEventDate(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const v = raw.trim();
+  if (!/^\d{4}(-\d{2}(-\d{2})?)?$/.test(v)) return null;
+  const year = Number(v.slice(0, 4));
+  if (year < 1000 || year > 2100) return null;
+  if (Number.isNaN(Date.parse(v))) return null;  // rejects 2026-13, 2026-02-31
+  return v;
 }
 
 export interface LLMExtractor {
@@ -54,11 +76,12 @@ Rules:
 - Reject facts where subject or object is a currency amount ("CHF 22"), a number alone, a date alone, or a fragment ("Co-Marketing").
 - For entities, type must be one of: person | organization | product | system | place | concept | event.
 - Confidence: 0.95 for explicitly stated, 0.85 for clearly implied, ≤0.75 means don't emit.
+- event_date: the date the fact became true IN THE WORLD, as "YYYY", "YYYY-MM", or "YYYY-MM-DD" — ONLY when the text states or clearly implies it (a stated year, a dated announcement, "since 2019"). If the text gives no date for the fact, use null. NEVER invent a date, NEVER use today's date, NEVER use the document's date unless the fact is about the document itself.
 
 Output ONLY valid JSON. No prose, no markdown fences. Schema:
 {
   "facts": [
-    {"subject": "...", "predicate": "...", "object": "...", "confidence": 0.95}
+    {"subject": "...", "predicate": "...", "object": "...", "confidence": 0.95, "event_date": "YYYY-MM-DD or null"}
   ],
   "entities": [
     {"name": "...", "type": "..."}
@@ -73,13 +96,13 @@ If the document contains zero extractable facts, return {"facts": [], "entities"
 // demo when they can't extract anything substantive from the real input —
 // the defense below catches that.
 const FEW_SHOT_USER = `Text:
-PostgreSQL supports JSONB indexing. The Apache Software Foundation manages the Kafka project. Linus Torvalds founded the Linux kernel project.`;
+PostgreSQL supports JSONB indexing. The Apache Software Foundation manages the Kafka project. Linus Torvalds founded the Linux kernel project in 1991.`;
 
 const FEW_SHOT_ASSISTANT = `{
   "facts": [
-    {"subject": "PostgreSQL", "predicate": "supports", "object": "JSONB indexing", "confidence": 0.95},
-    {"subject": "Apache Software Foundation", "predicate": "manages", "object": "Kafka project", "confidence": 0.95},
-    {"subject": "Linus Torvalds", "predicate": "founded", "object": "Linux kernel project", "confidence": 0.95}
+    {"subject": "PostgreSQL", "predicate": "supports", "object": "JSONB indexing", "confidence": 0.95, "event_date": null},
+    {"subject": "Apache Software Foundation", "predicate": "manages", "object": "Kafka project", "confidence": 0.95, "event_date": null},
+    {"subject": "Linus Torvalds", "predicate": "founded", "object": "Linux kernel project", "confidence": 0.95, "event_date": "1991"}
   ],
   "entities": [
     {"name": "PostgreSQL", "type": "system"},
@@ -341,7 +364,11 @@ export class AnthropicExtractor implements LLMExtractor {
   private model: string;
   constructor(opts: { apiKey: string; model?: string }) {
     this.apiKey = opts.apiKey;
-    this.model = opts.model ?? "claude-3-5-haiku-20241022";
+    // v2.15.0 — was claude-3-5-haiku-20241022, RETIRED 2026-02-19: with an
+    // ANTHROPIC_API_KEY set, pickExtractor preferred this extractor and every
+    // extraction 404'd. claude-sonnet-5 is the current quality/cost sweet
+    // spot for structured extraction (1M context, so no truncation needed).
+    this.model = opts.model ?? "claude-sonnet-5";
     this.name = `anthropic:${this.model}`;
   }
   async extract(text: string): Promise<ExtractionResult> {
@@ -354,12 +381,14 @@ export class AnthropicExtractor implements LLMExtractor {
       },
       body: JSON.stringify({
         model: this.model,
-        max_tokens: 4000,
+        max_tokens: 8192,
         system: SYSTEM_PROMPT,
         messages: [
           { role: "user", content: FEW_SHOT_USER },
           { role: "assistant", content: FEW_SHOT_ASSISTANT },
-          { role: "user", content: `Text:\n${text.slice(0, 8000)}` },
+          // v2.15.0 — Bug A closed on the API path too: full content, capped
+          // only at the same 600 KB sanity bound as the CLI extractor.
+          { role: "user", content: `Text:\n${text.slice(0, 600_000)}` },
         ],
       }),
     });
@@ -421,11 +450,13 @@ export class ClaudeCLIExtractor implements LLMExtractor {
   private static readonly MAX_CHARS = 600_000;
   constructor(opts: { model?: string; timeoutMs?: number; chunkChars?: number; concurrency?: number } = {}) {
     this.model = opts.model ?? process.env.MEMA_CLAUDE_EXTRACTOR_MODEL ?? "sonnet";
-    // Per-CHUNK timeout. Chunks are small (<= chunkChars) so a single call
-    // finishes well under this even under parallel cold-start contention; the
-    // old 180s was sized for whole-document calls that timed out.
-    this.timeoutMs = opts.timeoutMs ?? Number(process.env.MEMA_EXTRACT_TIMEOUT_MS ?? 120000);
-    this.chunkChars = opts.chunkChars ?? Number(process.env.MEMA_EXTRACT_CHUNK_CHARS ?? 8000);
+    // v2.15.0 — defaults re-tuned from the 2026-07-08 live run: an 8,000-char
+    // chunk timed out at the old 120s default even on haiku (CLI overhead
+    // dominates), silently zeroing the run; 4,500-char chunks at 300s
+    // completed reliably (~2:53 wall for 2 parallel chunks). Both remain
+    // env-overridable.
+    this.timeoutMs = opts.timeoutMs ?? Number(process.env.MEMA_EXTRACT_TIMEOUT_MS ?? 300000);
+    this.chunkChars = opts.chunkChars ?? Number(process.env.MEMA_EXTRACT_CHUNK_CHARS ?? 4500);
     this.concurrency = opts.concurrency ?? Number(process.env.MEMA_EXTRACT_CONCURRENCY ?? 3);
     this.name = `entity-extractor:${this.model}`;
   }
@@ -454,7 +485,13 @@ export class ClaudeCLIExtractor implements LLMExtractor {
     if (ok === 0 && failed > 0) {
       throw new Error(`claude CLI extractor: all ${failed} chunk(s) failed`);
     }
-    return mergeExtractionResults(perChunk);
+    // v2.15.0 — SOME chunks failed: report it instead of masquerading as a
+    // full extraction. /v2/observe turns this into extraction_status:
+    // "partial" (the 2026-07-08 live run lost 95% of a document to a chunk
+    // timeout while reporting "complete").
+    const merged = mergeExtractionResults(perChunk);
+    merged.chunk_stats = { total: chunks.length, failed };
+    return merged;
   }
 
   // One sterilized CLI call over a single chunk, with a hard timeout.
