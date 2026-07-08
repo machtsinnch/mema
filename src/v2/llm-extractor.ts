@@ -118,6 +118,24 @@ const FEW_SHOT_ENTITY_NAMES = new Set([
   "kafka project", "linus torvalds", "linux kernel project",
 ]);
 
+// Distinctive multi-word demo phrases used for substring matching against
+// scrambled regurgitations. "postgresql" alone is too short to substring-
+// match safely, so we keep the high-signal multi-word phrases here.
+const FEW_SHOT_PHRASES = [
+  "jsonb indexing", "apache software foundation", "kafka project",
+  "linus torvalds", "linux kernel project",
+];
+
+function containsFewShotEntity(slot: string): boolean {
+  const v = slot.trim().toLowerCase();
+  if (FEW_SHOT_ENTITY_NAMES.has(v)) return true;
+  // Strip leading articles before exact-set check.
+  const stripped = v.replace(/^(the|a|an)\s+/, "");
+  if (FEW_SHOT_ENTITY_NAMES.has(stripped)) return true;
+  // Substring check for the high-signal multi-word phrases.
+  return FEW_SHOT_PHRASES.some(phrase => v.includes(phrase));
+}
+
 // v2.14.3+ entity-type whitelist (codex review). The extractor prompt says
 // types must be one of seven, but qwen2.5:7b regularly returns invented
 // types like "command", "path", "issue", "fix", "stock", "index", "pattern",
@@ -155,6 +173,15 @@ function filterFewShotLeak(r: ExtractionResult): ExtractionResult {
       const o = (f.object ?? "").toLowerCase();
       if (FEW_SHOT_TRIPLES.has(`${s}|${p}|${o}`)) return false;
       if (FEW_SHOT_PRED_OBJ.has(`${p}|${o}`)) return false;
+      // v2.14.3+: drop any fact whose subject OR object CONTAINS a few-shot
+      // entity name. Weak models scramble the demo — "ASML founded Linus
+      // Torvalds" reuses a demo subject as an object; "ardin founded the
+      // linux kernel project" wraps it in an article. Substring match (not
+      // exact) defeats both the article-prefix ("the linux kernel project")
+      // and partial-phrase variants. These tech-history terms never appear
+      // in the user's finance/business content except as regurgitation, so
+      // substring matching is safe here.
+      if (containsFewShotEntity(s) || containsFewShotEntity(o)) return false;
       // v2.14.3+: drop role-inverted facts — "Linux fully_supported by PAI"
       // patterns are nearly always model errors (real meaning: PAI supports
       // Linux, with the subject and object swapped). The retrieval scorer
@@ -191,6 +218,85 @@ function parseStrictJson(raw: string): ExtractionResult {
     facts: Array.isArray(obj.facts) ? obj.facts : [],
     entities: Array.isArray(obj.entities) ? obj.entities : [],
   });
+}
+
+// ── Chunking helpers (v2.14.4) ───────────────────────────────────────
+//
+// The full-content ClaudeCLIExtractor call timed out (180s / 0 facts) on a
+// 65 KB episode. Rather than truncate (Bug A) we split the FULL content into
+// boundary-aligned pieces, extract each, and merge. These are module-level
+// function declarations (hoisted) so the extractor below can use them.
+
+// Split text into <= maxChars pieces, preferring paragraph (blank-line) then
+// line boundaries so a fact is never severed mid-sentence. A single oversize
+// paragraph is hard-split on newlines (then on raw length) as a last resort.
+export function chunkOnBoundaries(text: string, maxChars: number): string[] {
+  if (text.length <= maxChars) return [text];
+  const paras = text.split(/\n\n+/);
+  const chunks: string[] = [];
+  let buf = "";
+  const flush = () => { if (buf.trim()) chunks.push(buf); buf = ""; };
+  for (const para of paras) {
+    if (para.length > maxChars) {
+      flush();
+      let rest = para;
+      while (rest.length > maxChars) {
+        let cut = rest.lastIndexOf("\n", maxChars);
+        if (cut <= 0) cut = maxChars;
+        chunks.push(rest.slice(0, cut));
+        rest = rest.slice(cut);
+      }
+      buf = rest;
+      continue;
+    }
+    if (buf.length + para.length + 2 > maxChars) flush();
+    buf = buf ? `${buf}\n\n${para}` : para;
+  }
+  flush();
+  return chunks;
+}
+
+// Merge per-chunk results, deduping facts by (subject|predicate|object) and
+// entities by (name|type), case-insensitively. Cross-chunk duplicates are
+// common (an entity recurs across sections); the write layer dedups too, but
+// collapsing here avoids redundant writes + audit noise. First write wins.
+export function mergeExtractionResults(results: ExtractionResult[]): ExtractionResult {
+  const facts: ExtractedFact[] = [];
+  const entities: ExtractedEntity[] = [];
+  const seenF = new Set<string>();
+  const seenE = new Set<string>();
+  for (const r of results) {
+    for (const f of r.facts ?? []) {
+      const k = `${(f.subject ?? "").toLowerCase()}|${(f.predicate ?? "").toLowerCase()}|${(f.object ?? "").toLowerCase()}`;
+      if (seenF.has(k)) continue;
+      seenF.add(k); facts.push(f);
+    }
+    for (const e of r.entities ?? []) {
+      const k = `${(e.name ?? "").toLowerCase()}|${(e.type ?? "").toLowerCase()}`;
+      if (seenE.has(k)) continue;
+      seenE.add(k); entities.push(e);
+    }
+  }
+  return { facts, entities };
+}
+
+// Bounded-concurrency map. Unbounded parallel `claude` subprocesses risk OAuth
+// quota throttling + resource spikes; cap to `limit` in flight. Preserves
+// input order in the output array.
+async function mapWithConcurrency<T, R>(
+  items: T[], limit: number, fn: (item: T, i: number) => Promise<R>,
+): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) break;
+      out[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return out;
 }
 
 // ── OllamaExtractor ──────────────────────────────────────────────────
@@ -285,24 +391,89 @@ export class AnthropicExtractor implements LLMExtractor {
 // (start.sh / stop.sh) target a throwaway port instead of the real mema
 // on 3001.
 
+// v2.14.4+ — the "entity-extractor" agent. A Claude invocation via the CLI
+// (OAuth, no API key) acting as a dedicated structured-fact extractor. The
+// defining change vs. the v2.14.2 ClaudeCLIExtractor:
+//
+//   • NO 8 KB truncation. Reads the FULL raw episode body (capped only at a
+//     600 KB / ~150k-token sanity bound, well inside the 1M context window).
+//     This closes Bug A — large episodes are now extracted in their entirety
+//     instead of just their first 8 KB.
+//   • Defaults to `sonnet` (1M-context capable, strong instruction-following
+//     so it does not regurgitate few-shot demos the way qwen2.5:7b/llama do,
+//     better Max-plan quota than opus). Override via MEMA_CLAUDE_EXTRACTOR_MODEL.
+//   • Larger timeout — full-content extraction is slower than the 8 KB path.
+//
+// The 1M context window means a single call can read an entire long document
+// episode; future batch mode (B) can feed many episodes per call.
 export class ClaudeCLIExtractor implements LLMExtractor {
   readonly name: string;
   private model: string;
   private timeoutMs: number;
-  constructor(opts: { model?: string; timeoutMs?: number } = {}) {
-    this.model = opts.model ?? process.env.MEMA_CLAUDE_EXTRACTOR_MODEL ?? "haiku";
-    this.timeoutMs = opts.timeoutMs ?? 90000;
-    this.name = `claude-cli:${this.model}`;
+  // v2.14.4 — chunking parameters. Large episodes are split into <= chunkChars
+  // pieces and extracted with bounded parallelism (see extract()). All three
+  // are env-overridable for tuning without a redeploy.
+  private chunkChars: number;
+  private concurrency: number;
+  // 600 KB ≈ 150k tokens — full episodes (walk caps source files at 200 KB)
+  // fit comfortably; the bound only guards against pathological input and
+  // macOS ARG_MAX when the text is passed as a CLI argument.
+  private static readonly MAX_CHARS = 600_000;
+  constructor(opts: { model?: string; timeoutMs?: number; chunkChars?: number; concurrency?: number } = {}) {
+    this.model = opts.model ?? process.env.MEMA_CLAUDE_EXTRACTOR_MODEL ?? "sonnet";
+    // Per-CHUNK timeout. Chunks are small (<= chunkChars) so a single call
+    // finishes well under this even under parallel cold-start contention; the
+    // old 180s was sized for whole-document calls that timed out.
+    this.timeoutMs = opts.timeoutMs ?? Number(process.env.MEMA_EXTRACT_TIMEOUT_MS ?? 120000);
+    this.chunkChars = opts.chunkChars ?? Number(process.env.MEMA_EXTRACT_CHUNK_CHARS ?? 8000);
+    this.concurrency = opts.concurrency ?? Number(process.env.MEMA_EXTRACT_CONCURRENCY ?? 3);
+    this.name = `entity-extractor:${this.model}`;
   }
+
+  // v2.14.4 — chunk-then-merge. The prior single full-content call timed out
+  // at 180s / 0 facts on a 65 KB episode (CLI cold-start + dense structured
+  // output over 16k+ tokens). We still read the FULL content, but split it on
+  // text boundaries into <= chunkChars pieces, extract each in bounded
+  // parallel, then merge + dedup. Per-chunk failures are isolated so one slow
+  // chunk can't zero the whole episode. Bug A (truncation) stays closed.
   async extract(text: string): Promise<ExtractionResult> {
+    const capped = text.length > ClaudeCLIExtractor.MAX_CHARS
+      ? text.slice(0, ClaudeCLIExtractor.MAX_CHARS)
+      : text;
+    // Fast path: small episodes go in a single call, no chunking overhead.
+    if (capped.length <= this.chunkChars) return this.extractOne(capped);
+
+    const chunks = chunkOnBoundaries(capped, this.chunkChars);
+    let ok = 0, failed = 0;
+    const perChunk = await mapWithConcurrency(chunks, this.concurrency, async chunk => {
+      try { const r = await this.extractOne(chunk); ok++; return r; }
+      catch { failed++; return { facts: [], entities: [] } as ExtractionResult; }
+    });
+    // Every chunk failed (CLI unavailable / all timed out) — surface it so
+    // /v2/observe records pending_retry instead of silently zero facts.
+    if (ok === 0 && failed > 0) {
+      throw new Error(`claude CLI extractor: all ${failed} chunk(s) failed`);
+    }
+    return mergeExtractionResults(perChunk);
+  }
+
+  // One sterilized CLI call over a single chunk, with a hard timeout.
+  private async extractOne(text: string): Promise<ExtractionResult> {
     const userPrompt =
-      `${FEW_SHOT_USER}\n\n${FEW_SHOT_ASSISTANT}\n\nNow extract from this text:\n${text.slice(0, 8000)}`;
+      `${FEW_SHOT_USER}\n\n${FEW_SHOT_ASSISTANT}\n\nNow extract from this text:\n${text}`;
     const proc = Bun.spawn([
       "claude",
       "--model", this.model,
       "--no-session-persistence",
       "--disable-slash-commands",
       "--allowedTools", "",
+      // v2.14.4 — kill per-call startup overhead. Measured ~50s of fixed
+      // latency per invocation was the CLI loading MCP servers + settings +
+      // hooks. --strict-mcp-config (with no --mcp-config) loads ZERO MCP
+      // servers; --setting-sources "" skips CLAUDE.md/skills/plugins/hooks/
+      // MCP settings. MACHTSINN_PORT below still guards hooks belt-and-suspenders.
+      "--strict-mcp-config",
+      "--setting-sources", "",
       "--system-prompt", SYSTEM_PROMPT,
       "-p", userPrompt,
     ], {

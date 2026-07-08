@@ -37,6 +37,11 @@ interface Args {
   api: string;
   key: string;
   limit: number | null;
+  /** v2.14.3+ — 1-indexed resume point. --start 53 skips the first 52
+   *  files (which already ingested) and begins at file 53. Relies on the
+   *  walk order being deterministic for an unchanged source tree, which
+   *  it is on APFS. */
+  start: number | null;
   dryRun: boolean;
   /** v2.14.0+ — skip the LLM extractor entirely; observe-only ingestion.
    *  Used overnight 2026-05-17→18 when the bench-utils callClaudeCLI was
@@ -111,6 +116,7 @@ function parseArgs(): Args {
     api: String(flags.api ?? "http://localhost:3001"),
     key: String(flags.key ?? "dev-ardin"),
     limit: flags.limit ? parseInt(flags.limit, 10) : null,
+    start: flags.start ? parseInt(flags.start, 10) : null,
     dryRun: !!flags["dry-run"],
     skipExtract: !!flags["skip-extract"],
   };
@@ -172,7 +178,10 @@ async function main() {
 
   const files = walk(args.source);
   console.log(`Found ${files.length} .md files (after filters)\n`);
-  const slice = args.limit ? files.slice(0, args.limit) : files;
+  const startIdx = args.start ? args.start - 1 : 0;
+  let slice = files.slice(startIdx);
+  if (args.limit) slice = slice.slice(0, args.limit);
+  if (args.start) console.log(`Resuming at file ${args.start} (skipping first ${startIdx})\n`);
 
   let episodesCreated = 0;
   let factsCreated = 0;
@@ -188,7 +197,7 @@ async function main() {
     const body = readFileSync(f, "utf8");
     const observationDate = new Date().toISOString().slice(0, 10);
     const relName = f.replace(args.source + "/", "");
-    process.stdout.write(`[${i + 1}/${slice.length}] ${relName.slice(0, 70).padEnd(70)} `);
+    process.stdout.write(`[${startIdx + i + 1}/${files.length}] ${relName.slice(0, 70).padEnd(70)} `);
 
     let episodeId = "(dry-run)";
     if (!args.dryRun) {

@@ -184,6 +184,11 @@ export function buildGraphView(
       label: shortLabel(fm.name ?? "entity"),
       meta: { tags: fm.aliases ?? [] },
     })) break;
+    // v2.14.3+ (bug fix): entities carry derived_from provenance just like
+    // facts/cognitive, but this branch previously emitted only merged_into
+    // edges — so entities rendered as disconnected nodes in the graph even
+    // though their source episodes were recorded. Emit the provenance edges.
+    for (const d of (fm.derived_from ?? []) as string[]) addEdge(fm.id, d, "derived_from");
     if (fm.merged_into) addEdge(fm.id, fm.merged_into, "merged_into");
   }
 
