@@ -335,17 +335,55 @@ export function consensusMerge(perPass: ExtractionResult[]): ExtractionResult {
   }
   const threshold = Math.floor(ok / 2) + 1;
 
+  // v2.16.2 — subject/object surface normalization, anchored to the
+  // extractor's OWN entity declarations. "Princeton" and "Princeton
+  // research team" must tally as one candidate — but only when the passes'
+  // entity lists justify it:
+  //   1. exact entity-name match wins first ("Claude model family" never
+  //      collapses into "Claude" when BOTH are declared entities);
+  //   2. otherwise a ref maps to an entity name contained in it on token
+  //      boundaries, and only when exactly ONE entity matches — ambiguous
+  //      or unanchored strings keep their surface form.
+  const entityCased = new Map<string, string>();   // lc name → first cased name
+  for (const pass of perPass) {
+    for (const e of pass.entities ?? []) {
+      const lc = (e.name ?? "").trim().toLowerCase();
+      if (lc && !entityCased.has(lc)) entityCased.set(lc, e.name.trim());
+    }
+  }
+  const tokensOf = (s: string) => s.split(/[^a-z0-9]+/).filter(Boolean);
+  const containsTokens = (haystack: string[], needle: string[]): boolean => {
+    if (needle.length === 0 || needle.length > haystack.length) return false;
+    for (let i = 0; i + needle.length <= haystack.length; i++) {
+      if (needle.every((t, j) => haystack[i + j] === t)) return true;
+    }
+    return false;
+  };
+  const normalizeRef = (raw: string): string => {
+    const s = (raw ?? "").trim().toLowerCase();
+    if (!s || entityCased.has(s)) return s;          // exact match (or literal) stays
+    const refTokens = tokensOf(s);
+    let hit: string | null = null;
+    for (const name of entityCased.keys()) {
+      if (name.length < 3) continue;                 // too short to anchor safely
+      if (!containsTokens(refTokens, tokensOf(name))) continue;
+      if (hit) return s;                             // ambiguous → keep surface form
+      hit = name;
+    }
+    return hit ?? s;
+  };
+
   // v2.16.1 — vote on the CANONICAL predicate so synonym phrasings tally
   // together ("developed"/"created"/"founded" = one candidate, 3 votes)
-  // instead of dying as 1-vote strangers. Display keeps the first surface
-  // form; only the key is normalized.
+  // instead of dying as 1-vote strangers.
   const factKey = (f: ExtractedFact) =>
-    `${(f.subject ?? "").trim().toLowerCase()}|${canonicalPredicate(f.predicate ?? "")}|${(f.object ?? "").trim().toLowerCase()}`;
+    `${normalizeRef(f.subject)}|${canonicalPredicate(f.predicate ?? "")}|${normalizeRef(f.object)}`;
 
   // Tally facts: one vote per pass per triple (dupes within a pass don't
   // double-count). First surface form wins for display.
   const factTally = new Map<string, {
-    first: ExtractedFact; votes: number; confidences: number[]; dates: (string | null)[];
+    first: ExtractedFact; subjKey: string; objKey: string;
+    votes: number; confidences: number[]; dates: (string | null)[];
   }>();
   for (const pass of perPass) {
     const seenThisPass = new Set<string>();
@@ -360,7 +398,8 @@ export function consensusMerge(perPass: ExtractionResult[]): ExtractionResult {
         entry.dates.push(sanitizeEventDate(f.event_date));
       } else {
         factTally.set(k, {
-          first: f, votes: 1,
+          first: f, subjKey: normalizeRef(f.subject), objKey: normalizeRef(f.object),
+          votes: 1,
           confidences: [f.confidence ?? 0.8],
           dates: [sanitizeEventDate(f.event_date)],
         });
@@ -369,7 +408,7 @@ export function consensusMerge(perPass: ExtractionResult[]): ExtractionResult {
   }
 
   const facts: ExtractedFact[] = [];
-  for (const { first, votes, confidences, dates } of factTally.values()) {
+  for (const { first, subjKey, objKey, votes, confidences, dates } of factTally.values()) {
     if (votes < threshold) continue;
     // event_date must ITSELF win a majority — "never invent" extends to
     // dates: a date one pass hallucinated onto an agreed triple is dropped.
@@ -383,6 +422,12 @@ export function consensusMerge(perPass: ExtractionResult[]): ExtractionResult {
     }
     facts.push({
       ...first,
+      // v2.16.2 — display the canonical entity name when the vote key was
+      // anchored to one ("Princeton research team" → "Princeton"), so the
+      // downstream exact-match entity linking fires. Literals keep their
+      // first surface form.
+      subject: entityCased.get(subjKey) ?? first.subject,
+      object: entityCased.get(objKey) ?? first.object,
       confidence: confidences.reduce((a, b) => a + b, 0) / confidences.length,
       event_date: eventDate,
       votes,
@@ -755,9 +800,13 @@ export async function pickExtractor(): Promise<LLMExtractor> {
 async function claudeCliAvailable(): Promise<boolean> {
   try {
     const proc = Bun.spawn(["claude", "--version"], { stdout: "pipe", stderr: "pipe" });
+    // v2.16.2 — was 2s, which a cold fnm-shimmed Node CLI start can exceed:
+    // on 2026-07-09 the probe timed out and mema SILENTLY degraded to the
+    // Ollama extractor (truncated, no consensus, banned predicates leaked).
+    // 10s is cheap insurance; the result is only consulted once per request.
     const exited = await Promise.race([
       proc.exited,
-      new Promise<number>(r => setTimeout(() => r(-1), 2000)),
+      new Promise<number>(r => setTimeout(() => r(-1), 10000)),
     ]);
     return exited === 0;
   } catch { return false; }

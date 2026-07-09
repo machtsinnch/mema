@@ -302,10 +302,15 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     let entityCount = 0;
     let extractionError: string | undefined;
     let chunkStats: { total: number; failed: number } | undefined;
+    let extractorName: string | undefined;
     const rejectedFacts: Array<{ reason: string }> = [];
 
     try {
       const extractor = await pickExtractor();
+      // v2.16.2 — always report WHICH extractor ran. On 2026-07-09 a slow
+      // CLI probe silently degraded extraction to Ollama and nothing in the
+      // response showed it; the extractor identity is part of the result.
+      extractorName = extractor.name;
       const result = await extractor.extract(parsed.body.content);
       chunkStats = result.chunk_stats;
 
@@ -401,6 +406,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
         fact_count: factCount,
         entity_count: entityCount,
         rejected_count: rejectedFacts.length,
+        ...(extractorName ? { extractor: extractorName } : {}),
         ...(chunkStats ? { chunks: chunkStats } : {}),
         ...(extractionError ? { error: extractionError } : {}),
       },
