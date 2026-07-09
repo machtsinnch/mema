@@ -32,7 +32,7 @@ const SYNONYM_CLASSES: Record<string, string[]> = {
   // people management
   manages: ["manages", "leads", "heads", "oversees"],
   // ownership
-  owns: ["owns", "owned_by_reverse_never_merge_placeholder"],
+  owns: ["owns", "owned"],
 };
 
 const CANON = new Map<string, string>();
@@ -46,4 +46,26 @@ for (const [canonical, variants] of Object.entries(SYNONYM_CLASSES)) {
 export function canonicalPredicate(predicate: string): string {
   const p = (predicate ?? "").trim().toLowerCase().replace(/\s+/g, "_");
   return CANON.get(p) ?? p;
+}
+
+// v2.16.3 — query-side relation hints: noun/role words users naturally ask
+// with, mapped onto the predicate class they mean. "who is X's employer"
+// must find `works_at` facts even though the strings share nothing.
+const QUERY_RELATION_HINTS: Record<string, string> = {
+  employer: "works_at", employed: "works_at", employment: "works_at",
+  creator: "created", builder: "created", author: "created",
+  residence: "lives_in", location: "based_in", headquarters: "based_in",
+  owner: "owns", manager: "manages",
+};
+
+// All surface variants of the predicate class a query token refers to —
+// via a direct class membership ("built" → created-class) or a relation
+// hint ("employer" → works_at-class). Empty when the token is not
+// relation-like. Used by retrieval to expand keyword patterns; scoring
+// counts expansions under the ORIGINAL token so IDF stays honest.
+export function relationVariants(token: string): string[] {
+  const t = (token ?? "").trim().toLowerCase();
+  const canon = CANON.has(t) ? CANON.get(t)! : QUERY_RELATION_HINTS[t];
+  if (!canon) return [];
+  return SYNONYM_CLASSES[canon] ?? [canon];
 }

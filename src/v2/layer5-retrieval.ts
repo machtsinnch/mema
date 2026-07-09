@@ -25,6 +25,36 @@ import { pickEmbedder, vectorSearch, type Embedder } from "./layer5-embeddings";
 import { buildEvidenceChain, buildSupportIndex } from "./layer5-graph";
 import { factValidAt, toEpochMs } from "./temporal";
 import { reciprocalRankFusion } from "./layer5-rrf";
+import { relationVariants } from "./predicates";
+
+// v2.16.3 — deterministic morphological variants for a query token, so
+// "build" finds "built" and "holds" finds "hold". No stemming library, no
+// LLM: a small irregulars table + conservative suffix rules. All variants
+// are counted under the BASE token in scoring, so expansion never inflates
+// IDF.
+const IRREGULARS: Record<string, string[]> = {
+  build: ["built"], built: ["build"],
+  hold: ["held"], held: ["hold", "holds"], holds: ["held", "hold"],
+  speak: ["spoke", "spoken", "speaks"], speaks: ["speak"],
+  write: ["wrote", "written"], wrote: ["write"],
+  lead: ["led"], led: ["lead"],
+  make: ["made"], made: ["make"],
+  teach: ["taught"], apply: ["applied", "applies"], applied: ["apply"],
+};
+export function morphVariants(token: string): string[] {
+  const t = token.toLowerCase();
+  const out = new Set<string>([t]);
+  for (const v of IRREGULARS[t] ?? []) out.add(v);
+  if (t.length >= 4) {
+    if (t.endsWith("ing")) { const s = t.slice(0, -3); out.add(s); out.add(s + "e"); }
+    else if (t.endsWith("ied")) out.add(t.slice(0, -3) + "y");
+    else if (t.endsWith("ed")) { out.add(t.slice(0, -2)); out.add(t.slice(0, -1)); }
+    else if (t.endsWith("es")) { out.add(t.slice(0, -2)); out.add(t.slice(0, -1)); }
+    else if (t.endsWith("s") && !t.endsWith("ss")) out.add(t.slice(0, -1));
+    else { out.add(t + "s"); out.add(t + "ed"); out.add(t + "ing"); }
+  }
+  return [...out];
+}
 
 // Module-level cached embedder — initialized once per process.
 let _embedder: Embedder | null = null;
@@ -53,7 +83,17 @@ async function ripgrepAcross(
     .map(t => t.replace(/^[^\w-]+|[^\w-]+$/g, "").toLowerCase())
     .filter(t => t.length >= 2);
   if (tokens.length === 0) return { byPath: new Map(), tokenDocFreq: new Map() };
-  const eFlags = tokens.flatMap(t => ["-e", t]);
+  // v2.16.3 — expand each token into morphological variants + relation-
+  // class surface forms ("employer" → works_at/works_for/employed_by...).
+  // variantToBase maps every matched pattern back to its ORIGINAL query
+  // token so IDF and title-boost scoring see base tokens only.
+  const variantToBase = new Map<string, string>();
+  for (const t of tokens) {
+    for (const v of [...morphVariants(t), ...relationVariants(t)]) {
+      if (!variantToBase.has(v)) variantToBase.set(v, t);
+    }
+  }
+  const eFlags = [...variantToBase.keys()].flatMap(v => ["-e", v]);
   const proc = await $`rg --json -i -g "*.md" ${eFlags} ${vaultRoot}`
     .nothrow().quiet();
   const result = proc.text();
@@ -74,7 +114,8 @@ async function ripgrepAcross(
     const matchedTokens: string[] = [];
     for (const sm of evt.data.submatches ?? []) {
       const tok = (sm.match?.text ?? "").toLowerCase();
-      if (tok) matchedTokens.push(tok);
+      // v2.16.3 — credit the BASE query token, not the expanded variant.
+      if (tok) matchedTokens.push(variantToBase.get(tok) ?? tok);
     }
     const prev = byPath.get(path);
     if (prev) {
@@ -243,7 +284,14 @@ export async function recall(
       rec.frontmatter.subject,
       rec.frontmatter.predicate,
     ].filter(Boolean).join(" ").toLowerCase();
-    const titleHits = queryTokens.filter(t => titleSource.includes(t)).length;
+    // v2.16.3 — a query token counts as a title hit when ANY of its
+    // morphological/relation variants appears in the title source, so
+    // "employer" boosts a fact whose predicate is works_at.
+    const titleHits = queryTokens.filter(t =>
+      titleSource.includes(t)
+      || morphVariants(t).some(v => titleSource.includes(v))
+      || relationVariants(t).some(v => titleSource.includes(v))
+    ).length;
     const titleBoost = Math.min(titleHits / Math.max(queryTokens.length, 1), 1);
 
     const layerPrior = kind === "cognitive" ? 1.0 : kind === "fact" ? 0.9 : kind === "episode" ? 0.7 : 0.6;
@@ -305,8 +353,15 @@ export async function recall(
 
     // Excerpt prefers the doc's own title/alias over the first matched line (which
     // is often a table-of-contents or boilerplate match).
+    // v2.16.3 — when the first matched line is frontmatter ("actor: x",
+    // "owner: y"), show the record BODY's first content line instead: a
+    // recall excerpt reading `actor: ardin-pai` tells the caller nothing.
+    const fmLike = /^[a-z_]+:\s/.test(firstLine.trim());
+    const displayLine = fmLike
+      ? (rec.body.split("\n").find(l => l.trim().length > 0) ?? firstLine)
+      : firstLine;
     const titleAlias = rec.frontmatter.aliases?.[0] ?? rec.frontmatter.alias ?? null;
-    const excerpt = titleAlias ? `${titleAlias} — ${firstLine.slice(0, 160)}` : firstLine.slice(0, 240);
+    const excerpt = titleAlias ? `${titleAlias} — ${displayLine.slice(0, 160)}` : displayLine.slice(0, 240);
 
     // Build human-readable "why retrieved" — the strongest contributing signal
     const parts: string[] = [];
