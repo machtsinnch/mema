@@ -274,7 +274,12 @@ export async function recall(
       idfScore += idf;
     }
     // Normalize per query length, cap at 1
-    const idfNorm = Math.min(idfScore / Math.max(queryTokens.length, 1) / 2, 1);
+    // v2.16.4 — plus document-length normalization (the BM25 idea): a 60 KB
+    // document contains nearly every common word and would otherwise
+    // keyword-match every query. Small records (facts, entities, short
+    // notes) are untouched (factor ≈ 1); a 60 KB document is divided ~3.7×.
+    const lengthNorm = 1 / (1 + Math.log1p(rec.body.length / 4000));
+    const idfNorm = Math.min(idfScore / Math.max(queryTokens.length, 1) / 2, 1) * lengthNorm;
 
     // Title/alias boost: if any query token appears in the doc's alias/tags, big bump
     const titleSource = [
@@ -314,7 +319,14 @@ export async function recall(
     //     contradicted claim less aggressively than a clean one.
     const recordId = rec.frontmatter.id as string | undefined;
     const supportCount = recordId ? (supportIndex.get(recordId) ?? 0) : 0;
-    const graphSupport = Math.min(supportCount / maxSupport, 1);
+    // v2.16.4 — LOG-dampened, not linear. An episode's in-degree counts how
+    // many records were extracted FROM it, which measures document LENGTH,
+    // not groundedness: on the finance corpus a 480-fact document took the
+    // full graph bonus on every query and buried topical results. log1p
+    // keeps "cited more = somewhat better" while flattening the size bias.
+    const graphSupport = Math.min(
+      Math.log1p(supportCount) / Math.log1p(Math.max(maxSupport, 1)), 1,
+    );
 
     const recordTime = rec.frontmatter.valid_from
       ?? rec.frontmatter.first_seen
