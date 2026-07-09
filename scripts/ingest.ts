@@ -103,29 +103,31 @@ async function main() {
     if (args.dryRun) { console.log("(dry-run)"); continue; }
 
     try {
-      const r = await fetch(`${args.api}/v2/observe`, {
-        method: "POST",
-        headers: {
-          "x-api-key": args.key,
-          "x-owner": args.owner,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          kind: "document",
-          content: readFileSync(f, "utf8"),
-          source: rel,
-        }),
-        // Consensus extraction of a large file legitimately takes many
-        // minutes — Bun's 300s default fetch timeout is what produced the
-        // phantom OBSERVE_FAILs on 2026-07-09.
-        signal: AbortSignal.timeout(30 * 60_000),
+      // Via curl, NOT fetch: Bun's fetch enforces its own ~5-minute timeout
+      // that an AbortSignal cannot extend — it produced phantom OBSERVE_FAILs
+      // on both 2026-07-09 ingestion runs while the server completed every
+      // file. curl waits exactly as long as told.
+      const payload = JSON.stringify({
+        kind: "document",
+        content: readFileSync(f, "utf8"),
+        source: rel,
       });
-      if (!r.ok) {
-        console.log(`HTTP_${r.status}`);
+      const proc = Bun.spawn([
+        "curl", "-sS", "--max-time", "3600",
+        "-X", "POST", `${args.api}/v2/observe`,
+        "-H", `x-api-key: ${args.key}`,
+        "-H", `x-owner: ${args.owner}`,
+        "-H", "content-type: application/json",
+        "--data-binary", "@-",
+      ], { stdin: Buffer.from(payload), stdout: "pipe", stderr: "pipe" });
+      const out = await new Response(proc.stdout).text();
+      const exit = await proc.exited;
+      if (exit !== 0) {
+        console.log(`OBSERVE_FAIL: curl exit ${exit}`);
         totals.failed++;
         continue;
       }
-      const d = await r.json() as {
+      const d = JSON.parse(out) as {
         extraction_status: string;
         extracted?: {
           fact_count: number; entity_count: number; rejected_count: number;
