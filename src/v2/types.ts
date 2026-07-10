@@ -143,7 +143,18 @@ export interface SemanticFact {
   // reflection annotates the facts instead of creating a Layer 3 belief.
   corroboration_sources?: number;      // distinct source documents agreeing
   corroboration_updated_at?: string;
+  // v2.18.1 — internet fact-check stamp (Ardin's design: verification
+  // against serious sources is what makes Layer 2 the truth layer).
+  //   confirmed     — the web supports the claim
+  //   contradicted  — the web disputes it (fact kept, demoted in search)
+  //   unverifiable  — nothing solid found either way
+  verification?: FactCheckVerdict;
+  verification_note?: string;          // one plain-English sentence
+  verification_sources?: string[];     // URLs consulted
+  verification_checked_at?: string;
 }
+
+export type FactCheckVerdict = "confirmed" | "contradicted" | "unverifiable";
 
 export interface Entity {
   id: string;

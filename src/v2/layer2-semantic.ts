@@ -272,6 +272,43 @@ export function annotateFactCorroboration(
   return true;
 }
 
+// v2.18.1 — write the internet fact-check verdict onto a fact record.
+// Companion to annotateFactCorroboration above; see layer2-factcheck.ts
+// for how verdicts are produced. Skips the write when the stamp is
+// identical (idempotent re-runs). Contradicted facts are demoted by
+// retrieval (layer5), never deleted — the audit trail records the stamp.
+export function annotateFactVerification(
+  vaultRoot: string,
+  owner: string,
+  factId: string,
+  check: { verdict: string; note: string; sources: string[] },
+  actor: string,
+): boolean {
+  const path = pathForFact(vaultRoot, owner, factId);
+  if (!path) return false;
+  const parsed = matter(readFileSync(path, "utf8"));
+  const fm = parsed.data as Record<string, unknown>;
+  if (fm.owner !== owner) return false;
+  if (
+    fm.verification === check.verdict
+    && fm.verification_note === check.note
+    && JSON.stringify(fm.verification_sources ?? []) === JSON.stringify(check.sources)
+  ) return false;
+  fm.verification = check.verdict;
+  fm.verification_note = check.note;
+  fm.verification_sources = check.sources;
+  fm.verification_checked_at = new Date().toISOString();
+  atomicWriteFile(path, matter.stringify(parsed.content, fm));
+  appendAudit({
+    op: "EXTRACT",
+    actor,
+    owner,
+    record_ids: [factId],
+    reason: `fact_check:${check.verdict}`,
+  });
+  return true;
+}
+
 export function getFactsValidAt(
   vaultRoot: string,
   owner: string,

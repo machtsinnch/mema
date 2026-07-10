@@ -348,7 +348,12 @@ export async function recall(
     const contradiction = rec.frontmatter.invalidated_at || rec.frontmatter.superseded_by
       ? 1 : 0;
     // 35% reduction for contradicted records — still recallable but de-ranked.
-    const contradictionPenalty = contradiction * 0.35;
+    // v2.18.1 — internet fact-check verdict (Ardin's rule 2026-07-10: a
+    // fact the web contradicts is never deleted, but must sink in search).
+    // Uses the same multiplier channel, harder: 60% reduction, stacking
+    // with the supersession penalty up to a cap of 80%.
+    const factCheckPenalty = rec.frontmatter.verification === "contradicted" ? 0.6 : 0;
+    const contradictionPenalty = Math.min(0.8, contradiction * 0.35 + factCheckPenalty);
 
     // v2.7.5+ fused score with graph signals.
     //   keyword IDF        24%
