@@ -37,9 +37,15 @@ export function createEntity(vaultRoot: string, input: CreateEntityInput): Entit
   // v2.14.3+ (codex review): per-vault dedup. Without this, every ingest
   // that mentions the same entity name creates a fresh file with a new ULID
   // (e.g. "PAI" ends up as system-pai--01KS01.md, system-pai--01KS02.md, ...
-  // across N documents). Look up by (owner, type, name-or-alias) first and
-  // update the existing record's last_seen + aliases + derived_from union.
-  const existing = findEntityByNameAndType(vaultRoot, input.owner, input.name, input.type);
+  // across N documents). Look up by name-or-alias first and update the
+  // existing record's last_seen + aliases + derived_from union.
+  //
+  // v2.16.6 — dedup by NAME across types (was name AND type): two
+  // extraction passes typing the same referent differently ("Ginger
+  // liqueur" as product vs concept) created duplicate records that wasted
+  // retrieval slots (LongMemEval round 2). One name = one referent per
+  // owner — which is already how fact→entity linking resolves names.
+  const existing = findEntityByName(vaultRoot, input.owner, input.name);
   if (existing) {
     const existingPath = entityPath(vaultRoot, input.owner, existing.id);
     if (existingPath) {

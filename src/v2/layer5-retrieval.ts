@@ -506,15 +506,20 @@ export async function recall(
   // search-engine practice: cap results per source. At most 3 facts per
   // source episode in the primary ranking; over-cap facts drop behind, and
   // only fill slots if the limit isn't reached by diverse records.
-  const MAX_FACTS_PER_SOURCE = 3;
+  // v2.16.6 — the cap covers entities too (facts + entities counted
+  // together per source): entity swarms from chatty sessions caused the
+  // same crowd-out the fact cap fixed (LongMemEval round 2, question
+  // c4a1ceb8: the 4th gold session ranked 12 behind entity clutter).
+  const MAX_RECORDS_PER_SOURCE = 3;
   const perSource = new Map<string, number>();
   const primary: RetrievalHit[] = [];
   const overflow: RetrievalHit[] = [];
   for (const h of hits) {
-    const src = h.kind === "fact" ? h.payload?.derived_from?.[0] : undefined;
+    const src = (h.kind === "fact" || h.kind === "entity")
+      ? h.payload?.derived_from?.[0] : undefined;
     if (src) {
       const n = perSource.get(src) ?? 0;
-      if (n >= MAX_FACTS_PER_SOURCE) { overflow.push(h); continue; }
+      if (n >= MAX_RECORDS_PER_SOURCE) { overflow.push(h); continue; }
       perSource.set(src, n + 1);
     }
     primary.push(h);

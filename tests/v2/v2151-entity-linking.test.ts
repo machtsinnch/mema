@@ -117,3 +117,15 @@ describe("supersession sees through aliases via subject_entity_id", () => {
     rmSync(vault, { recursive: true, force: true });
   });
 });
+
+describe("v2.16.6 — entity dedup across types", () => {
+  test("same name with different type merges into one record", () => {
+    const vault = fresh();
+    const a = createEntity(vault, { name: "Ginger liqueur", type: "product", actor: "t", owner: "o" });
+    const b = createEntity(vault, { name: "Ginger liqueur", type: "concept", actor: "t", owner: "o" });
+    expect(b.id).toBe(a.id);
+    const c = createEntity(vault, { name: "ginger liqueur", type: "product", actor: "t", owner: "o" });
+    expect(c.id).toBe(a.id);
+    rmSync(vault, { recursive: true, force: true });
+  });
+});
