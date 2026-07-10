@@ -139,6 +139,12 @@ export interface NewFactCandidate {
 export function classifyOnWrite(
   newFact: NewFactCandidate,
   candidates: SemanticFact[],
+  // v2.17.1 — the resolved entity type of the fact's subject ("person",
+  // "organization", ...) when the caller knows it; null/undefined = unknown.
+  // Location predicates only replace for person subjects (see
+  // isFunctionalFor above) — unknown subjects accumulate rather than risk
+  // wrongly replacing a company's second location.
+  subjectEntityType?: string | null,
 ): SupersessionDecision {
   const normNewObject = newFact.object.trim().toLowerCase();
   const normNewDate = (newFact.event_date ?? "").slice(0, 10);
@@ -166,7 +172,7 @@ export function classifyOnWrite(
   //    status, etc.). For everything else, accumulate — multi-valued by
   //    default. Loses some legitimate version replacements; prevents the
   //    "13 facts deleted from one document" failure mode from codex review.
-  if (!isFunctional(newFact.predicate)) {
+  if (!isFunctionalFor(newFact.predicate, subjectEntityType)) {
     return { kind: "ADD", reason: "non_functional_predicate" };
   }
 

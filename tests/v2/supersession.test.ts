@@ -43,16 +43,23 @@ const NEW = (object: string, event_date: string): NewFactCandidate => ({
   event_date,
 });
 
+// v2.17.1 — location predicates only replace for PERSON subjects
+// (isFunctionalFor). These fixtures model a person's residence, so the
+// tests pass the subject type explicitly; unknown-type behavior is covered
+// in v2171-functional-for.test.ts.
+const classify = (n: NewFactCandidate, c: SemanticFact[]) =>
+  classifyOnWrite(n, c, "person");
+
 describe("classifyOnWrite — pure structural classifier", () => {
   test("ADD when no candidates exist", () => {
-    expect(classifyOnWrite(NEW("Berlin", "2025-03-01"), [])).toEqual({ kind: "ADD" });
+    expect(classify(NEW("Berlin", "2025-03-01"), [])).toEqual({ kind: "ADD" });
   });
 
   test("NONE/duplicate when an existing fact has same object AND same date", () => {
     const candidates = [
       fact("f1", "User", "lives_in", "Berlin", "2025-03-01"),
     ];
-    expect(classifyOnWrite(NEW("Berlin", "2025-03-01"), candidates)).toEqual({
+    expect(classify(NEW("Berlin", "2025-03-01"), candidates)).toEqual({
       kind: "NONE",
       reason: "duplicate",
     });
@@ -64,7 +71,7 @@ describe("classifyOnWrite — pure structural classifier", () => {
     const candidates = [
       fact("f1", "User", "lives_in", "Berlin", "2025-03-01"),
     ];
-    expect(classifyOnWrite(NEW("Berlin", "2024-01-01"), candidates)).toEqual({
+    expect(classify(NEW("Berlin", "2024-01-01"), candidates)).toEqual({
       kind: "NONE",
       reason: "stale",
     });
@@ -76,7 +83,7 @@ describe("classifyOnWrite — pure structural classifier", () => {
     const candidates = [
       fact("f-munich", "User", "lives_in", "Munich", "2023-06-15"),
     ];
-    const d = classifyOnWrite(NEW("Berlin", "2025-03-01"), candidates);
+    const d = classify(NEW("Berlin", "2025-03-01"), candidates);
     expect(d.kind).toBe("UPDATE");
     if (d.kind === "UPDATE") {
       expect(d.superseded).toHaveLength(1);
@@ -92,7 +99,7 @@ describe("classifyOnWrite — pure structural classifier", () => {
       fact("f-hamburg",   "User", "lives_in", "Hamburg",   "2024-02-10"),
       fact("f-frankfurt", "User", "lives_in", "Frankfurt", "2024-08-20"),
     ];
-    const d = classifyOnWrite(NEW("Berlin", "2025-03-01"), candidates);
+    const d = classify(NEW("Berlin", "2025-03-01"), candidates);
     expect(d.kind).toBe("UPDATE");
     if (d.kind === "UPDATE") {
       expect(d.superseded).toHaveLength(3);
@@ -113,7 +120,7 @@ describe("classifyOnWrite — pure structural classifier", () => {
       }),
       fact("f-hamburg", "User", "lives_in", "Hamburg", "2024-01-01"),
     ];
-    const d = classifyOnWrite(NEW("Berlin", "2025-03-01"), candidates);
+    const d = classify(NEW("Berlin", "2025-03-01"), candidates);
     expect(d.kind).toBe("UPDATE");
     if (d.kind === "UPDATE") {
       // Only Hamburg (still current) is superseded; Munich (already
@@ -132,7 +139,7 @@ describe("classifyOnWrite — pure structural classifier", () => {
     const candidates = [
       fact("f-berlin", "User", "lives_in", "Berlin", "2025-03-01"),
     ];
-    expect(classifyOnWrite(NEW("Munich", "2023-06-15"), candidates)).toEqual({ kind: "ADD" });
+    expect(classify(NEW("Munich", "2023-06-15"), candidates)).toEqual({ kind: "ADD" });
   });
 
   test("case-insensitive object comparison", () => {
@@ -140,7 +147,7 @@ describe("classifyOnWrite — pure structural classifier", () => {
     const candidates = [
       fact("f1", "User", "lives_in", "Berlin", "2025-03-01"),
     ];
-    expect(classifyOnWrite(NEW("berlin", "2025-03-01"), candidates)).toEqual({
+    expect(classify(NEW("berlin", "2025-03-01"), candidates)).toEqual({
       kind: "NONE",
       reason: "duplicate",
     });
@@ -150,7 +157,7 @@ describe("classifyOnWrite — pure structural classifier", () => {
     const candidates = [
       fact("f1", "User", "lives_in", "Berlin", "2025-03-01"),
     ];
-    expect(classifyOnWrite(NEW("  Berlin  ", "2025-03-01"), candidates)).toEqual({
+    expect(classify(NEW("  Berlin  ", "2025-03-01"), candidates)).toEqual({
       kind: "NONE",
       reason: "duplicate",
     });
@@ -162,7 +169,7 @@ describe("classifyOnWrite — pure structural classifier", () => {
     const candidates = [
       fact("f1", "User", "lives_in", "Berlin", "2025-03-01"),
     ];
-    expect(classifyOnWrite({
+    expect(classify({
       subject: "User",
       predicate: "lives_in",
       object: "Berlin",
@@ -176,7 +183,7 @@ describe("classifyOnWrite — pure structural classifier", () => {
     const candidates = [
       fact("f-undated", "User", "lives_in", "Unknown", ""),
     ];
-    const d = classifyOnWrite(NEW("Berlin", "2025-03-01"), candidates);
+    const d = classify(NEW("Berlin", "2025-03-01"), candidates);
     expect(d.kind).toBe("UPDATE");
     if (d.kind === "UPDATE") {
       expect(d.superseded).toHaveLength(1);

@@ -26,7 +26,8 @@ import {
   recordCognitive, findCognitiveByClaimKey, updateCognitiveSupport, supersedeBelief,
 } from "./layer3-cognitive";
 import { canonicalPredicate } from "./predicates";
-import { isFunctional } from "./layer4-supersession";
+import { isFunctionalFor } from "./layer4-supersession";
+import { readEntity } from "./layer2-entities";
 import { pickExtractor } from "./llm-extractor";
 
 export interface ReflectInput {
@@ -227,8 +228,24 @@ export function reflect(input: ReflectInput): ReflectionReport {
     subject: string; predicate: string; subjectEntityId: string | null;
   }
   const stateGroups = new Map<string, StateGroup>();
+  // v2.17.1 — Rule B must know WHO the subject is: "currently lives_in /
+  // located_in" only makes sense for persons. A company holds many
+  // locations at once, so no single one is "current" — concluding
+  // "TSMC currently located_in Germany" from the Dresden fab was wrong.
+  // Entity types are read once per entity and cached.
+  const entityTypeCache = new Map<string, string | null>();
+  const subjectTypeOf = (f: SemanticFact): string | null => {
+    if (!f.subject_entity_id) return null;
+    let t = entityTypeCache.get(f.subject_entity_id);
+    if (t === undefined) {
+      t = readEntity(input.vaultRoot, input.owner, f.subject_entity_id)?.type ?? null;
+      entityTypeCache.set(f.subject_entity_id, t);
+    }
+    return t;
+  };
+  const today = new Date().toISOString().slice(0, 10);
   for (const f of facts) {
-    if (!isFunctional(f.predicate)) continue;
+    if (!isFunctionalFor(f.predicate, subjectTypeOf(f))) continue;
     const subjKey = f.subject_entity_id ?? f.subject.trim().toLowerCase();
     const key = `${subjKey}|${canonicalPredicate(f.predicate)}`;
     const g = stateGroups.get(key) ?? {
@@ -250,6 +267,16 @@ export function reflect(input: ReflectInput): ReflectionReport {
       continue;
     }
     const f = g.current[0];
+    // v2.17.1 — a fact dated in the FUTURE ("starts at X in 2027-03") is a
+    // plan, not a current state. Refuse to conclude "currently" from it,
+    // and say so visibly.
+    if (hasWorldDate(f) && (f.valid_from ?? "") > today) {
+      abstained.push({
+        rule: "current-state", subject: g.subject, predicate: g.predicate,
+        reason: `stated date ${f.valid_from} is in the future — a plan, not a current state`,
+      });
+      continue;
+    }
     // A lone undated fact with no superseded history would make the belief
     // a photocopy of the fact — no added knowledge. Conclude only when
     // either history exists (supersession established currency) or the

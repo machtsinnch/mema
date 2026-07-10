@@ -18,6 +18,7 @@ import { appendAudit } from "./layer6-audit";
 import { factValidAt } from "./temporal";
 import { classifyOnWrite, type SupersessionDecision } from "./layer4-supersession";
 import { canonicalPredicate } from "./predicates";
+import { readEntity } from "./layer2-entities";
 
 export interface RecordFactInput {
   subject: string;
@@ -439,6 +440,15 @@ export function recordFactWithSupersession(
   }
 
   // 2. Classify (pure function — fully testable).
+  //
+  // v2.17.1 — pass the subject's entity type when the fact is linked to a
+  // resolved entity. Location predicates only replace for persons; a
+  // company gaining a second location ("TSMC located_in Germany" next to
+  // "...Taiwan") must ADD, not replace. Unlinked subjects stay unknown →
+  // locations accumulate (safe default).
+  const subjectEntityType = input.subject_entity_id
+    ? (readEntity(vaultRoot, input.owner, input.subject_entity_id)?.type ?? null)
+    : null;
   const decision = classifyOnWrite(
     {
       subject: input.subject,
@@ -447,6 +457,7 @@ export function recordFactWithSupersession(
       event_date: input.valid_from ?? new Date().toISOString(),
     },
     fullCandidates,
+    subjectEntityType,
   );
 
   // 3. Branch on decision.
