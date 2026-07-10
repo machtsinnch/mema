@@ -16,10 +16,10 @@ import type { CognitiveRecord, CognitiveKind, BeliefKind } from "./types";
 import { clampConfidence, toWikilinks, slugify, recordFilename, idFromFilename } from "./types";
 
 // Resolve a cognitive record's on-disk path by ULID, regardless of kind
-// (belief/observation/experience) and regardless of slug schema. Returns
-// null when not found.
+// (belief/observation/experience/judgment) and regardless of slug schema.
+// Returns null when not found.
 export function pathForCognitive(vaultRoot: string, owner: string, id: string): string | null {
-  for (const kind of ["belief", "observation", "experience"]) {
+  for (const kind of ["belief", "observation", "experience", "judgment"]) {
     const kindDir = join(vaultRoot, "cognitive", owner, kind);
     if (!existsSync(kindDir)) continue;
     const legacy = join(kindDir, `${id}.md`);

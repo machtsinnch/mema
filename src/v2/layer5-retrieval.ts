@@ -305,7 +305,9 @@ export async function recall(
     // pronoun-counter filler outrank real facts).
     const layerPrior =
       kind === "cognitive"
-        ? (rec.frontmatter.kind === "belief" ? 0.95 : 0.75)
+        // v2.19.0 — judgments rank with beliefs: both are multi-source
+        // conclusions (judgments are the arc42-style decisions).
+        ? (rec.frontmatter.kind === "belief" || rec.frontmatter.kind === "judgment" ? 0.95 : 0.75)
         : kind === "fact" ? 0.9 : kind === "episode" ? 0.7 : 0.6;
     // CRITICAL: defensive clamp against NaN/Infinity in stored confidence.
     // Even though clampConfidence is applied at write boundaries, legacy v1

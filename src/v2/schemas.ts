@@ -91,6 +91,30 @@ export const supersedeBody = z.object({
   new_id: z.string(),
 });
 
+// ── Judgments (v2.19.0 — Ardin's design 2026-07-10) ───────────────
+export const judgmentBody = z.object({
+  question: z.string().min(1),
+  decision: z.string().min(1),
+  rationale: z.string().min(1),
+  alternatives: z.array(z.object({
+    option: z.string(),
+    reason_rejected: z.string(),
+  })).optional(),
+  consequences: z.array(z.string()).optional(),
+  based_on: z.array(z.string()),
+  judgment_status: z.enum(["proposed", "accepted"]).optional(),
+  iteration: z.number().int().positive().optional(),
+  confidence: z.number().optional(),
+  // whole-record supersession: id of the judgment this one replaces plus
+  // the WRITTEN reason (the chain is the design story)
+  supersedes_id: z.string().optional(),
+  supersession_reason: z.string().optional(),
+});
+
+export const judgmentFlagsClearBody = z.object({
+  resolution: z.string().min(1),
+});
+
 // ── Reflection ───────────────────────────────────────────────────
 export const reflectBody = z.object({
   since: z.string().optional(),

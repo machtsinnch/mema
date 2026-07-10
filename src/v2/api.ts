@@ -10,6 +10,10 @@ import {
 } from "./layer2-semantic";
 import { factCheckAutoEnabled, factCheckUnverified, listUnverifiedClaims } from "./layer2-factcheck";
 import {
+  recordJudgment, readJudgment, listJudgments, supersedeJudgment,
+  flagJudgmentsForFact, clearJudgmentFlags,
+} from "./layer3-judgment";
+import {
   createEntity, readEntity, findEntityByName, listEntities, mergeEntities,
   approveEntity, rejectEntity, listDraftEntities, entityEvidenceCheck,
   resolveEntity,
@@ -38,6 +42,7 @@ import {
   observeBody, factBody, factInvalidateBody, reasonForceBody, reasonBody, factFindBody,
   entityBody, entityResolveBody,
   cognitiveBody, derivedFromAddBody, supersedeBody,
+  judgmentBody, judgmentFlagsClearBody,
   reflectBody,
   governanceBuildBody, eraseBody,
   recallBody, recallPacketBody,
@@ -384,6 +389,9 @@ export function mountV2(app: Hono, cfg: V2Config): void {
           });
           if (w.written) {
             factCount++;
+            // v2.19.0 — the living loop: a new fact touching a judgment's
+            // foundations flags that judgment for review (never rewrites).
+            flagJudgmentsForFact(cfg.vaultRoot, owner, w.written, actor);
           } else {
             rejectedFacts.push({ reason: (w.decision as any)?.reason ?? "skipped" });
           }
@@ -438,9 +446,11 @@ export function mountV2(app: Hono, cfg: V2Config): void {
         message: `fact_skipped:${(result.decision as any).reason ?? "duplicate_or_stale"}`,
       });
     }
+    const judgmentsFlagged = flagJudgmentsForFact(cfg.vaultRoot, owner, result.written, actor);
     return c.json({
       fact: result.written,
       decision: result.decision,
+      ...(judgmentsFlagged > 0 ? { judgments_flagged: judgmentsFlagged } : {}),
       ...(result.supersededIds.length > 0
         ? { superseded: result.supersededIds }
         : {}),
@@ -836,6 +846,48 @@ export function mountV2(app: Hono, cfg: V2Config): void {
   });
 
   // ── Layer 3: Reflection (automated synthesis) ────────────────────
+  // ── Layer 3: Judgments (v2.19.0 — Ardin's design 2026-07-10) ─────
+  app.post("/v2/judgment", async c => {
+    const parsed = await parseBody(c, judgmentBody);
+    if (!parsed.ok) return parsed.response;
+    const owner = c.get("owner");
+    const actor = c.get("actor");
+    const { supersedes_id, supersession_reason, ...body } = parsed.body;
+    if (supersedes_id && !supersession_reason) {
+      return c.json({ error: "supersession_reason is required when supersedes_id is set — the reason IS the design story" }, 400);
+    }
+    const judgment = recordJudgment(cfg.vaultRoot, { ...body, actor, owner });
+    let superseded = false;
+    if (supersedes_id && supersession_reason) {
+      superseded = supersedeJudgment(cfg.vaultRoot, owner, supersedes_id, judgment.id, supersession_reason, actor);
+    }
+    return c.json({ judgment, ...(supersedes_id ? { superseded_old: superseded } : {}) });
+  });
+
+  app.get("/v2/judgments", c => {
+    const owner = c.get("owner");
+    const flagged = c.req.query("flagged") === "true";
+    const includeSuperseded = c.req.query("include_superseded") === "true";
+    return c.json({ judgments: listJudgments(cfg.vaultRoot, owner, { flagged, include_superseded: includeSuperseded }) });
+  });
+
+  app.get("/v2/judgment/:id", c => {
+    const owner = c.get("owner");
+    const j = readJudgment(cfg.vaultRoot, owner, c.req.param("id"));
+    if (!j) return c.json({ error: "not_found" }, 404);
+    return c.json({ judgment: j });
+  });
+
+  app.post("/v2/judgment/:id/flags/clear", async c => {
+    const parsed = await parseBody(c, judgmentFlagsClearBody);
+    if (!parsed.ok) return parsed.response;
+    const owner = c.get("owner");
+    const actor = c.get("actor");
+    const ok = clearJudgmentFlags(cfg.vaultRoot, owner, c.req.param("id"), actor, parsed.body.resolution);
+    if (!ok) return c.json({ error: "not_found_or_no_flags" }, 404);
+    return c.json({ cleared: true });
+  });
+
   app.post("/v2/reflect", async c => {
     const parsed = await parseBody(c, reflectBody);
     if (!parsed.ok) return parsed.response;

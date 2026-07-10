@@ -179,7 +179,10 @@ export interface Entity {
 // (what was noticed), beliefs (what the agent holds to be true). Confidence-
 // weighted. Beliefs can be superseded by newer reflection.
 
-export type CognitiveKind = "experience" | "observation" | "belief";
+// v2.19.0 — "judgment" added: iterative craft conclusions (arc42-style
+// decisions with rationale) — Ardin: "the heart of Layer 3". Stored in
+// their own kind directory; structured fields live in layer3-judgment.ts.
+export type CognitiveKind = "experience" | "observation" | "belief" | "judgment";
 
 // v2.18.0 — Ardin's three knowledge labels (2026-07-10):
 //   personal — concluded from the owner's own documents about the owner's
