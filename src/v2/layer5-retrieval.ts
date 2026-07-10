@@ -417,6 +417,11 @@ export async function recall(
         predicate: fm.predicate,
         object: fm.object,
         valid_from: fm.valid_from,
+        // v2.16.5 — provenance inline: consumers (and benchmarks) can credit
+        // a fact hit back to the episode(s) it came from without a second
+        // lookup.
+        ...(Array.isArray(fm.derived_from) && fm.derived_from.length
+          ? { derived_from: fm.derived_from } : {}),
         ...(fm.invalidated_at ? { invalidated_at: fm.invalidated_at } : {}),
       };
     } else if (kind === "cognitive") {
@@ -430,6 +435,8 @@ export async function recall(
         name: fm.name,
         entity_type: fm.type,
         ...(Array.isArray(fm.aliases) && fm.aliases.length > 0 ? { aliases: fm.aliases } : {}),
+        ...(Array.isArray(fm.derived_from) && fm.derived_from.length
+          ? { derived_from: fm.derived_from } : {}),
       };
     }
     hits.push(hit);
@@ -490,7 +497,29 @@ export async function recall(
 
   hits.sort((a, b) => b.score - a.score);
   const limit = Math.max(1, Math.min(query.limit ?? 10, 100));
-  const finalHits = hits.slice(0, limit);
+
+  // v2.16.5 — result diversification. A chatty source document can spawn
+  // dozens of sibling facts that all keyword-match the same query with
+  // near-identical scores; unchecked, they fill every result slot and bury
+  // the source episodes themselves (LongMemEval round 1: 17 bike-shop facts
+  // from one session pushed both gold episodes below rank 18). Standard
+  // search-engine practice: cap results per source. At most 3 facts per
+  // source episode in the primary ranking; over-cap facts drop behind, and
+  // only fill slots if the limit isn't reached by diverse records.
+  const MAX_FACTS_PER_SOURCE = 3;
+  const perSource = new Map<string, number>();
+  const primary: RetrievalHit[] = [];
+  const overflow: RetrievalHit[] = [];
+  for (const h of hits) {
+    const src = h.kind === "fact" ? h.payload?.derived_from?.[0] : undefined;
+    if (src) {
+      const n = perSource.get(src) ?? 0;
+      if (n >= MAX_FACTS_PER_SOURCE) { overflow.push(h); continue; }
+      perSource.set(src, n + 1);
+    }
+    primary.push(h);
+  }
+  const finalHits = [...primary, ...overflow].slice(0, limit);
 
   // ── Graph expansion of evidence chain ────────────────────────────────
   // For each top hit, walk derived_from up to 2 hops to surface supporting

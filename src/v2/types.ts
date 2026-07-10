@@ -269,6 +269,10 @@ export interface RetrievalHitPayload {
   name?: string;
   entity_type?: string;
   aliases?: string[];
+  // v2.16.5 — provenance inline on fact/entity hits: the episode IDs this
+  // record was derived from, so consumers can credit a hit back to its
+  // source document without a second lookup.
+  derived_from?: string[];
 }
 
 export interface RetrievalResult {

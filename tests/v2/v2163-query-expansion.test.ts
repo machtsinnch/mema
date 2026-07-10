@@ -93,3 +93,35 @@ describe("recall through expansions (keyword path, vector off)", () => {
     rmSync(vault, { recursive: true, force: true });
   });
 });
+
+describe("v2.16.5 — result diversification", () => {
+  test("sibling facts from one source cannot fill every slot", async () => {
+    const vault = fresh();
+    const ep1 = observe(vault, { kind: "document", content: "bike shop list", actor: "t", owner: "o" });
+    const ep2 = observe(vault, { kind: "document", content: "I own four bikes now after buying the gravel bike.", actor: "t", owner: "o" });
+    // 8 sibling facts from ep1, all matching "bike"
+    for (let i = 0; i < 8; i++) {
+      recordFact(vault, {
+        subject: `Bike Shop ${i}`, predicate: "offers", object: "bike rentals",
+        derived_from: [ep1.id], actor: "t", owner: "o",
+      });
+    }
+    const r = await recall(vault, {
+      query: "bike", owner: "o", actor: "t",
+      purpose: "test", use_vector: false, limit: 6,
+    } as any);
+    // The guarantee: diverse records are never crowded out. In the primary
+    // ranking at most 3 sibling facts per source compete; remaining slots
+    // may refill with capped facts only when nothing else is left.
+    const firstFive = r.hits.slice(0, 5);
+    const ep1FactsInTop5 = firstFive.filter(h =>
+      h.kind === "fact" && h.payload?.derived_from?.[0] === ep1.id).length;
+    expect(ep1FactsInTop5).toBeLessThanOrEqual(3);
+    // BOTH episodes must survive into the results despite the fact swarm.
+    expect(r.hits.filter(h => h.kind === "episode").length).toBe(2);
+    // provenance is inlined on fact hits
+    const f = r.hits.find(h => h.kind === "fact");
+    expect(f?.payload?.derived_from?.[0]).toBe(ep1.id);
+    rmSync(vault, { recursive: true, force: true });
+  });
+});

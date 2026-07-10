@@ -608,7 +608,11 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
   // collide, and within a question Ollama queues concurrent extracts.
   // The bench protocol measures answer correctness, not ingestion speed —
   // parallel Phase 1 is methodologically equivalent.
-  const INGEST_CONCURRENCY = 8;
+  // v2.16.4 — was 8. Server-side observe now runs 3-pass consensus
+  // extraction (up to 3 claude CLI calls in flight per request): 8 parallel
+  // observes spawn up to 24 CLI processes, which thrashes the machine and
+  // pushes single observes past Bun's ~5min fetch ceiling.
+  const INGEST_CONCURRENCY = 2;
   const sessionToEpisode = new Map<string, string>();
   const t0 = Date.now();
   const ingestTasks: Array<() => Promise<void>> = [];
@@ -833,9 +837,25 @@ async function runQuestion(args: Args, rec: LMERecord): Promise<ScoredQuestion> 
       const rj = await recallRes.json() as { hits: RecallHit[] };
       const idToSession = new Map<string, string>();
       for (const [sid, eid] of sessionToEpisode) idToSession.set(eid, sid);
-      retrievedSessions = rj.hits
-        .filter(h => h.kind === "episode")
-        .map(h => idToSession.get(h.id) ?? h.id);
+      // v2.16.5 — credit fact/entity hits to their SOURCE session via the
+      // derived_from provenance now inlined on the hit payload. A retrieved
+      // fact IS retrieved knowledge from that session; counting only
+      // episode-kind hits scored a total miss when facts (correctly) ranked
+      // high. Sessions are credited in hit order, deduplicated.
+      const ordered: string[] = [];
+      const seen = new Set<string>();
+      const credit = (sid: string | undefined) => {
+        if (sid && !seen.has(sid)) { seen.add(sid); ordered.push(sid); }
+      };
+      for (const h of rj.hits) {
+        if (h.kind === "episode") credit(idToSession.get(h.id) ?? h.id);
+        else if (h.kind === "fact" || h.kind === "entity") {
+          for (const epId of (h.payload as { derived_from?: string[] } | undefined)?.derived_from ?? []) {
+            credit(idToSession.get(epId));
+          }
+        }
+      }
+      retrievedSessions = ordered;
       factHits = rj.hits.filter(h => h.kind === "fact" && h.payload);
       cognitiveHits = rj.hits.filter(h => h.kind === "cognitive" && h.payload?.content);
       entityHits = rj.hits.filter(h => h.kind === "entity" && h.payload);
