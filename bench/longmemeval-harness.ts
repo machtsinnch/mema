@@ -1261,6 +1261,10 @@ async function main() {
 
   const raw = JSON.parse(readFileSync(args.data, "utf8")) as LMERecord[];
   let questions = raw;
+  // v2.16.6 — rerun a single question by ID (flake retries, autopsies).
+  const onlyQ = process.argv.includes("--question")
+    ? process.argv[process.argv.indexOf("--question") + 1] : null;
+  if (onlyQ) questions = questions.filter(q => q.question_id === onlyQ);
   if (args.category) questions = questions.filter(q => q.question_type === args.category);
   if (args.balanced && !args.category) {
     // Group by category, take ceil(limit/categoryCount) from each, then
