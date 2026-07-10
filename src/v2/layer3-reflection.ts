@@ -21,13 +21,14 @@
 import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import matter from "gray-matter";
-import type { Episode, SemanticFact, CognitiveRecord } from "./types";
+import type { Episode, SemanticFact, CognitiveRecord, BeliefKind } from "./types";
 import {
   recordCognitive, findCognitiveByClaimKey, updateCognitiveSupport, supersedeBelief,
 } from "./layer3-cognitive";
 import { canonicalPredicate } from "./predicates";
 import { isFunctionalFor } from "./layer4-supersession";
 import { readEntity } from "./layer2-entities";
+import { annotateFactCorroboration } from "./layer2-semantic";
 import { pickExtractor } from "./llm-extractor";
 
 export interface ReflectInput {
@@ -37,6 +38,12 @@ export interface ReflectInput {
   since?: string;              // ISO timestamp; default: last 7 days
   min_support?: number;        // minimum evidence count for a belief; default 3
   max_records_emitted?: number;
+  // v2.18.0 — names/aliases that identify the OWNER's own world (their
+  // person entity, their projects/systems). Rule A only creates beliefs
+  // for self subjects; everything else is a WORLD claim and stays in
+  // Layer 2 with a corroboration annotation (Ardin's boundary rule).
+  // Defaults to tokens derived from owner + actor.
+  self_names?: string[];
   // v2.9.0+ — opt-in LLM-driven belief synthesis (NEW; closes Hindsight gap).
   // When true, after the rule-based pass runs, the same window of episodes
   // is fed to a structured-prompt LLM that proposes beliefs/observations as
@@ -60,6 +67,10 @@ export interface ReflectionReport {
   updated?: number;
   unchanged?: number;
   abstained?: Array<{ rule: string; subject: string; predicate: string; reason: string }>;
+  // v2.18.0 — world claims several documents agree on. NOT beliefs (world
+  // claims stay in Layer 2); listed here for transparency, and the facts
+  // involved carry corroboration_sources.
+  world_claims?: Array<{ subject: string; predicate: string; object: string; sources: number }>;
   // v2.9.0+ separate counts for the LLM-driven pass — surfaces how much
   // of the report came from the heuristic strategies vs. the LLM.
   llm_drafts_proposed?: number;
@@ -137,6 +148,18 @@ export function reflect(input: ReflectInput): ReflectionReport {
   const records: CognitiveRecord[] = [];
   let created = 0, updated = 0, unchanged = 0;
   const abstained: NonNullable<ReflectionReport["abstained"]> = [];
+  const worldClaims: NonNullable<ReflectionReport["world_claims"]> = [];
+
+  // v2.18.0 — is this subject part of the owner's own world? Token match
+  // against self names (default: owner + actor identifiers). "Ardin
+  // Ibraimi" and "ardin.me" match owner "ardin-pai"; "Hock Tan" does not.
+  const selfTokens = new Set(
+    (input.self_names ?? [input.owner, input.actor])
+      .flatMap(n => n.toLowerCase().split(/[^a-z0-9]+/))
+      .filter(t => t.length >= 3),
+  );
+  const isSelfSubject = (subject: string): boolean =>
+    subject.toLowerCase().split(/[^a-z0-9]+/).some(t => t.length >= 3 && selfTokens.has(t));
 
   // Write-or-update through the claim key: re-running reflection over
   // unchanged evidence must not duplicate (the autopsy found 150 copies of
@@ -144,6 +167,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
   const upsert = (args: {
     kind: "belief"; content: string; confidence: number;
     derived_from: string[]; claim_key: string; subject_entity_id?: string | null;
+    belief_kind: BeliefKind;
   }): void => {
     if (records.length >= cap) return;
     const existing = findCognitiveByClaimKey(input.vaultRoot, input.owner, args.claim_key);
@@ -152,14 +176,17 @@ export function reflect(input: ReflectInput): ReflectionReport {
         JSON.stringify([...new Set(existing.derived_from)].sort())
         === JSON.stringify([...new Set(args.derived_from)].sort());
       const sameContent = existing.content.trim() === args.content.trim();
-      if (sameSupport && sameContent) { unchanged++; return; }
+      // v2.18.0 — records written before labels existed get the label
+      // backfilled in place instead of counting as unchanged.
+      const sameKind = existing.belief_kind === args.belief_kind;
+      if (sameSupport && sameContent && sameKind) { unchanged++; return; }
       if (!sameContent && existing.kind === "belief") {
         // The conclusion itself changed (e.g. a new current employer):
         // keep history — supersede the old belief with a fresh record.
         const fresh = recordCognitive(input.vaultRoot, {
           kind: args.kind, content: args.content, confidence: args.confidence,
           derived_from: args.derived_from, actor: input.actor, owner: input.owner,
-          claim_key: args.claim_key,
+          claim_key: args.claim_key, belief_kind: args.belief_kind,
           ...(args.subject_entity_id ? { subject_entity_id: args.subject_entity_id } : {}),
         });
         supersedeBelief(input.vaultRoot, existing.id, fresh.id, input.owner, input.actor);
@@ -169,6 +196,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
       // Same conclusion, new evidence — refresh support in place.
       const upd = updateCognitiveSupport(input.vaultRoot, input.owner, existing.id, {
         content: args.content, confidence: args.confidence, derived_from: args.derived_from,
+        belief_kind: args.belief_kind,
       }, input.actor);
       if (upd) { records.push(upd); updated++; }
       return;
@@ -176,7 +204,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
     const r = recordCognitive(input.vaultRoot, {
       kind: args.kind, content: args.content, confidence: args.confidence,
       derived_from: args.derived_from, actor: input.actor, owner: input.owner,
-      claim_key: args.claim_key,
+      claim_key: args.claim_key, belief_kind: args.belief_kind,
       ...(args.subject_entity_id ? { subject_entity_id: args.subject_entity_id } : {}),
     });
     records.push(r); created++;
@@ -207,6 +235,21 @@ export function reflect(input: ReflectInput): ReflectionReport {
   }
   for (const [key, g] of groups) {
     if (g.episodes.size < minSources) continue;
+    // v2.18.0 — world claims stay in Layer 2 (Ardin's boundary rule +
+    // France rule: our own documents agreeing does not make it true).
+    // Only claims about the owner's own world become beliefs; everything
+    // else annotates the facts with the corroboration count and waits for
+    // the fact-check pass to establish truth.
+    if (!isSelfSubject(g.subject)) {
+      for (const f of g.facts) {
+        annotateFactCorroboration(input.vaultRoot, input.owner, f.id, g.episodes.size, input.actor);
+      }
+      worldClaims.push({
+        subject: g.subject, predicate: g.predicate, object: g.object,
+        sources: g.episodes.size,
+      });
+      continue;
+    }
     const meanConf = g.facts.reduce((s, f) => s + f.confidence, 0) / g.facts.length;
     const confidence = Math.min(0.95, meanConf * (0.75 + 0.1 * g.episodes.size));
     upsert({
@@ -216,6 +259,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
       derived_from: [...new Set([...g.facts.map(f => f.id), ...g.episodes])],
       claim_key: `corro|${key}`,
       subject_entity_id: g.subjectEntityId,
+      belief_kind: "personal",
     });
   }
 
@@ -291,6 +335,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
       derived_from: [...new Set([f.id, ...(f.derived_from ?? [])])],
       claim_key: `current|${key}`,
       subject_entity_id: g.subjectEntityId,
+      belief_kind: "personal",
     });
   }
 
@@ -303,6 +348,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
     updated,
     unchanged,
     abstained,
+    world_claims: worldClaims,
   };
 }
 

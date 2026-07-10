@@ -37,9 +37,11 @@ describe("RULE A — corroboration", () => {
     // Single-source claim — must NOT become a belief:
     recordFact(vault, { subject: "Zep", predicate: "uses", object: "Neo4j", derived_from: [ep1.id], actor: "t", owner: "o" });
 
-    const r = reflect({ vaultRoot: vault, owner: "o", actor: "t", since: SINCE });
+    // v2.18.0 — the fixture's subject is the owner's own world, say so.
+    const r = reflect({ vaultRoot: vault, owner: "o", actor: "t", since: SINCE, self_names: ["Princeton"] });
     expect(r.cognitive_records_created).toBe(1);
     expect(r.records[0].kind).toBe("belief");
+    expect(r.records[0].belief_kind).toBe("personal");
     expect(r.records[0].content).toContain("independently stated in 2 documents");
     expect(r.records[0].content.toLowerCase()).toContain("princeton");
     rmSync(vault, { recursive: true, force: true });
@@ -103,9 +105,9 @@ describe("idempotency", () => {
     recordFact(vault, { subject: "Princeton", predicate: "created", object: "CoALA", derived_from: [ep1.id], actor: "t", owner: "o" });
     recordFact(vault, { subject: "Princeton", predicate: "developed", object: "CoALA", derived_from: [ep2.id], actor: "t", owner: "o" });
 
-    const r1 = reflect({ vaultRoot: vault, owner: "o", actor: "t", since: SINCE });
+    const r1 = reflect({ vaultRoot: vault, owner: "o", actor: "t", since: SINCE, self_names: ["Princeton"] });
     expect(r1.cognitive_records_created).toBe(1);
-    const r2 = reflect({ vaultRoot: vault, owner: "o", actor: "t", since: SINCE });
+    const r2 = reflect({ vaultRoot: vault, owner: "o", actor: "t", since: SINCE, self_names: ["Princeton"] });
     expect(r2.cognitive_records_created).toBe(0);
     expect(r2.unchanged).toBe(1);
     rmSync(vault, { recursive: true, force: true });

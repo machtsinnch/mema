@@ -138,6 +138,11 @@ export interface SemanticFact {
   reviewed_by?: string;        // actor that approved/rejected
   reviewed_at?: string;
   review_reason?: string;
+  // v2.18.0 — world claims stay in Layer 2 (Ardin's boundary rule):
+  // when several INDEPENDENT documents state the same world claim,
+  // reflection annotates the facts instead of creating a Layer 3 belief.
+  corroboration_sources?: number;      // distinct source documents agreeing
+  corroboration_updated_at?: string;
 }
 
 export interface Entity {
@@ -165,6 +170,17 @@ export interface Entity {
 
 export type CognitiveKind = "experience" | "observation" | "belief";
 
+// v2.18.0 — Ardin's three knowledge labels (2026-07-10):
+//   personal — concluded from the owner's own documents about the owner's
+//              own world; not checkable on the internet.
+//   opinion  — a stance; always attributed to its holder, never presented
+//              as world truth, never deleted (the France rule).
+//   judgment — iterative craft conclusion (arc42-style decision with
+//              rationale); reserved until the judgment record type ships.
+// World claims carry NO belief_kind because they must not become beliefs
+// at all — they stay in Layer 2 with a corroboration annotation.
+export type BeliefKind = "personal" | "opinion" | "judgment";
+
 export interface CognitiveRecord {
   id: string;
   kind: CognitiveKind;
@@ -180,6 +196,8 @@ export interface CognitiveRecord {
   claim_key?: string;
   // v2.17.0 — entity link for the belief's subject, same as facts carry.
   subject_entity_id?: string | null;
+  // v2.18.0 — see BeliefKind above. Only meaningful when kind === "belief".
+  belief_kind?: BeliefKind;
 }
 
 // ─── Layer 4: Governance (the trust moat) ───────────────────────────

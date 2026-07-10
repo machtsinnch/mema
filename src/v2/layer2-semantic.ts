@@ -239,6 +239,39 @@ export function readFact(vaultRoot: string, owner: string, id: string): Semantic
 // Get all facts for an owner that were valid at a given point in time.
 // Skips facts invalidated before `at`, or whose valid_to is before `at`.
 // v2.7+: skips drafts and rejected records unless includeDrafts is true.
+// v2.18.0 — world claims stay in Layer 2 (Ardin's boundary rule,
+// 2026-07-10). When reflection finds the same WORLD claim independently
+// stated in several documents, it must NOT create a Layer 3 belief
+// (internal repetition ≠ truth — the France rule). Instead the agreement
+// is recorded HERE, on the facts themselves, as a corroboration
+// annotation. The later fact-check pass adds the actual truth stamp.
+// Idempotent: re-running reflection with the same count writes nothing.
+export function annotateFactCorroboration(
+  vaultRoot: string,
+  owner: string,
+  factId: string,
+  sources: number,
+  actor: string,
+): boolean {
+  const path = pathForFact(vaultRoot, owner, factId);
+  if (!path) return false;
+  const parsed = matter(readFileSync(path, "utf8"));
+  const fm = parsed.data as Record<string, unknown>;
+  if (fm.owner !== owner) return false;
+  if (fm.corroboration_sources === sources) return false;
+  fm.corroboration_sources = sources;
+  fm.corroboration_updated_at = new Date().toISOString();
+  atomicWriteFile(path, matter.stringify(parsed.content, fm));
+  appendAudit({
+    op: "EXTRACT",
+    actor,
+    owner,
+    record_ids: [factId],
+    reason: `corroboration_annotate:${sources}_sources`,
+  });
+  return true;
+}
+
 export function getFactsValidAt(
   vaultRoot: string,
   owner: string,

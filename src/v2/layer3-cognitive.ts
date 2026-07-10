@@ -12,7 +12,7 @@ import { mkdirSync, readFileSync, existsSync, readdirSync } from "node:fs";
 import { atomicWriteFile } from "./atomic";
 import { join } from "node:path";
 import matter from "gray-matter";
-import type { CognitiveRecord, CognitiveKind } from "./types";
+import type { CognitiveRecord, CognitiveKind, BeliefKind } from "./types";
 import { clampConfidence, toWikilinks, slugify, recordFilename, idFromFilename } from "./types";
 
 // Resolve a cognitive record's on-disk path by ULID, regardless of kind
@@ -49,6 +49,8 @@ export interface RecordCognitiveInput {
   // the belief subject's entity link, mirroring what facts carry.
   claim_key?: string;
   subject_entity_id?: string | null;
+  // v2.18.0 — Ardin's knowledge label (personal/opinion/judgment).
+  belief_kind?: BeliefKind;
 }
 
 export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput): CognitiveRecord {
@@ -66,6 +68,7 @@ export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput):
     owner: input.owner,
     ...(input.claim_key ? { claim_key: input.claim_key } : {}),
     ...(input.subject_entity_id ? { subject_entity_id: input.subject_entity_id } : {}),
+    ...(input.belief_kind ? { belief_kind: input.belief_kind } : {}),
   };
 
   const dir = join(vaultRoot, "cognitive", input.owner, input.kind);
@@ -91,6 +94,7 @@ export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput):
     status,
     ...(input.claim_key ? { claim_key: input.claim_key } : {}),
     ...(input.subject_entity_id ? { subject_entity_id: input.subject_entity_id } : {}),
+    ...(input.belief_kind ? { belief_kind: input.belief_kind } : {}),
     ...(input.evidence_excerpt ? { evidence_excerpt: input.evidence_excerpt.slice(0, 500) } : {}),
     ...(input.proposed_by ? { proposed_by: input.proposed_by, proposed_at: now } : {}),
     links,
@@ -310,7 +314,7 @@ export function updateCognitiveSupport(
   vaultRoot: string,
   owner: string,
   id: string,
-  updates: { content: string; confidence: number; derived_from: string[] },
+  updates: { content: string; confidence: number; derived_from: string[]; belief_kind?: BeliefKind },
   actor: string,
 ): CognitiveRecord | null {
   const path = pathForCognitive(vaultRoot, owner, id);
@@ -320,6 +324,8 @@ export function updateCognitiveSupport(
   if (fm.owner !== owner) return null;
   fm.confidence = clampConfidence(updates.confidence);
   fm.derived_from = [...new Set(updates.derived_from)];
+  // v2.18.0 — also backfills the knowledge label onto pre-label records.
+  if (updates.belief_kind) fm.belief_kind = updates.belief_kind;
   fm.reflected_at = new Date().toISOString();
   fm.links = toWikilinks([
     ...(fm.derived_from as string[]),

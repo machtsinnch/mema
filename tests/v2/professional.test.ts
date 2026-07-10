@@ -123,12 +123,15 @@ describe("Layer 3 — Automated reflection", () => {
     const cutoff = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
     const report = reflect({
       vaultRoot: v, owner: "ardin", actor: "ardin", since: cutoff,
+      // v2.18.0 — marcel-r is the owner's own world in this fixture.
+      self_names: ["marcel-r"],
     });
     expect(report.windowed_episodes).toBe(3);
     expect(report.windowed_facts).toBe(3);
     const beliefs = report.records.filter(r => r.kind === "belief");
     expect(beliefs.length).toBe(1);
     expect(beliefs[0].content).toContain("independently stated in 2 documents");
+    expect(beliefs[0].belief_kind).toBe("personal");
     // Provenance: 2 fact IDs + 2 episode IDs.
     expect(beliefs[0].derived_from.length).toBe(4);
   });
