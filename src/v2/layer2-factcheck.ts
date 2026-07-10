@@ -13,7 +13,12 @@
 // callers must batch deliberately; scripts/fact-check.ts groups facts by
 // claim and checks each claim once.
 
-import type { FactCheckVerdict } from "./types";
+import { readdirSync, readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import matter from "gray-matter";
+import type { FactCheckVerdict, SemanticFact } from "./types";
+import { canonicalPredicate } from "./predicates";
+import { annotateFactVerification } from "./layer2-semantic";
 
 export interface FactCheckClaim {
   subject: string;
@@ -70,6 +75,106 @@ export function parseFactCheck(raw: string): FactCheckResult {
       ? parsed.sources.filter((s): s is string => typeof s === "string").slice(0, 3)
       : [],
   };
+}
+
+// ── Automatic checking (v2.18.2, Ardin: "fact checking should run
+// automatically") ─────────────────────────────────────────────────────
+//
+// After every reflection run the API kicks off a background pass over
+// corroborated world claims that have no verification stamp yet —
+// sequential, capped, idempotent (already-stamped claims are skipped).
+
+export interface PendingClaim {
+  subject: string;
+  predicate: string;
+  object: string;
+  as_of?: string;
+  factIds: string[];
+}
+
+/** Corroborated claims (>= minSources independent documents) whose facts
+ *  carry NO verification stamp yet. One entry per DISTINCT claim. */
+export function listUnverifiedClaims(
+  vaultRoot: string,
+  owner: string,
+  opts: { minSources?: number } = {},
+): PendingClaim[] {
+  const minSources = opts.minSources ?? 2;
+  const dir = join(vaultRoot, "facts", owner);
+  if (!existsSync(dir)) return [];
+  const groups = new Map<string, PendingClaim & { checked: boolean }>();
+  for (const file of readdirSync(dir)) {
+    if (!file.endsWith(".md")) continue;
+    let f: SemanticFact;
+    try { f = matter(readFileSync(join(dir, file), "utf8")).data as SemanticFact; }
+    catch { continue; }
+    if ((f.status ?? "approved") !== "approved") continue;
+    if (f.invalidated_at || f.superseded_by) continue;
+    if ((f.corroboration_sources ?? 0) < minSources) continue;
+    const key = `${(f.subject ?? "").trim().toLowerCase()}|${canonicalPredicate(f.predicate)}|${(f.object ?? "").trim().toLowerCase()}`;
+    const g = groups.get(key) ?? {
+      subject: f.subject, predicate: f.predicate, object: f.object,
+      ...(f.valid_from && f.valid_from.length <= 10 ? { as_of: f.valid_from } : {}),
+      factIds: [], checked: false,
+    };
+    g.factIds.push(f.id);
+    if (f.verification) g.checked = true;
+    groups.set(key, g);
+  }
+  return [...groups.values()].filter(g => !g.checked)
+    .map(({ checked: _checked, ...claim }) => claim);
+}
+
+export interface FactCheckRunResult {
+  checked: Array<{ claim: string; verdict: string; note: string; sources: string[]; factsStamped: number }>;
+  errors: Array<{ claim: string; error: string }>;
+  /** claims still unchecked after this run (beyond the limit) */
+  pending: number;
+}
+
+export async function factCheckUnverified(
+  vaultRoot: string,
+  owner: string,
+  actor: string,
+  opts: {
+    limit?: number;
+    minSources?: number;
+    model?: string;
+    timeoutMs?: number;
+    /** injectable for tests — defaults to the real CLI web-search checker */
+    checker?: (claim: FactCheckClaim) => Promise<FactCheckResult>;
+  } = {},
+): Promise<FactCheckRunResult> {
+  const limit = opts.limit ?? 5;
+  const checker = opts.checker
+    ?? ((c: FactCheckClaim) => checkClaimWithCLI(c, { model: opts.model, timeoutMs: opts.timeoutMs }));
+  const all = listUnverifiedClaims(vaultRoot, owner, { minSources: opts.minSources });
+  const queue = all.slice(0, limit);
+  const out: FactCheckRunResult = { checked: [], errors: [], pending: all.length - queue.length };
+  for (const g of queue) {
+    const sentence = claimSentence(g);
+    try {
+      const r = await checker(g);
+      let stamped = 0;
+      for (const id of g.factIds) {
+        if (annotateFactVerification(vaultRoot, owner, id, r, actor)) stamped++;
+      }
+      out.checked.push({ claim: sentence, verdict: r.verdict, note: r.note, sources: r.sources, factsStamped: stamped });
+    } catch (e) {
+      out.errors.push({ claim: sentence, error: (e as Error).message });
+    }
+  }
+  return out;
+}
+
+// Auto mode is ON by default (Ardin, 2026-07-10). Off under `bun test`
+// (no hidden web calls in tests) unless explicitly forced on;
+// MEMA_FACTCHECK_AUTO=false turns it off anywhere.
+export function factCheckAutoEnabled(): boolean {
+  const flag = process.env.MEMA_FACTCHECK_AUTO;
+  if (flag === "false") return false;
+  if (flag === "true") return true;
+  return process.env.NODE_ENV !== "test";
 }
 
 export async function checkClaimWithCLI(

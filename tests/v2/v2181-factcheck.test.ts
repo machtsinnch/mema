@@ -6,7 +6,10 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseFactCheck, claimSentence } from "../../src/v2/layer2-factcheck";
+import {
+  parseFactCheck, claimSentence, listUnverifiedClaims, factCheckUnverified, factCheckAutoEnabled,
+} from "../../src/v2/layer2-factcheck";
+import { annotateFactCorroboration } from "../../src/v2/layer2-semantic";
 import { recordFact, readFact, annotateFactVerification } from "../../src/v2/layer2-semantic";
 import { observe } from "../../src/v2/layer1-episodic";
 import { recall } from "../../src/v2/layer5-retrieval";
@@ -85,5 +88,77 @@ describe("retrieval demotes contradicted facts", () => {
     expect(wrongHit).toBeDefined();
     expect(cleanHit!.score).toBeGreaterThan(wrongHit!.score);
     rmSync(vault, { recursive: true, force: true });
+  });
+});
+
+describe("automatic fact-check pass (v2.18.2)", () => {
+  test("checks only unverified corroborated claims, respects the limit, stamps all facts", async () => {
+    const vault = fresh();
+    const ep1 = observe(vault, { kind: "document", content: "a", actor: "t", owner: "o" });
+    const ep2 = observe(vault, { kind: "document", content: "b", actor: "t", owner: "o" });
+    // Two corroborated claims (2 facts each) + one uncorroborated fact.
+    const ids: string[] = [];
+    for (const [s, p, ob] of [["TSMC", "supplies", "Nvidia"], ["ASML", "supplies", "TSMC"]] as const) {
+      for (const ep of [ep1, ep2]) {
+        const f = recordFact(vault, { subject: s, predicate: p, object: ob, derived_from: [ep.id], actor: "t", owner: "o" });
+        annotateFactCorroboration(vault, "o", f.id, 2, "t");
+        ids.push(f.id);
+      }
+    }
+    recordFact(vault, { subject: "Zug", predicate: "hosts", object: "Quorix", derived_from: [ep1.id], actor: "t", owner: "o" });
+
+    expect(listUnverifiedClaims(vault, "o")).toHaveLength(2);
+
+    // Stubbed checker — no web, deterministic.
+    const seen: string[] = [];
+    const checker = async (c: { subject: string }) => {
+      seen.push(c.subject);
+      return { verdict: "confirmed" as const, note: "stub", sources: ["https://example.org"] };
+    };
+
+    const r1 = await factCheckUnverified(vault, "o", "t", { limit: 1, checker });
+    expect(r1.checked).toHaveLength(1);
+    expect(r1.pending).toBe(1);
+    expect(r1.checked[0].factsStamped).toBe(2);
+
+    // Second pass picks up the remaining claim and skips the stamped one.
+    const r2 = await factCheckUnverified(vault, "o", "t", { limit: 5, checker });
+    expect(r2.checked).toHaveLength(1);
+    expect(r2.pending).toBe(0);
+    expect(new Set(seen).size).toBe(2);
+
+    // Nothing left.
+    expect(listUnverifiedClaims(vault, "o")).toHaveLength(0);
+    rmSync(vault, { recursive: true, force: true });
+  });
+
+  test("a failing check is reported and does not block the rest", async () => {
+    const vault = fresh();
+    const ep1 = observe(vault, { kind: "document", content: "a", actor: "t", owner: "o" });
+    const ep2 = observe(vault, { kind: "document", content: "b", actor: "t", owner: "o" });
+    for (const [s, ob] of [["A", "B"], ["C", "D"]] as const) {
+      for (const ep of [ep1, ep2]) {
+        const f = recordFact(vault, { subject: s, predicate: "supplies", object: ob, derived_from: [ep.id], actor: "t", owner: "o" });
+        annotateFactCorroboration(vault, "o", f.id, 2, "t");
+      }
+    }
+    let n = 0;
+    const checker = async () => {
+      if (++n === 1) throw new Error("boom");
+      return { verdict: "unverifiable" as const, note: "stub", sources: [] };
+    };
+    const r = await factCheckUnverified(vault, "o", "t", { limit: 5, checker });
+    expect(r.errors).toHaveLength(1);
+    expect(r.checked).toHaveLength(1);
+    rmSync(vault, { recursive: true, force: true });
+  });
+
+  test("auto mode is off under bun test unless forced on", () => {
+    expect(factCheckAutoEnabled()).toBe(false);   // NODE_ENV=test here
+    process.env.MEMA_FACTCHECK_AUTO = "true";
+    expect(factCheckAutoEnabled()).toBe(true);
+    process.env.MEMA_FACTCHECK_AUTO = "false";
+    expect(factCheckAutoEnabled()).toBe(false);
+    delete process.env.MEMA_FACTCHECK_AUTO;
   });
 });

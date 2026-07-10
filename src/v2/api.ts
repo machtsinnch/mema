@@ -8,6 +8,7 @@ import {
   approveFact, rejectFact, listDraftFacts, evidenceCheck,
   findContradictions,
 } from "./layer2-semantic";
+import { factCheckAutoEnabled, factCheckUnverified, listUnverifiedClaims } from "./layer2-factcheck";
 import {
   createEntity, readEntity, findEntityByName, listEntities, mergeEntities,
   approveEntity, rejectEntity, listDraftEntities, entityEvidenceCheck,
@@ -849,7 +850,23 @@ export function mountV2(app: Hono, cfg: V2Config): void {
       llm_max_per_window: parsed.body.llm_max_per_window,
     };
     const report = parsed.body.llm ? await reflectLLM(args) : reflect(args);
-    return c.json({ report });
+    // v2.18.2 — Ardin (2026-07-10): fact-checking runs automatically.
+    // After every reflection, corroborated world claims without a
+    // verification stamp are checked in the BACKGROUND (sequential CLI
+    // web-search calls, capped at 5 per run — quota-gentle). The
+    // response only reports how many started; results land on the fact
+    // records and in the audit log as they finish.
+    let factChecksStarted = 0;
+    if (factCheckAutoEnabled()) {
+      const pending = listUnverifiedClaims(cfg.vaultRoot, owner);
+      factChecksStarted = Math.min(pending.length, 5);
+      if (factChecksStarted > 0) {
+        factCheckUnverified(cfg.vaultRoot, owner, actor, { limit: 5 })
+          .then(r => console.log(`[fact-check] ${owner}: ${r.checked.length} checked, ${r.errors.length} errors, ${r.pending} still pending`))
+          .catch(e => console.error(`[fact-check] ${owner}: ${(e as Error).message}`));
+      }
+    }
+    return c.json({ report, fact_checks_started: factChecksStarted });
   });
 
   // ── Layer 5: Vector index management ─────────────────────────────
