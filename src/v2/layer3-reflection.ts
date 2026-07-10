@@ -5,23 +5,28 @@
 // no-LLM-on-every-write principle is preserved. Reflection can be triggered
 // via POST /v2/reflect or via a scheduled cron job (operator choice).
 //
-// v2.0 strategy: rule-based synthesis. We aggregate evidence by entity and
-// produce three kinds of cognitive records:
-//   - experience  : an episode marked with kind "tool_call" or "observation"
-//                   becomes an experience record summarizing what happened
-//   - observation : pattern across N+ episodes mentioning the same entity
-//                   becomes an observation about that entity
-//   - belief      : when 3+ supporting episodes/facts converge on a fact,
-//                   produce a belief with confidence proportional to support
-//
-// v2.1 will add LLM-backed reflection as an opt-in upgrade.
+// v2.17.0 strategy — evidence rules only, no filler (the pronoun-counter
+// and episode-photocopier strategies were deleted after the 2026-07-10
+// small-batch autopsy). Two deterministic rules produce beliefs:
+//   RULE A  corroboration — the same claim (entity-resolved subject,
+//           canonical predicate, object) stated independently in >=2
+//           distinct documents.
+//   RULE B  current state — for one-value relations (works_at, lives_in,
+//           ...), the single current value, but ONLY when time is
+//           orderable (world date or supersession history). No dates ->
+//           no conclusion; abstentions are reported (Ardin's rule).
+// Idempotent via claim_key: re-runs update or skip, never duplicate.
+// LLM-assisted reflection (opt-in) is scheduled for the next round.
 
 import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { Episode, SemanticFact, CognitiveRecord } from "./types";
-import { recordCognitive } from "./layer3-cognitive";
-import { factValidSince } from "./temporal";
+import {
+  recordCognitive, findCognitiveByClaimKey, updateCognitiveSupport, supersedeBelief,
+} from "./layer3-cognitive";
+import { canonicalPredicate } from "./predicates";
+import { isFunctional } from "./layer4-supersession";
 import { pickExtractor } from "./llm-extractor";
 
 export interface ReflectInput {
@@ -46,6 +51,14 @@ export interface ReflectionReport {
   windowed_facts: number;
   cognitive_records_created: number;
   records: CognitiveRecord[];
+  // v2.17.0 — idempotency + transparency counters. Re-running reflection
+  // over unchanged evidence yields created=0 and only `unchanged` grows.
+  // `abstained` lists conclusions reflection REFUSED to draw and why
+  // (Ardin's rule 2026-07-10: better silent than wrong) — silence must be
+  // visible, not implicit.
+  updated?: number;
+  unchanged?: number;
+  abstained?: Array<{ rule: string; subject: string; predicate: string; reason: string }>;
   // v2.9.0+ separate counts for the LLM-driven pass — surfaces how much
   // of the report came from the heuristic strategies vs. the LLM.
   llm_drafts_proposed?: number;
@@ -73,7 +86,13 @@ function loadEpisodes(vaultRoot: string, owner: string, since: string): Episode[
   return out;
 }
 
-function loadFacts(vaultRoot: string, owner: string, since: string): SemanticFact[] {
+// v2.17.0 — load ALL approved facts. Conclusions are properties of the
+// whole vault (two documents corroborating a claim may be months apart),
+// so reflection no longer windows the fact set. The old code windowed on
+// valid_from, which after v2.15's event-date fix meant WORLD time: your
+// 2023 certification fell "outside last week" and was invisible to
+// reflection. The `since` window is now informational only (report counts).
+function loadFacts(vaultRoot: string, owner: string): SemanticFact[] {
   const dir = join(vaultRoot, "facts", owner);
   if (!existsSync(dir)) return [];
   const out: SemanticFact[] = [];
@@ -82,110 +101,181 @@ function loadFacts(vaultRoot: string, owner: string, since: string): SemanticFac
     try {
       const parsed = matter(readFileSync(join(dir, f), "utf8"));
       const fact = parsed.data as SemanticFact;
-      // v2.7.4+ epoch-ms temporal comparison (W8).
-      if (factValidSince(fact, since)) out.push(fact);
+      if ((fact.status ?? "approved") !== "approved") continue;
+      out.push(fact);
     } catch { /* skip */ }
   }
   return out;
 }
 
-// Tokenize content to extract candidate entities (capitalized multi-word phrases
-// or quoted strings). This is intentionally crude — proper extraction is v2.1.
-function candidateEntities(text: string): string[] {
-  const out = new Set<string>();
-  // Multi-word capitalized phrases (e.g., "Marcel Schmidt", "Säule 3a")
-  const phrases = text.match(/\b([A-ZÄÖÜ][\wäöü]+(?:\s+[A-ZÄÖÜ0-9][\wäöü0-9]+){0,3})\b/g) ?? [];
-  for (const p of phrases) {
-    if (p.length >= 3 && p.length <= 80) out.add(p);
-  }
-  return [...out];
+// Learn-time of a fact: when mema first stored it (proposed_at from the
+// consensus extractor), falling back to valid_from for hand-written facts.
+function learnTime(f: SemanticFact): string {
+  return (f as { proposed_at?: string }).proposed_at ?? f.valid_from ?? "";
+}
+
+// A world date is a plain YYYY / YYYY-MM / YYYY-MM-DD from the source text;
+// ingestion fallbacks are full ISO timestamps. Length distinguishes them.
+function hasWorldDate(f: SemanticFact): boolean {
+  return typeof f.valid_from === "string" && f.valid_from.length <= 10 && f.valid_from.length >= 4;
 }
 
 export function reflect(input: ReflectInput): ReflectionReport {
   const cutoff = input.since
     ?? new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
-  const minSupport = input.min_support ?? 3;
   const cap = input.max_records_emitted ?? 50;
+  // v2.17.0 — corroboration needs at least this many DISTINCT source
+  // documents agreeing on the same claim (was: >=3 facts regardless of
+  // source, which let one document corroborate itself).
+  const minSources = Math.max(2, input.min_support ?? 2);
 
   const episodes = loadEpisodes(input.vaultRoot, input.owner, cutoff);
-  const facts = loadFacts(input.vaultRoot, input.owner, cutoff);
+  const facts = loadFacts(input.vaultRoot, input.owner);
+  const windowedFacts = facts.filter(f => learnTime(f) >= cutoff).length;
 
   const records: CognitiveRecord[] = [];
+  let created = 0, updated = 0, unchanged = 0;
+  const abstained: NonNullable<ReflectionReport["abstained"]> = [];
 
-  // ── Strategy 1: each tool_call / observation episode becomes an experience
-  for (const ep of episodes) {
-    if (records.length >= cap) break;
-    if (ep.kind !== "tool_call" && ep.kind !== "observation") continue;
-    const r = recordCognitive(input.vaultRoot, {
-      kind: "experience",
-      content: ep.content.slice(0, 280),
-      confidence: 0.7,
-      derived_from: [ep.id],
-      actor: input.actor,
-      owner: input.owner,
-    });
-    records.push(r);
-  }
-
-  // ── Strategy 2: entity-mention frequency → observation
-  const entityCounts = new Map<string, { count: number; episode_ids: Set<string> }>();
-  for (const ep of episodes) {
-    const cands = candidateEntities(ep.content);
-    for (const c of cands) {
-      const entry = entityCounts.get(c) ?? { count: 0, episode_ids: new Set<string>() };
-      entry.count++;
-      entry.episode_ids.add(ep.id);
-      entityCounts.set(c, entry);
+  // Write-or-update through the claim key: re-running reflection over
+  // unchanged evidence must not duplicate (the autopsy found 150 copies of
+  // 50 records after three runs).
+  const upsert = (args: {
+    kind: "belief"; content: string; confidence: number;
+    derived_from: string[]; claim_key: string; subject_entity_id?: string | null;
+  }): void => {
+    if (records.length >= cap) return;
+    const existing = findCognitiveByClaimKey(input.vaultRoot, input.owner, args.claim_key);
+    if (existing) {
+      const sameSupport =
+        JSON.stringify([...new Set(existing.derived_from)].sort())
+        === JSON.stringify([...new Set(args.derived_from)].sort());
+      const sameContent = existing.content.trim() === args.content.trim();
+      if (sameSupport && sameContent) { unchanged++; return; }
+      if (!sameContent && existing.kind === "belief") {
+        // The conclusion itself changed (e.g. a new current employer):
+        // keep history — supersede the old belief with a fresh record.
+        const fresh = recordCognitive(input.vaultRoot, {
+          kind: args.kind, content: args.content, confidence: args.confidence,
+          derived_from: args.derived_from, actor: input.actor, owner: input.owner,
+          claim_key: args.claim_key,
+          ...(args.subject_entity_id ? { subject_entity_id: args.subject_entity_id } : {}),
+        });
+        supersedeBelief(input.vaultRoot, existing.id, fresh.id, input.owner, input.actor);
+        records.push(fresh); created++;
+        return;
+      }
+      // Same conclusion, new evidence — refresh support in place.
+      const upd = updateCognitiveSupport(input.vaultRoot, input.owner, existing.id, {
+        content: args.content, confidence: args.confidence, derived_from: args.derived_from,
+      }, input.actor);
+      if (upd) { records.push(upd); updated++; }
+      return;
     }
-  }
-  for (const [entity, { count, episode_ids }] of entityCounts) {
-    if (records.length >= cap) break;
-    if (count < minSupport) continue;
-    if (episode_ids.size < 2) continue;  // mentioned in only 1 episode is too narrow
     const r = recordCognitive(input.vaultRoot, {
-      kind: "observation",
-      content: `Entity "${entity}" mentioned ${count} times across ${episode_ids.size} episodes since ${cutoff}.`,
-      confidence: Math.min(0.5 + count / 20, 0.9),
-      derived_from: [...episode_ids],
-      actor: input.actor,
-      owner: input.owner,
+      kind: args.kind, content: args.content, confidence: args.confidence,
+      derived_from: args.derived_from, actor: input.actor, owner: input.owner,
+      claim_key: args.claim_key,
+      ...(args.subject_entity_id ? { subject_entity_id: args.subject_entity_id } : {}),
     });
-    records.push(r);
+    records.push(r); created++;
+  };
+
+  // ── RULE A — corroboration: the SAME claim stated independently in
+  // several documents becomes a belief. Grouped by entity-or-name subject,
+  // canonical predicate and object, so alias spellings and predicate
+  // synonyms tally together (same normalization the consensus vote uses).
+  interface Group {
+    facts: SemanticFact[]; episodes: Set<string>;
+    subject: string; predicate: string; object: string;
+    subjectEntityId: string | null;
+  }
+  const groups = new Map<string, Group>();
+  const active = facts.filter(f => !f.invalidated_at && !f.superseded_by);
+  for (const f of active) {
+    const subjKey = f.subject_entity_id ?? f.subject.trim().toLowerCase();
+    const key = `${subjKey}|${canonicalPredicate(f.predicate)}|${f.object.trim().toLowerCase()}`;
+    const g = groups.get(key) ?? {
+      facts: [], episodes: new Set<string>(),
+      subject: f.subject, predicate: f.predicate, object: f.object,
+      subjectEntityId: f.subject_entity_id ?? null,
+    };
+    g.facts.push(f);
+    for (const ep of f.derived_from ?? []) g.episodes.add(ep);
+    groups.set(key, g);
+  }
+  for (const [key, g] of groups) {
+    if (g.episodes.size < minSources) continue;
+    const meanConf = g.facts.reduce((s, f) => s + f.confidence, 0) / g.facts.length;
+    const confidence = Math.min(0.95, meanConf * (0.75 + 0.1 * g.episodes.size));
+    upsert({
+      kind: "belief",
+      content: `${g.subject} ${g.predicate} ${g.object} — independently stated in ${g.episodes.size} documents.`,
+      confidence,
+      derived_from: [...new Set([...g.facts.map(f => f.id), ...g.episodes])],
+      claim_key: `corro|${key}`,
+      subject_entity_id: g.subjectEntityId,
+    });
   }
 
-  // ── Strategy 3: subject-predicate frequency → belief
-  // Group facts by subject+predicate; if N≥minSupport facts converge, form a belief.
-  const groupedFacts = new Map<string, SemanticFact[]>();
-  for (const f of facts) {
-    if ((f as any).invalidated_at) continue;
-    const k = `${f.subject}::${f.predicate}`;
-    const arr = groupedFacts.get(k) ?? [];
-    arr.push(f);
-    groupedFacts.set(k, arr);
+  // ── RULE B — current state of one-value relations (works_at, lives_in,
+  // ...): conclude which value is CURRENT, but only when the evidence can
+  // actually order time. Ardin's rule (2026-07-10): no dates -> no
+  // conclusion; abstentions are reported, never silent.
+  interface StateGroup {
+    current: SemanticFact[]; superseded: number;
+    subject: string; predicate: string; subjectEntityId: string | null;
   }
-  for (const [key, group] of groupedFacts) {
-    if (records.length >= cap) break;
-    if (group.length < minSupport) continue;
-    const [subj, pred] = key.split("::");
-    const objs = [...new Set(group.map(f => f.object))];
-    const avgConf = group.reduce((s, f) => s + f.confidence, 0) / group.length;
-    const r = recordCognitive(input.vaultRoot, {
+  const stateGroups = new Map<string, StateGroup>();
+  for (const f of facts) {
+    if (!isFunctional(f.predicate)) continue;
+    const subjKey = f.subject_entity_id ?? f.subject.trim().toLowerCase();
+    const key = `${subjKey}|${canonicalPredicate(f.predicate)}`;
+    const g = stateGroups.get(key) ?? {
+      current: [], superseded: 0,
+      subject: f.subject, predicate: f.predicate,
+      subjectEntityId: f.subject_entity_id ?? null,
+    };
+    if (f.invalidated_at || f.superseded_by) g.superseded++;
+    else g.current.push(f);
+    stateGroups.set(key, g);
+  }
+  for (const [key, g] of stateGroups) {
+    if (g.current.length === 0) continue;
+    if (g.current.length > 1) {
+      abstained.push({
+        rule: "current-state", subject: g.subject, predicate: g.predicate,
+        reason: `${g.current.length} candidate values and no dates to order them — refusing to guess which is current`,
+      });
+      continue;
+    }
+    const f = g.current[0];
+    // A lone undated fact with no superseded history would make the belief
+    // a photocopy of the fact — no added knowledge. Conclude only when
+    // either history exists (supersession established currency) or the
+    // fact carries a world date.
+    if (g.superseded === 0 && !hasWorldDate(f)) continue;
+    const since = hasWorldDate(f) ? ` since ${f.valid_from}` : "";
+    const history = g.superseded > 0 ? `; replaced ${g.superseded} earlier value(s)` : "";
+    upsert({
       kind: "belief",
-      content: `${subj} ${pred} ${objs.join(" / ")} (supported by ${group.length} convergent fact(s); avg confidence ${avgConf.toFixed(2)}).`,
-      confidence: Math.min(avgConf * Math.min(group.length / 5, 1.0) + 0.3, 0.95),
-      derived_from: group.map(f => f.id),
-      actor: input.actor,
-      owner: input.owner,
+      content: `${g.subject} currently ${g.predicate} ${f.object}${since}${history}.`,
+      confidence: Math.min(0.95, f.confidence + 0.05 * g.superseded),
+      derived_from: [...new Set([f.id, ...(f.derived_from ?? [])])],
+      claim_key: `current|${key}`,
+      subject_entity_id: g.subjectEntityId,
     });
-    records.push(r);
   }
 
   return {
     reflected_at: new Date().toISOString(),
     windowed_episodes: episodes.length,
-    windowed_facts: facts.length,
-    cognitive_records_created: records.length,
+    windowed_facts: windowedFacts,
+    cognitive_records_created: created,
     records,
+    updated,
+    unchanged,
+    abstained,
   };
 }
 
@@ -229,7 +319,7 @@ export async function reflectLLM(input: ReflectInput): Promise<ReflectionReport>
   const maxDrafts = input.llm_max_per_window ?? 10;
   const cutoff = input.since ?? new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
   const episodes = loadEpisodes(input.vaultRoot, input.owner, cutoff);
-  const facts = loadFacts(input.vaultRoot, input.owner, cutoff);
+  const facts = loadFacts(input.vaultRoot, input.owner).filter(f => learnTime(f) >= cutoff);
 
   const windowParts: string[] = [];
   let budget = 8000;  // chars

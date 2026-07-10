@@ -64,14 +64,39 @@ const FUNCTIONAL_PREDICATES = new Set<string>([
   "current_status",
   "current_version",
   "current_owner",
-  "owns",        // X owns Y is sometimes multi-valued but usually replacement
+  // v2.17.0 — "owns" REMOVED (Ardin's decision 2026-07-10): people and
+  // organizations own many things at once; treating ownership as one-value
+  // silently replaced valid ownership facts and produced false "currently
+  // owns" conclusions in L3. Ownership facts now accumulate.
 ]);
 
-function isFunctional(predicate: string): boolean {
+export function isFunctional(predicate: string): boolean {
   // v2.16.1 — check the canonical form too, so "works_for"/"employed_by"
   // hit the works_at gate even if the synonym table canonicalizes them.
   const raw = predicate.trim().toLowerCase();
   return FUNCTIONAL_PREDICATES.has(raw) || FUNCTIONAL_PREDICATES.has(canonicalPredicate(predicate));
+}
+
+// v2.17.0 — one-value-ness depends on WHO the subject is (Ardin's decision
+// 2026-07-10): a person lives in one place, but a company is located in
+// many (HQ, factories, offices) — treating location as one-value for
+// organizations replaced "TSMC located_in Taiwan" with "…Germany" (the
+// Dresden fab) at write time. Location predicates are functional ONLY for
+// person subjects; unknown subject type → NOT functional for locations
+// (better accumulate than wrongly replace). All other functional
+// predicates keep their behavior regardless of type.
+const PERSON_ONLY_CLASSES = new Set(["lives_in", "based_in"]);
+
+export function isFunctionalFor(
+  predicate: string,
+  subjectEntityType: string | null | undefined,
+): boolean {
+  if (!isFunctional(predicate)) return false;
+  const canon = canonicalPredicate(predicate);
+  if (PERSON_ONLY_CLASSES.has(canon)) {
+    return subjectEntityType === "person";
+  }
+  return true;
 }
 
 /**

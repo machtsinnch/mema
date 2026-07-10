@@ -174,6 +174,12 @@ export interface CognitiveRecord {
   reflected_at: string;        // when reflection happened
   superseded_by?: string | null;
   owner: string;
+  // v2.17.0 — stable identity of the conclusion, independent of wording.
+  // Reflection uses it to UPDATE an existing record on re-run instead of
+  // duplicating it (three autopsy runs produced 150 copies of 50 records).
+  claim_key?: string;
+  // v2.17.0 — entity link for the belief's subject, same as facts carry.
+  subject_entity_id?: string | null;
 }
 
 // ─── Layer 4: Governance (the trust moat) ───────────────────────────

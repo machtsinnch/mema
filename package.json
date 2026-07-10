@@ -1,6 +1,6 @@
 {
   "name": "machtsinn.ai",
-  "version": "2.16.6",
+  "version": "2.17.0",
   "license": "BUSL-1.1",
   "module": "src/index.ts",
   "type": "module",

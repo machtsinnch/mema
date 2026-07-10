@@ -45,6 +45,10 @@ export interface RecordCognitiveInput {
   status?: "draft" | "approved" | "rejected";
   evidence_excerpt?: string;
   proposed_by?: string;
+  // v2.17.0 — stable conclusion identity (for idempotent reflection) and
+  // the belief subject's entity link, mirroring what facts carry.
+  claim_key?: string;
+  subject_entity_id?: string | null;
 }
 
 export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput): CognitiveRecord {
@@ -60,6 +64,8 @@ export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput):
     reflected_at: now,
     superseded_by: null,
     owner: input.owner,
+    ...(input.claim_key ? { claim_key: input.claim_key } : {}),
+    ...(input.subject_entity_id ? { subject_entity_id: input.subject_entity_id } : {}),
   };
 
   const dir = join(vaultRoot, "cognitive", input.owner, input.kind);
@@ -83,6 +89,8 @@ export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput):
     superseded_by: record.superseded_by,
     owner: record.owner,
     status,
+    ...(input.claim_key ? { claim_key: input.claim_key } : {}),
+    ...(input.subject_entity_id ? { subject_entity_id: input.subject_entity_id } : {}),
     ...(input.evidence_excerpt ? { evidence_excerpt: input.evidence_excerpt.slice(0, 500) } : {}),
     ...(input.proposed_by ? { proposed_by: input.proposed_by, proposed_at: now } : {}),
     links,
@@ -261,4 +269,70 @@ export function supersedeBelief(
     return parsed.data as CognitiveRecord;
   }
   return null;
+}
+
+// ── v2.17.0 — idempotent reflection support ──────────────────────────
+
+// Find a cognitive record by its stable claim_key (scans the owner's
+// cognitive dirs). Returns the newest non-superseded match, or null.
+export function findCognitiveByClaimKey(
+  vaultRoot: string,
+  owner: string,
+  claimKey: string,
+): CognitiveRecord | null {
+  const base = join(vaultRoot, "cognitive", owner);
+  if (!existsSync(base)) return null;
+  let best: CognitiveRecord | null = null;
+  for (const kind of readdirSync(base)) {
+    const dir = join(base, kind);
+    let files: string[];
+    try { files = readdirSync(dir); } catch { continue; }
+    for (const f of files) {
+      if (!f.endsWith(".md")) continue;
+      try {
+        const parsed = matter(readFileSync(join(dir, f), "utf8"));
+        // content lives in the BODY, not the frontmatter — attach it so
+        // callers can compare conclusions textually.
+        const r = { ...(parsed.data as CognitiveRecord), content: parsed.content.trim() };
+        if (r.claim_key !== claimKey) continue;
+        if (r.superseded_by) continue;
+        if (!best || r.reflected_at > best.reflected_at) best = r;
+      } catch { /* skip malformed */ }
+    }
+  }
+  return best;
+}
+
+// Update an existing conclusion in place (same id, same file identity):
+// refresh content, confidence, support and reflected_at. Used when
+// reflection re-runs and the underlying evidence changed. Audit-logged.
+export function updateCognitiveSupport(
+  vaultRoot: string,
+  owner: string,
+  id: string,
+  updates: { content: string; confidence: number; derived_from: string[] },
+  actor: string,
+): CognitiveRecord | null {
+  const path = pathForCognitive(vaultRoot, owner, id);
+  if (!path) return null;
+  const parsed = matter(readFileSync(path, "utf8"));
+  const fm = parsed.data as Record<string, unknown>;
+  if (fm.owner !== owner) return null;
+  fm.confidence = clampConfidence(updates.confidence);
+  fm.derived_from = [...new Set(updates.derived_from)];
+  fm.reflected_at = new Date().toISOString();
+  fm.links = toWikilinks([
+    ...(fm.derived_from as string[]),
+    ...(fm.superseded_by ? [String(fm.superseded_by)] : []),
+  ]);
+  atomicWriteFile(path, matter.stringify(updates.content, fm));
+  appendAudit({
+    op: "REFLECT",
+    actor,
+    owner,
+    record_ids: [id],
+    evidence_chain: fm.derived_from as string[],
+    reason: "reflection_update",
+  });
+  return { ...(fm as unknown as CognitiveRecord), content: updates.content };
 }

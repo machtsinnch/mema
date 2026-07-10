@@ -99,41 +99,38 @@ describe("Layer 2 — Entity CRUD", () => {
 // ─── Layer 3: Reflection ─────────────────────────────────────────────
 
 describe("Layer 3 — Automated reflection", () => {
-  test("produces beliefs from convergent facts", () => {
+  test("produces a corroboration belief when 2+ documents state the same claim (v2.17.0 contract)", () => {
     const v = fresh();
-    // Create 3 episodes
     const ep1 = observe(v, { kind: "observation", content: "Marcel R. founded machtsinn.", actor: "ardin", owner: "ardin" });
-    const ep2 = observe(v, { kind: "observation", content: "Marcel R. is the CEO of machtsinn.", actor: "ardin", owner: "ardin" });
+    const ep2 = observe(v, { kind: "observation", content: "machtsinn was founded by Marcel R.", actor: "ardin", owner: "ardin" });
     const ep3 = observe(v, { kind: "observation", content: "Marcel R. presented at Swiss Insurtech 2026.", actor: "ardin", owner: "ardin" });
 
-    // Create 3 facts about the same subject+predicate
+    // The SAME claim stated in two separate documents (synonym predicates),
+    // plus one unrelated single-source fact that must NOT become a belief.
     recordFact(v, {
-      subject: "marcel-r", predicate: "role_at", object: "machtsinn",
+      subject: "marcel-r", predicate: "founded", object: "machtsinn",
       derived_from: [ep1.id], confidence: 0.9, actor: "ardin", owner: "ardin",
     });
     recordFact(v, {
-      subject: "marcel-r", predicate: "role_at", object: "machtsinn-AG",
+      subject: "marcel-r", predicate: "created", object: "machtsinn",
       derived_from: [ep2.id], confidence: 0.85, actor: "ardin", owner: "ardin",
     });
     recordFact(v, {
-      subject: "marcel-r", predicate: "role_at", object: "machtsinn",
+      subject: "marcel-r", predicate: "presented_at", object: "Swiss Insurtech 2026",
       derived_from: [ep3.id], confidence: 0.95, actor: "ardin", owner: "ardin",
     });
 
     const cutoff = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
     const report = reflect({
-      vaultRoot: v, owner: "ardin", actor: "ardin",
-      since: cutoff, min_support: 3,
+      vaultRoot: v, owner: "ardin", actor: "ardin", since: cutoff,
     });
     expect(report.windowed_episodes).toBe(3);
     expect(report.windowed_facts).toBe(3);
-    // Expect at least one belief from the 3 convergent role_at facts
     const beliefs = report.records.filter(r => r.kind === "belief");
-    expect(beliefs.length).toBeGreaterThanOrEqual(1);
-    const roleBelief = beliefs.find(b => b.content.includes("role_at"));
-    expect(roleBelief).toBeDefined();
-    expect(roleBelief!.derived_from.length).toBe(3);
-    rmSync(v, { recursive: true, force: true });
+    expect(beliefs.length).toBe(1);
+    expect(beliefs[0].content).toContain("independently stated in 2 documents");
+    // Provenance: 2 fact IDs + 2 episode IDs.
+    expect(beliefs[0].derived_from.length).toBe(4);
   });
 
   test("no-LLM principle: reflect() makes no external API calls", async () => {

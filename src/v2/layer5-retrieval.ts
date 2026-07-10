@@ -299,7 +299,14 @@ export async function recall(
     ).length;
     const titleBoost = Math.min(titleHits / Math.max(queryTokens.length, 1), 1);
 
-    const layerPrior = kind === "cognitive" ? 1.0 : kind === "fact" ? 0.9 : kind === "episode" ? 0.7 : 0.6;
+    // v2.17.0 — cognitive trust is per-kind, no longer a blanket 1.0:
+    // beliefs are multi-source conclusions and rank above facts;
+    // observations/experiences rank below facts (the old flat 1.0 let
+    // pronoun-counter filler outrank real facts).
+    const layerPrior =
+      kind === "cognitive"
+        ? (rec.frontmatter.kind === "belief" ? 0.95 : 0.75)
+        : kind === "fact" ? 0.9 : kind === "episode" ? 0.7 : 0.6;
     // CRITICAL: defensive clamp against NaN/Infinity in stored confidence.
     // Even though clampConfidence is applied at write boundaries, legacy v1
     // records may have arbitrary trust values.
