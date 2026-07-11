@@ -384,7 +384,8 @@ export function mountV2(app: Hono, cfg: V2Config): void {
             ...(eventDate ? { valid_from: eventDate } : {}),
             // v2.16.0 — consensus provenance: which extractor, and how many
             // of the parallel passes agreed on this triple.
-            ...(f.votes ? { proposed_by: `${extractor.name} consensus:${f.votes}/${f.passes}` } : {}),
+            ...(f.votes ? { proposed_by: `${extractor.name} consensus:${f.votes}/${f.passes}${f.evidence_verified ? "+evidence" : ""}` } : {}),
+            ...(f.evidence ? { evidence_excerpt: f.evidence } : {}),
             confidence: f.confidence ?? 0.8,
             derived_from: [ep.id],
             actor,

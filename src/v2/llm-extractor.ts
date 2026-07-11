@@ -36,6 +36,14 @@ export interface ExtractedFact {
   // proposed_by provenance by /v2/observe.
   votes?: number;
   passes?: number;
+  // v2.20.0 — the ONE verbatim sentence from the source that states this
+  // fact. Used by the evidence-rescue gate: a below-majority fact survives
+  // only if this quote appears character-for-character in the source text.
+  evidence?: string | null;
+  // Set by consensusMerge when a below-majority fact passed the verbatim-
+  // evidence gate. /v2/observe marks provenance "+evidence" and lowers
+  // confidence accordingly.
+  evidence_verified?: boolean;
 }
 export interface ExtractedEntity {
   name: string;
@@ -104,11 +112,12 @@ Rules:
 - For entities, type must be one of: person | organization | product | system | place | concept | event.
 - Confidence: 0.95 for explicitly stated, 0.85 for clearly implied, ≤0.75 means don't emit.
 - event_date: the date the fact became true IN THE WORLD, as "YYYY", "YYYY-MM", or "YYYY-MM-DD" — ONLY when the text states or clearly implies it (a stated year, a dated announcement, "since 2019"). If the text gives no date for the fact, use null. NEVER invent a date, NEVER use today's date, NEVER use the document's date unless the fact is about the document itself.
+- evidence: the ONE sentence from the text that states this fact, copied EXACTLY, character for character. Never paraphrase, never shorten, never merge two sentences. If no single sentence states it, the claim is not explicit enough — do not emit the fact.
 
 Output ONLY valid JSON. No prose, no markdown fences. Schema:
 {
   "facts": [
-    {"subject": "...", "predicate": "...", "object": "...", "confidence": 0.95, "event_date": "YYYY-MM-DD or null"}
+    {"subject": "...", "predicate": "...", "object": "...", "confidence": 0.95, "event_date": "YYYY-MM-DD or null", "evidence": "exact sentence from the text"}
   ],
   "entities": [
     {"name": "...", "type": "..."}
@@ -127,9 +136,9 @@ PostgreSQL supports JSONB indexing. The Apache Software Foundation manages the K
 
 const FEW_SHOT_ASSISTANT = `{
   "facts": [
-    {"subject": "PostgreSQL", "predicate": "supports", "object": "JSONB indexing", "confidence": 0.95, "event_date": null},
-    {"subject": "Apache Software Foundation", "predicate": "manages", "object": "Kafka project", "confidence": 0.95, "event_date": null},
-    {"subject": "Linus Torvalds", "predicate": "founded", "object": "Linux kernel project", "confidence": 0.95, "event_date": "1991"}
+    {"subject": "PostgreSQL", "predicate": "supports", "object": "JSONB indexing", "confidence": 0.95, "event_date": null, "evidence": "PostgreSQL supports JSONB indexing."},
+    {"subject": "Apache Software Foundation", "predicate": "manages", "object": "Kafka project", "confidence": 0.95, "event_date": null, "evidence": "The Apache Software Foundation manages the Kafka project."},
+    {"subject": "Linus Torvalds", "predicate": "founded", "object": "Linux kernel project", "confidence": 0.95, "event_date": "1991", "evidence": "Linus Torvalds founded the Linux kernel project in 1991."}
   ],
   "entities": [
     {"name": "PostgreSQL", "type": "system"},
@@ -341,7 +350,30 @@ export function mergeExtractionResults(results: ExtractionResult[]): ExtractionR
 // Threshold = majority of SUCCESSFUL passes (3→2, 2→2, 1→1), so a single
 // flaky CLI call cannot zero a document. Deterministic given the pass
 // outputs: keys are normalized, ties resolve by first appearance.
-export function consensusMerge(perPass: ExtractionResult[]): ExtractionResult {
+// v2.20.0 — evidence-rescue gate. Diagnosed on Arachne ADR-016: on dense
+// design prose the three passes each notice DIFFERENT true facts (5/7/8
+// proposed, ~2 overlapping), so majority voting kept correctness but
+// destroyed coverage (~80% loss). The rescue: a below-majority fact
+// survives when its quoted evidence sentence appears VERBATIM in the
+// source text AND names both sides of the triple. Deterministic, zero
+// extra model calls. Agreement stays the gold gate; verbatim evidence is
+// the silver one — rescued facts enter with capped confidence and
+// explicit "+evidence" provenance.
+export function evidencePassesGate(f: ExtractedFact, sourceText: string): boolean {
+  const ev = (f.evidence ?? "").trim();
+  if (ev.length < 20) return false;
+  const norm = (x: string) => x.toLowerCase().replace(/\s+/g, " ").trim();
+  if (!norm(sourceText).includes(norm(ev))) return false;
+  const evNorm = norm(ev);
+  const mentions = (side: string): boolean => {
+    const toks = side.toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length >= 3);
+    if (toks.length === 0) return evNorm.includes(side.toLowerCase().trim());
+    return toks.some(t => evNorm.includes(t));
+  };
+  return mentions(f.subject ?? "") && mentions(f.object ?? "");
+}
+
+export function consensusMerge(perPass: ExtractionResult[], sourceText?: string): ExtractionResult {
   const ok = perPass.length;
   if (ok === 0) return { facts: [], entities: [] };
   if (ok === 1) {
@@ -427,7 +459,25 @@ export function consensusMerge(perPass: ExtractionResult[]): ExtractionResult {
 
   const facts: ExtractedFact[] = [];
   for (const { first, subjKey, objKey, votes, confidences, dates } of factTally.values()) {
-    if (votes < threshold) continue;
+    if (votes < threshold) {
+      // v2.20.0 — evidence rescue (see evidencePassesGate above).
+      if (!sourceText || !evidencePassesGate(first, sourceText)) continue;
+      const d = sanitizeEventDate(first.event_date);
+      facts.push({
+        ...first,
+        subject: entityCased.get(subjKey) ?? first.subject,
+        object: entityCased.get(objKey) ?? first.object,
+        // Silver gate = lower ceiling: never above 0.6.
+        confidence: Math.min(0.6, confidences.reduce((a, b) => a + b, 0) / confidences.length),
+        // "Never invent" extends to dates: a rescued fact keeps its date
+        // only when the quoted evidence itself contains the year.
+        event_date: d && (first.evidence ?? "").includes(d.slice(0, 4)) ? d : null,
+        votes,
+        passes: ok,
+        evidence_verified: true,
+      });
+      continue;
+    }
     // event_date must ITSELF win a majority — "never invent" extends to
     // dates: a date one pass hallucinated onto an agreed triple is dropped.
     const dateCounts = new Map<string, number>();
@@ -693,7 +743,7 @@ export class ClaudeCLIExtractor implements LLMExtractor {
         .map((job, i) => (job.ci === ci ? raw[i] : null))
         .filter((r): r is ExtractionResult => r !== null);
       if (okPasses.length === 0) { failedChunks++; continue; }
-      perChunkConsensus.push(consensusMerge(okPasses));
+      perChunkConsensus.push(consensusMerge(okPasses, chunks[ci]));
     }
     // Every chunk failed (CLI unavailable / all passes timed out) — surface
     // it so /v2/observe records pending_retry instead of silently zero facts.
