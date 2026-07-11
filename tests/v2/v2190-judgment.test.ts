@@ -167,3 +167,63 @@ describe("judgments in retrieval", () => {
     rmSync(vault, { recursive: true, force: true });
   });
 });
+
+describe("two-stage flags: relevance screening (v2.19.2)", () => {
+  test("candidates are kept as relevant or dropped per the screener's verdicts", async () => {
+    const { screenJudgmentCandidates } = await import("../../src/v2/layer3-judgment");
+    const vault = fresh();
+    const ep = observe(vault, { kind: "document", content: "x", actor: "a", owner: "o" });
+    const f1 = recordFact(vault, { subject: "Pulumi", predicate: "supports", object: "TypeScript", derived_from: [ep.id], actor: "a", owner: "o" });
+    const j = recordJudgment(vault, {
+      question: "Which tool for infrastructure?", decision: "Use Pulumi", rationale: "fits the team",
+      based_on: [f1.id], actor: "a", owner: "o",
+    });
+    const fGood = recordFact(vault, { subject: "Pulumi", predicate: "lacks", object: "native testing", derived_from: [ep.id], actor: "a", owner: "o" });
+    const fNoise = recordFact(vault, { subject: "Pulumi", predicate: "sponsors", object: "a conference", derived_from: [ep.id], actor: "a", owner: "o" });
+    flagJudgmentsForFact(vault, "o", fGood, "a");
+    flagJudgmentsForFact(vault, "o", fNoise, "a");
+    expect(readJudgment(vault, "o", j.id)!.review_flags).toHaveLength(2);
+
+    const r = await screenJudgmentCandidates(vault, "o", "a", {
+      screener: async (_j, cands) => cands.map(c => ({
+        fact_id: c.fact_id,
+        relevant: c.fact_id === fGood.id,
+        reason: c.fact_id === fGood.id ? "missing capability affects the choice" : "sponsorship is unrelated",
+      })),
+    });
+    expect(r.judgments_screened).toBe(1);
+    expect(r.kept).toBe(1);
+    expect(r.dropped).toBe(1);
+
+    const after = readJudgment(vault, "o", j.id)!;
+    expect(after.review_flags).toHaveLength(1);
+    expect(after.review_flags![0].fact_id).toBe(fGood.id);
+    expect(after.review_flags![0].status).toBe("relevant");
+    expect(after.review_flags![0].screen_reason).toContain("capability");
+
+    // Second run: nothing left to screen → screener not called.
+    const r2 = await screenJudgmentCandidates(vault, "o", "a", {
+      screener: async () => { throw new Error("must not be called"); },
+    });
+    expect(r2.judgments_screened).toBe(0);
+    rmSync(vault, { recursive: true, force: true });
+  });
+
+  test("screener failure leaves candidates untouched for the next run", async () => {
+    const { screenJudgmentCandidates } = await import("../../src/v2/layer3-judgment");
+    const vault = fresh();
+    const ep = observe(vault, { kind: "document", content: "x", actor: "a", owner: "o" });
+    const f1 = recordFact(vault, { subject: "Zig", predicate: "compiles", object: "C", derived_from: [ep.id], actor: "a", owner: "o" });
+    recordJudgment(vault, { question: "q", decision: "d", rationale: "r", based_on: [f1.id], actor: "a", owner: "o" });
+    const f2 = recordFact(vault, { subject: "Zig", predicate: "adds", object: "async", derived_from: [ep.id], actor: "a", owner: "o" });
+    flagJudgmentsForFact(vault, "o", f2, "a");
+
+    const r = await screenJudgmentCandidates(vault, "o", "a", {
+      screener: async () => { throw new Error("model unavailable"); },
+    });
+    expect(r.errors).toHaveLength(1);
+    const j = listJudgments(vault, "o", { flagged: true })[0];
+    expect((j.review_flags![0].status ?? "candidate")).toBe("candidate");
+    rmSync(vault, { recursive: true, force: true });
+  });
+});

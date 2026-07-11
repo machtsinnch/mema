@@ -11,7 +11,7 @@ import {
 import { factCheckAutoEnabled, factCheckUnverified, listUnverifiedClaims } from "./layer2-factcheck";
 import {
   recordJudgment, readJudgment, listJudgments, supersedeJudgment,
-  flagJudgmentsForFact, clearJudgmentFlags,
+  flagJudgmentsForFact, clearJudgmentFlags, screenJudgmentCandidates,
 } from "./layer3-judgment";
 import {
   createEntity, readEntity, findEntityByName, listEntities, mergeEntities,
@@ -917,6 +917,11 @@ export function mountV2(app: Hono, cfg: V2Config): void {
           .then(r => console.log(`[fact-check] ${owner}: ${r.checked.length} checked, ${r.errors.length} errors, ${r.pending} still pending`))
           .catch(e => console.error(`[fact-check] ${owner}: ${(e as Error).message}`));
       }
+      // v2.19.2 — candidate review flags get their relevance check in the
+      // same background slot (one model call per touched judgment).
+      screenJudgmentCandidates(cfg.vaultRoot, owner, actor, { limit: 5 })
+        .then(r => { if (r.judgments_screened > 0) console.log(`[flag-screen] ${owner}: ${r.kept} kept, ${r.dropped} dropped`); })
+        .catch(e => console.error(`[flag-screen] ${owner}: ${(e as Error).message}`));
     }
     return c.json({ report, fact_checks_started: factChecksStarted });
   });

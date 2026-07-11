@@ -21,7 +21,7 @@ import { join, basename } from "node:path";
 import matter from "gray-matter";
 import type { SemanticFact } from "../src/v2/types";
 import { extractJudgmentFromDocument } from "../src/v2/llm-judgment-extractor";
-import { recordJudgment, supersedeJudgment, listJudgments } from "../src/v2/layer3-judgment";
+import { recordJudgment, supersedeJudgment, listJudgments, screenJudgmentCandidates } from "../src/v2/layer3-judgment";
 import { initAudit } from "../src/v2/layer6-audit";
 
 function arg(flag: string, fallback: string): string {
@@ -39,7 +39,10 @@ const apiKey = process.env.MEMA_API_KEY ?? "dev-ardin";
 
 initAudit(vault);
 
-const files = readdirSync(folder).filter(f => f.endsWith(".md")).sort().slice(0, limit);
+const from = arg("--from", "");
+const files = readdirSync(folder).filter(f => f.endsWith(".md")).sort()
+  .filter(f => !from || f >= from)
+  .slice(0, limit);
 console.log(`replaying ${files.length} document(s) as owner "${owner}" via port ${port}`);
 
 // "ADR-15" / "adr-015" → "15" (for resolving supersedes references).
@@ -113,7 +116,16 @@ for (const file of files) {
   if (myRef) judgmentByRef.set(myRef, judgment.id);
   console.log(`  judgment ${judgment.id} [${proposal.status}] — ${proposal.decision.slice(0, 90)}`);
 
-  // 4. Supersession chain, with the document's own reason.
+  // 4. Relevance-screen any candidate flags this document's facts raised
+  //    (one model call per touched judgment — Ardin's two-stage design).
+  try {
+    const sc = await screenJudgmentCandidates(vault, owner, "replay-script", { limit: 10 });
+    if (sc.judgments_screened > 0) {
+      console.log(`  flags screened: ${sc.kept} kept, ${sc.dropped} dropped (${sc.judgments_screened} judgment(s))`);
+    }
+  } catch (e) { console.log(`  FLAG SCREENING ERROR: ${(e as Error).message}`); }
+
+  // 5. Supersession chain, with the document's own reason.
   for (const ref of proposal.supersedes_refs) {
     const key = ref ? refKey(ref) : null;
     const oldId = key ? judgmentByRef.get(key) : undefined;

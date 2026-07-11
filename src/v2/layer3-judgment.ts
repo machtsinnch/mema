@@ -37,6 +37,11 @@ export interface JudgmentReviewFlag {
   flagged_at: string;
   fact_id: string;
   because: string;             // plain English: what new evidence arrived
+  // v2.19.2 — two-stage flagging (Ardin's call): structural watch writes a
+  // "candidate"; a model relevance check promotes it to "relevant" or
+  // removes it. Missing status (pre-v2.19.2 flags) = candidate.
+  status?: "candidate" | "relevant";
+  screen_reason?: string;
 }
 
 export interface Judgment extends CognitiveRecord {
@@ -247,6 +252,7 @@ export function flagJudgmentsForFact(
       flagged_at: new Date().toISOString(),
       fact_id: fact.id,
       because: `new fact: ${fact.subject} ${fact.predicate} ${fact.object}`,
+      status: "candidate",
     });
     fm.review_flags = flags;
     atomicWriteFile(join(dir, f), matter.stringify(parsed.content, fm));
@@ -288,4 +294,88 @@ export function clearJudgmentFlags(
     reason: `judgment_flags_cleared:${resolution.slice(0, 160)}`,
   });
   return true;
+}
+
+// v2.19.2 — the relevance gate (Ardin, 2026-07-10): candidates from the
+// wide structural net are screened per judgment by ONE model call; facts
+// that bear on the decision become "relevant" flags, the rest are
+// removed with the screener's reason in the audit log. Injectable
+// screener keeps tests deterministic.
+import type { FlagCandidate, FlagVerdict, JudgmentSummary } from "./llm-flag-screener";
+import { screenFlagsWithCLI } from "./llm-flag-screener";
+
+export interface ScreenResult {
+  judgments_screened: number;
+  kept: number;
+  dropped: number;
+  errors: Array<{ judgment_id: string; error: string }>;
+}
+
+export async function screenJudgmentCandidates(
+  vaultRoot: string,
+  owner: string,
+  actor: string,
+  opts: {
+    limit?: number;
+    screener?: (j: JudgmentSummary, c: FlagCandidate[]) => Promise<FlagVerdict[]>;
+  } = {},
+): Promise<ScreenResult> {
+  const limit = opts.limit ?? 5;
+  const screener = opts.screener ?? screenFlagsWithCLI;
+  const out: ScreenResult = { judgments_screened: 0, kept: 0, dropped: 0, errors: [] };
+  const dir = join(vaultRoot, "cognitive", owner, "judgment");
+  if (!existsSync(dir)) return out;
+  for (const f of readdirSync(dir)) {
+    if (out.judgments_screened >= limit) break;
+    if (!f.endsWith(".md")) continue;
+    let parsed: matter.GrayMatterFile<string>;
+    try { parsed = matter(readFileSync(join(dir, f), "utf8")); } catch { continue; }
+    const fm = parsed.data as Record<string, unknown>;
+    if (fm.kind !== "judgment" || fm.superseded_by) continue;
+    const flags = (fm.review_flags as JudgmentReviewFlag[]) ?? [];
+    const candidates = flags.filter(fl => (fl.status ?? "candidate") === "candidate");
+    if (candidates.length === 0) continue;
+
+    out.judgments_screened++;
+    let verdicts: FlagVerdict[];
+    try {
+      verdicts = await screener(
+        {
+          question: String(fm.question ?? ""),
+          decision: String(fm.decision ?? ""),
+          rationale: String(fm.rationale ?? ""),
+        },
+        candidates.map(c => ({ fact_id: c.fact_id, because: c.because })),
+      );
+    } catch (e) {
+      out.errors.push({ judgment_id: String(fm.id), error: (e as Error).message });
+      continue;
+    }
+    const byId = new Map(verdicts.map(v => [v.fact_id, v]));
+    const next: JudgmentReviewFlag[] = [];
+    let kept = 0, dropped = 0;
+    for (const fl of flags) {
+      if ((fl.status ?? "candidate") !== "candidate") { next.push(fl); continue; }
+      const v = byId.get(fl.fact_id);
+      if (!v) { next.push(fl); continue; }          // no verdict → stays candidate, retried next run
+      if (v.relevant) {
+        next.push({ ...fl, status: "relevant", screen_reason: v.reason });
+        kept++;
+      } else {
+        dropped++;                                   // removed — reason preserved in audit
+      }
+    }
+    fm.review_flags = next;
+    atomicWriteFile(join(dir, f), matter.stringify(parsed.content, fm));
+    appendAudit({
+      op: "REFLECT",
+      actor,
+      owner,
+      record_ids: [String(fm.id)],
+      reason: `judgment_flags_screened:kept=${kept},dropped=${dropped}`,
+    });
+    out.kept += kept;
+    out.dropped += dropped;
+  }
+  return out;
 }
