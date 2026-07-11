@@ -19,7 +19,7 @@ import {
   resolveEntity,
 } from "./layer2-entities";
 import { findEpisode } from "./layer1-episodic";
-import { pickExtractor, sanitizeEventDate } from "./llm-extractor";
+import { pickExtractor, sanitizeEventDate, isSelfReferentialTriple } from "./llm-extractor";
 import {
   recordCognitive, supersedeBelief, addDerivedFrom,
   approveCognitive, rejectCognitive, listDraftCognitive, pathForCognitive,
@@ -366,6 +366,12 @@ export function mountV2(app: Hono, cfg: V2Config): void {
           // extractor found a date IN THE TEXT, it becomes valid_from, so
           // bi-temporal ordering and supersession follow reality. No date
           // extracted → recordFact falls back to now() as before.
+          // v2.19.3 — drop self-referential triples ("Arachne supersedes
+          // Arachne runtime") before they reach Layer 2.
+          if (isSelfReferentialTriple(f.subject, f.object)) {
+            rejectedFacts.push({ reason: `self_referential:${f.subject}|${f.object}`.slice(0, 120) });
+            continue;
+          }
           const eventDate = sanitizeEventDate(f.event_date);
           const subjectEntityId = resolveRef(f.subject);
           const objectEntityId = resolveRef(f.object);

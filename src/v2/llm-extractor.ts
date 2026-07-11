@@ -53,6 +53,24 @@ export interface ExtractionResult {
 // YYYY, YYYY-MM, or YYYY-MM-DD with a sane year; anything else (prose,
 // ISO timestamps with invented precision, years like 0001 or 9999) → null,
 // which callers treat as "no world date known" and fall back to now().
+// v2.19.3 — self-referential triple guard (Arachne replay finding: the
+// extractor emitted "Arachne supersedes Arachne runtime" — subject and
+// object are the same thing under two names). A fact whose subject's
+// words are a subset of its object's words (or vice versa) says nothing
+// about the world beyond naming; better to lose a marginal tautology
+// ("Arachne includes Arachne runtime") than keep garbage.
+export function isSelfReferentialTriple(subject: string, object: string): boolean {
+  const tokens = (s: string): Set<string> => new Set(
+    s.toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length > 0),
+  );
+  const a = tokens(subject);
+  const b = tokens(object);
+  if (a.size === 0 || b.size === 0) return false;
+  const subset = (x: Set<string>, y: Set<string>): boolean =>
+    [...x].every(t => y.has(t));
+  return subset(a, b) || subset(b, a);
+}
+
 export function sanitizeEventDate(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const v = raw.trim();

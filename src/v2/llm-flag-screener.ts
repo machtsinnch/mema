@@ -32,8 +32,10 @@ const SYSTEM_PROMPT = `You judge whether newly learned facts are relevant to an 
 You get the decision (question, decision, rationale) and a list of new facts. Answer ONLY one JSON object, no prose, no fences:
 {"verdicts":[{"fact_id":"...","relevant":true|false,"reason":"one short plain-English sentence"}]}
 
-relevant=true ONLY if the fact could plausibly affect whether this decision still stands: a new constraint, a contradiction, a capability appearing or disappearing, a cost/risk change.
+relevant=true ONLY if the fact could plausibly CHANGE whether this decision still stands: a new constraint, a contradiction, a capability appearing or disappearing, a cost/risk change.
 relevant=false for facts that merely mention the same project or product without bearing on THIS decision.
+relevant=false for facts that CONFIRM, support, reinforce, or are consistent with the decision — agreement is not a reason to re-open a decision. If your reason would contain words like "confirms", "consistent with", "reinforces", "supports", or "aligns with", the verdict is false.
+Example: decision "use Datomic-style schema"; fact "project uses Datomic" → relevant=false (confirmation). Fact "Datomic license terms changed" → relevant=true (new risk).
 Return a verdict for EVERY fact_id you were given.`;
 
 export function parseFlagVerdicts(raw: string): FlagVerdict[] {
