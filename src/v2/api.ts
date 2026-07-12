@@ -906,7 +906,13 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     if (supersedes_id && supersession_reason) {
       superseded = supersedeJudgment(cfg.vaultRoot, owner, supersedes_id, judgment.id, supersession_reason, actor);
     }
-    return c.json({ judgment, ...(supersedes_id ? { superseded_old: superseded } : {}) });
+    // v2.22.3 (round-3 finding): supersedeJudgment mutates the NEW judgment
+    // on disk (iteration bump + supersedes back-link) but not the object
+    // recordJudgment returned. Re-read so the response matches the persisted
+    // record (and a subsequent GET) instead of reporting iteration 1 / no
+    // supersedes for exactly the case iteration exists to describe.
+    const fresh = superseded ? (readJudgment(cfg.vaultRoot, owner, judgment.id) ?? judgment) : judgment;
+    return c.json({ judgment: fresh, ...(supersedes_id ? { superseded_old: superseded } : {}) });
   });
 
   app.get("/v2/judgments", c => {

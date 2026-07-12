@@ -84,10 +84,29 @@ export function isSelfReferentialTriple(subject: string, object: string): boolea
 export function sanitizeEventDate(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const v = raw.trim();
-  if (!/^\d{4}(-\d{2}(-\d{2})?)?$/.test(v)) return null;
-  const year = Number(v.slice(0, 4));
+  const m = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/.exec(v);
+  if (!m) return null;
+  const year = Number(m[1]);
   if (year < 1000 || year > 2100) return null;
-  if (Number.isNaN(Date.parse(v))) return null;  // rejects 2026-13, 2026-02-31
+  // v2.22.3 (round-3 finding): validate the calendar by COMPONENT + UTC
+  // round-trip, NOT Date.parse. On the Bun/JSC runtime mema runs on,
+  // Date.parse rolls day-overflow dates forward ('2026-06-31' -> 2026-07-01,
+  // '2023-02-29' -> 2023-03-01), so the old NaN check let impossible days
+  // through and stored them as valid_from — desyncing the string-ordered
+  // write classifier from the Date-parsed read validity. Reject month not in
+  // 1-12; when a day is present, confirm new Date(Date.UTC(y,m-1,d)) reflects
+  // it back unchanged (catches Feb 30/31, 31-day overflow, non-leap Feb 29).
+  if (m[2] !== undefined) {
+    const month = Number(m[2]);
+    if (month < 1 || month > 12) return null;
+    if (m[3] !== undefined) {
+      const day = Number(m[3]);
+      const d = new Date(Date.UTC(year, month - 1, day));
+      if (d.getUTCFullYear() !== year || d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) {
+        return null;
+      }
+    }
+  }
   return v;
 }
 

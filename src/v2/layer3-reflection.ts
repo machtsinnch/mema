@@ -329,11 +329,18 @@ export function reflect(input: ReflectInput): ReflectionReport {
   // Entity types are read once per entity and cached.
   const entityTypeCache = new Map<string, string | null>();
   const subjectTypeOf = (f: SemanticFact): string | null => {
-    if (!f.subject_entity_id) return null;
-    let t = entityTypeCache.get(f.subject_entity_id);
+    // v2.22.3 (round-3 finding): resolve the subject the SAME way subjKeyOf
+    // does (id first, then the entity-name registry). An unlinked residence
+    // fact about a registered person previously returned type null, so the
+    // person-only location-predicate gate (isFunctionalFor) dropped it out of
+    // Rule B entirely — desyncing filtering from grouping and asserting an
+    // outdated residence as current. Consult entityIdByName too.
+    const eid = f.subject_entity_id ?? entityIdByName.get(f.subject.trim().toLowerCase());
+    if (!eid) return null;
+    let t = entityTypeCache.get(eid);
     if (t === undefined) {
-      t = readEntity(input.vaultRoot, input.owner, f.subject_entity_id)?.type ?? null;
-      entityTypeCache.set(f.subject_entity_id, t);
+      t = readEntity(input.vaultRoot, input.owner, eid)?.type ?? null;
+      entityTypeCache.set(eid, t);
     }
     return t;
   };

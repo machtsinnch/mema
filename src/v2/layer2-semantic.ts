@@ -187,7 +187,11 @@ export function approveFact(
       for (const c of fullCandidates) {
         if (c.object?.trim().toLowerCase() !== normObj) continue;
         const cPrefix = (c.valid_from ?? "").slice(0, 10);
-        if (decision.reason === "duplicate" && cPrefix !== dPrefix) continue;
+        // v2.22.3 (round-3 finding): mirror the direct-write path — a
+        // covered-window restatement (step 2b) also yields reason
+        // "duplicate", so merge into the covering fact whose closed window
+        // contains the new date, not only the exact same-day duplicate.
+        if (decision.reason === "duplicate" && cPrefix !== dPrefix && !inCoveredWindow(c, cPrefix, dPrefix)) continue;
         if (decision.reason === "stale" && cPrefix < dPrefix) continue;
         if (mergeFactProvenance(vaultRoot, owner, c.id, (fm.derived_from as string[]) ?? [])) {
           mergedInto.push(c.id);
@@ -620,6 +624,20 @@ function gatherSupersessionCandidates(
   return out;
 }
 
+// v2.22.3 (round-3 finding) — does candidate `c`'s CLOSED validity window
+// [valid_from, valid_to] contain `newDatePrefix` (all sliced to YYYY-MM-DD)?
+// This is the step-2b "covered" case in classifyOnWrite: a same-object
+// restatement whose date falls strictly inside an already-closed window is
+// classified NONE/"duplicate" so the caller merges its provenance into the
+// covering fact. The covering fact's valid_from differs from the new date by
+// definition of containment, so the same-day duplicate predicate can't reach
+// it — this helper does.
+function inCoveredWindow(c: SemanticFact, cPrefix: string, newDatePrefix: string): boolean {
+  const to = c.valid_to ? String(c.valid_to).slice(0, 10) : null;
+  if (to === null) return false;
+  return !!cPrefix && cPrefix <= newDatePrefix && newDatePrefix <= to;
+}
+
 export function recordFactWithSupersession(
   vaultRoot: string,
   input: RecordFactInput,
@@ -681,7 +699,13 @@ export function recordFactWithSupersession(
     for (const c of fullCandidates) {
       if (c.object?.trim().toLowerCase() !== normObjForMerge) continue;
       const cPrefix = (c.valid_from ?? "").slice(0, 10);
-      if (decision.reason === "duplicate" && cPrefix !== newDatePrefix) continue;
+      // v2.22.3 (round-3 finding): the "duplicate" reason covers BOTH the
+      // exact same-day duplicate (step 1) AND the covered-window restatement
+      // (step 2b — a closed [valid_from, valid_to] window containing the new
+      // date). The old `cPrefix !== newDatePrefix` skip only matched the
+      // same-day case, so a covered restatement merged into nothing and its
+      // corroborating episode was dropped. Also target the covering fact.
+      if (decision.reason === "duplicate" && cPrefix !== newDatePrefix && !inCoveredWindow(c, cPrefix, newDatePrefix)) continue;
       if (decision.reason === "stale" && cPrefix < newDatePrefix) continue;
       if (mergeFactProvenance(vaultRoot, input.owner, c.id, input.derived_from ?? [])) {
         survivorIds.push(c.id);
