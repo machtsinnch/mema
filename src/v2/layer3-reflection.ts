@@ -24,7 +24,7 @@ import matter from "gray-matter";
 import type { Episode, SemanticFact, CognitiveRecord, BeliefKind } from "./types";
 import {
   recordCognitive, findCognitiveByClaimKey, findCognitiveMatch,
-  updateCognitiveSupport, supersedeBelief,
+  findAllCognitiveMatches, updateCognitiveSupport, supersedeBelief,
 } from "./layer3-cognitive";
 import { canonicalPredicate } from "./predicates";
 import { isFunctionalFor } from "./layer4-supersession";
@@ -213,6 +213,35 @@ export function reflect(input: ReflectInput): ReflectionReport {
   const namesResolveTo = (rawSubj: string, id: string | null | undefined): boolean =>
     !!id && (entityNamesById.get(id)?.has(rawSubj) ?? false);
 
+  // v2.22.12 (l3-reflect finding): resolve a STORED belief's subject to a group
+  // key the SAME way subjKeyOf resolves a fact's — approved id first, then the
+  // entity-name registry, else the raw segment. A belief is identified by its
+  // claim_key's subject segment plus its subject_entity_id; both a raw-name
+  // segment ("ardin ibraimi") and an entity-id segment resolve to one key.
+  const beliefSubjKey = (subjSeg: string, subjEntId: string | null | undefined): string => {
+    if (subjEntId && approvedEntityIds.has(subjEntId)) return subjEntId;
+    if (approvedEntityIds.has(subjSeg)) return subjSeg;
+    return entityIdByName.get(subjSeg) ?? subjSeg;
+  };
+  // Does this stored belief belong to the reflection group identified by
+  // (prefix, keySuffix, groupSubjKey, rawSubj)? Matches when the belief's
+  // resolved subject equals the group's (raw->entity / alias-merge), OR the
+  // all-status reverse map ties its entity-id segment or subject_entity_id back
+  // to the group's raw name (entity->raw, when the entity was rejected between
+  // runs). Used to collapse EVERY aliased-spelling predecessor onto one survivor.
+  const beliefBelongsToGroup = (
+    prefix: string, keySuffix: string, groupSubjKey: string, rawSubj: string,
+    r: CognitiveRecord,
+  ): boolean => {
+    const ck = r.claim_key;
+    if (typeof ck !== "string") return false;
+    if (!ck.startsWith(prefix) || !ck.endsWith(keySuffix)) return false;
+    const subjSeg = ck.slice(prefix.length, ck.length - keySuffix.length);
+    return beliefSubjKey(subjSeg, r.subject_entity_id) === groupSubjKey
+      || namesResolveTo(rawSubj, subjSeg)
+      || namesResolveTo(rawSubj, r.subject_entity_id);
+  };
+
   const records: CognitiveRecord[] = [];
   let created = 0, updated = 0, unchanged = 0;
   const abstained: NonNullable<ReflectionReport["abstained"]> = [];
@@ -249,6 +278,15 @@ export function reflect(input: ReflectInput): ReflectionReport {
     // in place instead of minting a duplicate. Consulted only when the raw-alt
     // lookup could not disambiguate (alt === primary).
     entity_fallback?: () => ReturnType<typeof findCognitiveByClaimKey>;
+    // v2.22.12 (l3-reflect finding): alt_claim_key + entity_fallback each
+    // locate at most ONE prior belief. When a subject was written under 2+
+    // spellings that each formed a belief BEFORE its entity existed,
+    // registering the entity collapses them into one group but only ONE
+    // predecessor got healed — the other aliased belief stayed live forever
+    // (breaking "re-runs update or skip, never duplicate"). This returns EVERY
+    // non-superseded belief belonging to the claim (all alias spellings, both
+    // key directions); upsert keeps one survivor and folds the rest onto it.
+    all_predecessors?: () => CognitiveRecord[];
   }): void => {
     if (records.length >= cap) return;
     let migrateKey: string | undefined;
@@ -263,6 +301,26 @@ export function reflect(input: ReflectInput): ReflectionReport {
       // runs hit the primary lookup directly.
       if (existing && existing.claim_key !== args.claim_key) migrateKey = args.claim_key;
     }
+    // v2.22.12 (l3-reflect finding): gather EVERY stale predecessor of this
+    // claim (across alias spellings + both key directions). We keep one
+    // survivor and supersede the rest so exactly one live belief remains.
+    const predecessors = args.all_predecessors ? args.all_predecessors() : [];
+    if (!existing && predecessors.length > 0) {
+      // The single-match probes all missed but duplicates exist (e.g. two
+      // aliased-spelling beliefs each on a non-primary key): adopt the newest
+      // as the survivor so we update it in place instead of minting a third.
+      existing = predecessors.reduce((a, b) => (a.reflected_at > b.reflected_at ? a : b));
+      if (existing.claim_key !== args.claim_key) migrateKey = args.claim_key;
+    }
+    // Fold every predecessor that is NOT the survivor onto the survivor. A
+    // stale predecessor already superseded (e.g. by the branch below) is a
+    // no-op — supersedeBelief re-reads and refuses to overwrite a chain link.
+    const collapseExtras = (survivorId: string): void => {
+      for (const p of predecessors) {
+        if (p.id === survivorId) continue;
+        supersedeBelief(input.vaultRoot, p.id, survivorId, input.owner, input.actor);
+      }
+    };
     if (existing) {
       const sameSupport =
         JSON.stringify([...new Set(existing.derived_from)].sort())
@@ -282,8 +340,9 @@ export function reflect(input: ReflectInput): ReflectionReport {
             derived_from: existing.derived_from, belief_kind: existing.belief_kind,
             claim_key: migrateKey,
           }, input.actor);
-          if (healed) { records.push(healed); updated++; return; }
+          if (healed) { collapseExtras(existing.id); records.push(healed); updated++; return; }
         }
+        collapseExtras(existing.id);
         unchanged++; return;
       }
       // v2.21.0 — general-review fix: the source COUNT baked into the text
@@ -304,6 +363,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
           ...(args.subject_entity_id ? { subject_entity_id: args.subject_entity_id } : {}),
         });
         supersedeBelief(input.vaultRoot, existing.id, fresh.id, input.owner, input.actor);
+        collapseExtras(fresh.id);
         records.push(fresh); created++;
         return;
       }
@@ -313,7 +373,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
         belief_kind: args.belief_kind,
         ...(migrateKey ? { claim_key: migrateKey } : {}),
       }, input.actor);
-      if (upd) { records.push(upd); updated++; }
+      if (upd) { collapseExtras(existing.id); records.push(upd); updated++; }
       return;
     }
     const r = recordCognitive(input.vaultRoot, {
@@ -333,6 +393,9 @@ export function reflect(input: ReflectInput): ReflectionReport {
     facts: SemanticFact[]; episodes: Set<string>;
     subject: string; predicate: string; object: string;
     subjectEntityId: string | null;
+    // v2.22.12 — the resolved subject key (approved entity id, else raw name)
+    // shared by every fact in the group; used to find ALL aliased predecessors.
+    subjKey: string;
   }
   const groups = new Map<string, Group>();
   const active = facts.filter(f => !f.invalidated_at && !f.superseded_by);
@@ -343,6 +406,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
       facts: [], episodes: new Set<string>(),
       subject: f.subject, predicate: f.predicate, object: f.object,
       subjectEntityId: f.subject_entity_id ?? null,
+      subjKey,
     };
     g.facts.push(f);
     for (const ep of f.derived_from ?? []) g.episodes.add(ep);
@@ -393,6 +457,12 @@ export function reflect(input: ReflectInput): ReflectionReport {
         const subjPart = ck.slice("corro|".length, ck.length - keySuffix.length);
         return namesResolveToSubj(subjPart) || namesResolveToSubj(r.subject_entity_id);
       }),
+      // v2.22.12 (l3-reflect finding): collapse ALL aliased-spelling
+      // predecessors of this claim, not just the one the single-match probes
+      // find. Without this, two spellings that each formed a belief before the
+      // entity existed left a permanent duplicate after the entity registered.
+      all_predecessors: () => findAllCognitiveMatches(input.vaultRoot, input.owner,
+        r => beliefBelongsToGroup("corro|", keySuffix, g.subjKey, rawSubj, r)),
       subject_entity_id: g.subjectEntityId,
       belief_kind: "personal",
     });
@@ -405,6 +475,8 @@ export function reflect(input: ReflectInput): ReflectionReport {
   interface StateGroup {
     current: SemanticFact[]; superseded: number;
     subject: string; predicate: string; subjectEntityId: string | null;
+    // v2.22.12 — resolved subject key shared by the group (see Rule A).
+    subjKey: string;
   }
   const stateGroups = new Map<string, StateGroup>();
   // v2.17.1 — Rule B must know WHO the subject is: "currently lives_in /
@@ -442,6 +514,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
       current: [], superseded: 0,
       subject: f.subject, predicate: f.predicate,
       subjectEntityId: f.subject_entity_id ?? null,
+      subjKey,
     };
     // v2.22.1 (round-2 finding): a fact whose validity window already ended
     // (valid_to in the past) is HISTORY — count it like a superseded value,
@@ -564,6 +637,10 @@ export function reflect(input: ReflectInput): ReflectionReport {
         const subjPart = ck.slice("current|".length, ck.length - keySuffix.length);
         return namesResolveToSubj(subjPart) || namesResolveToSubj(r.subject_entity_id);
       }),
+      // v2.22.12 (l3-reflect finding): collapse ALL aliased-spelling
+      // predecessors of this current-state claim onto one survivor (see Rule A).
+      all_predecessors: () => findAllCognitiveMatches(input.vaultRoot, input.owner,
+        r => beliefBelongsToGroup("current|", keySuffix, g.subjKey, rawSubj, r)),
       subject_entity_id: g.subjectEntityId,
       belief_kind: "personal",
     });

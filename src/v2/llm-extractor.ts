@@ -70,8 +70,13 @@ export interface ExtractionResult {
 // about the world beyond naming; better to lose a marginal tautology
 // ("Arachne includes Arachne runtime") than keep garbage.
 export function isSelfReferentialTriple(subject: string, object: string): boolean {
+  // v2.22.12 — unicode-aware tokenization. The ASCII-only /[^a-z0-9]+/ split
+  // fragmented accented words ("Zürich" -> {"z","rich"}), so an unrelated side
+  // that equalled an ASCII fragment (e.g. "Rich") looked like a token subset
+  // and a valid distinct triple was dropped as a tautology at the write
+  // boundary. Match tokensOf (line 470) and the evidence gate (line 417).
   const tokens = (s: string): Set<string> => new Set(
-    s.toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length > 0),
+    s.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(t => t.length > 0),
   );
   const a = tokens(subject);
   const b = tokens(object);

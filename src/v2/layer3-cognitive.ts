@@ -363,6 +363,42 @@ export function findCognitiveMatch(
   return best;
 }
 
+// v2.22.12 (l3-reflect finding): like findCognitiveMatch, but returns EVERY
+// non-superseded record the matcher accepts (newest first), not just the
+// single best. Backs reflection's predecessor collapse: when a subject was
+// written under 2+ spellings that each formed a belief BEFORE the entity
+// existed, registering the entity merges them into ONE claim group — the
+// single-match probes heal only one predecessor, leaving the other aliased
+// belief live forever. This lets reflect() find ALL predecessors of a claim so
+// it can keep one survivor and supersede the rest, restoring the "re-runs
+// update or skip, never duplicate" invariant. Matcher sees each record's
+// frontmatter plus its trimmed body as content.
+export function findAllCognitiveMatches(
+  vaultRoot: string,
+  owner: string,
+  match: (r: CognitiveRecord) => boolean,
+): CognitiveRecord[] {
+  const base = join(vaultRoot, "cognitive", owner);
+  if (!existsSync(base)) return [];
+  const out: CognitiveRecord[] = [];
+  for (const kind of readdirSync(base)) {
+    const dir = join(base, kind);
+    let files: string[];
+    try { files = readdirSync(dir); } catch { continue; }
+    for (const f of files) {
+      if (!f.endsWith(".md")) continue;
+      try {
+        const parsed = matter(readFileSync(join(dir, f), "utf8"));
+        const r = { ...(parsed.data as CognitiveRecord), content: parsed.content.trim() };
+        if (r.superseded_by) continue;
+        if (!match(r)) continue;
+        out.push(r);
+      } catch { /* skip malformed */ }
+    }
+  }
+  return out.sort((a, b) => (a.reflected_at > b.reflected_at ? -1 : 1));
+}
+
 // Update an existing conclusion in place (same id, same file identity):
 // refresh content, confidence, support and reflected_at. Used when
 // reflection re-runs and the underlying evidence changed. Audit-logged.
