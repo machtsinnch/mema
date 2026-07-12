@@ -251,6 +251,17 @@ export function supersedeBelief(
   owner: string,
   actor: string,
 ): CognitiveRecord | null {
+  // v2.22.10 — breaker finding: mirror supersedeJudgment's guards. Without
+  // them a bad new_id (a typo of the same id, or one pointing at a missing
+  // record) silently wrote superseded_by anyway, excluding the belief from
+  // retrieval with no valid successor — a self-cycle orphan that the next
+  // reflect() over the same evidence re-minted as a live duplicate.
+  if (oldId === newId) return null; // no self-cycle
+  const newPath = pathForCognitive(vaultRoot, owner, newId);
+  if (!newPath) return null; // successor must resolve to an existing record
+  const newFm = matter(readFileSync(newPath, "utf8")).data as Record<string, unknown>;
+  if (newFm.owner !== owner) return null; // successor must be in the owner space
+  if (newFm.superseded_by) return null; // refuse a superseded record as superseder
   for (const kind of ["belief", "observation", "experience"] as const) {
     const kindDir = join(vaultRoot, "cognitive", owner, kind);
     if (!existsSync(kindDir)) continue;
@@ -264,6 +275,8 @@ export function supersedeBelief(
     }
     if (!path) continue;
     const parsed = matter(readFileSync(path, "utf8"));
+    // Don't overwrite an existing chain link — the chain is the design story.
+    if (parsed.data.superseded_by) return null;
     parsed.data.superseded_by = newId;
     // Rebuild Obsidian links to include the new supersession edge.
     parsed.data.links = toWikilinks([
