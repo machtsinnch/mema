@@ -216,10 +216,19 @@ export function classifyOnWrite(
   // the mirror case did. Compare at the shared precision; when the day
   // ties AND the formats differ, the NEW fact wins (last-write-wins, the
   // same spirit as the v2.14.1 same-day fix).
+  // v2.22.6 — breaker finding: coarse event dates ("2023" / "2023-05")
+  // defeated the raw 10-char compare exactly like isClosed did before
+  // v2.21.1 ("2023-05-31" < "2023" is false), so a finer-dated existing
+  // fact in the SAME period was judged NOT older-than-new and the older
+  // fact never superseded (two live functional facts). Compare at the
+  // SHARED precision — the coarser of the two dates — the same way
+  // isClosed does; on a same-period tie the differing format means the
+  // NEW fact wins (last-write-wins, matching the v2.21.0 tie-break).
   const olderThanNew = (existing: string): boolean => {
     if (existing.length > 10 && newTs.length > 10) return existing < newTs;
-    const a = existing.slice(0, 10);
-    const b = newTs.slice(0, 10);
+    const n = Math.min(existing.length, newTs.length, 10);
+    const a = existing.slice(0, n);
+    const b = newTs.slice(0, n);
     if (a !== b) return a < b;
     return existing.length !== newTs.length;
   };

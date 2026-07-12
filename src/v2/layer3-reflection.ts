@@ -430,14 +430,33 @@ export function reflect(input: ReflectInput): ReflectionReport {
   }
   for (const [key, g] of stateGroups) {
     if (g.current.length === 0) continue;
-    if (g.current.length > 1) {
+    // v2.22.6 (round-6 finding): count DISTINCT object values, not fact
+    // count. Same-value corroboration (e.g. "works_at AUDI" confirmed
+    // twice) leaves several live facts asserting ONE value — that is not a
+    // conflict, it is agreement. Collapsing by normalized object stops a
+    // fabricated "N candidate values" abstention from suppressing an
+    // unambiguous current-state belief. Only >=2 DISTINCT values abstain.
+    const byObject = new Map<string, SemanticFact[]>();
+    for (const cf of g.current) {
+      const ok = cf.object.trim().toLowerCase();
+      (byObject.get(ok) ?? byObject.set(ok, []).get(ok)!).push(cf);
+    }
+    if (byObject.size > 1) {
       abstained.push({
         rule: "current-state", subject: g.subject, predicate: g.predicate,
-        reason: `${g.current.length} candidate values and no dates to order them — refusing to guess which is current`,
+        reason: `${byObject.size} distinct current values with no supersession history to order them — refusing to guess which is current`,
       });
       continue;
     }
-    const f = g.current[0];
+    // One distinct value. Pick a representative fact: earliest valid_from
+    // drives the "since" text, and derived_from is unioned across every
+    // same-value fact so the belief cites all its corroborating evidence.
+    const sameObject = [...byObject.values()][0];
+    const f = sameObject.reduce((a, b) =>
+      (a.valid_from ?? "") <= (b.valid_from ?? "") ? a : b);
+    const unionedDerivedFrom = [...new Set(
+      sameObject.flatMap(x => [x.id, ...(x.derived_from ?? [])]),
+    )];
     // v2.17.1 — a fact dated in the FUTURE ("starts at X in 2027-03") is a
     // plan, not a current state. Refuse to conclude "currently" from it,
     // and say so visibly.
@@ -472,7 +491,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
       kind: "belief",
       content: `${g.subject} currently ${g.predicate} ${f.object}${since}${history}.`,
       confidence: Math.min(0.95, f.confidence + 0.05 * g.superseded),
-      derived_from: [...new Set([f.id, ...(f.derived_from ?? [])])],
+      derived_from: unionedDerivedFrom,
       claim_key: primaryClaimKey,
       alt_claim_key: `current|${rawSubj}${keySuffix}`,
       entity_fallback: () => findCognitiveMatch(input.vaultRoot, input.owner, r => {

@@ -465,7 +465,15 @@ export function mountV2(app: Hono, cfg: V2Config): void {
         message: `fact_skipped:${(result.decision as any).reason ?? "duplicate_or_stale"}`,
       });
     }
-    const judgmentsFlagged = flagJudgmentsForFact(cfg.vaultRoot, owner, result.written, actor);
+    // v2.22.6 (round-6 finding): the living-loop trigger is APPROVAL, not
+    // any write. Flagging a judgment from an unreviewed draft injects a
+    // possibly-false claim into its review loop, and if the draft is later
+    // rejected nothing ever clears the flag (rejectFact does not touch
+    // judgments) — a permanent phantom "needs review" citing a rejected
+    // fact. Skip drafts here; the /approve paths flag on promotion instead.
+    const judgmentsFlagged = result.written.status === "approved"
+      ? flagJudgmentsForFact(cfg.vaultRoot, owner, result.written, actor)
+      : 0;
     return c.json({
       fact: result.written,
       decision: result.decision,
@@ -539,10 +547,16 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     }
     const r = approveFact(cfg.vaultRoot, id, owner, actor, parsed.body.reason);
     if (!r.fact) return c.json({ error: "not found" }, 404);
+    // v2.22.6 (round-6 finding): the living loop fires on APPROVAL. A draft
+    // that matched a judgment's foundations at write time was intentionally
+    // NOT flagged (unreviewed); now that it is trusted, flag here — this
+    // also catches drafts written before the judgment existed.
+    const judgmentsFlagged = flagJudgmentsForFact(cfg.vaultRoot, owner, r.fact, actor);
     // v2.21.1 — explicit visibility: approval-time supersession is
     // reported, never silent (matches POST /v2/fact's superseded[]).
     return c.json({
       fact: r.fact,
+      ...(judgmentsFlagged > 0 ? { judgments_flagged: judgmentsFlagged } : {}),
       ...(r.supersededIds.length > 0 ? { superseded: r.supersededIds } : {}),
     });
   });
@@ -628,9 +642,12 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     // invalidateFact is idempotent (v2.21.1) so this explicit call is a
     // no-op in that case and a real invalidation otherwise.
     const invalidated = invalidateFact(cfg.vaultRoot, oldId, owner, actor, newId);
+    // v2.22.6 (round-6 finding): approval fires the living loop (see /approve).
+    const judgmentsFlagged = flagJudgmentsForFact(cfg.vaultRoot, owner, approvedResult.fact, actor);
     return c.json({
       approved: approvedResult.fact,
       invalidated,
+      ...(judgmentsFlagged > 0 ? { judgments_flagged: judgmentsFlagged } : {}),
       ...(approvedResult.supersededIds.length > 0 ? { superseded: approvedResult.supersededIds } : {}),
     });
   });
