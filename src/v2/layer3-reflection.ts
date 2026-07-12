@@ -470,10 +470,20 @@ export function reflect(input: ReflectInput): ReflectionReport {
       });
       continue;
     }
-    // One distinct value. Pick a representative fact: earliest valid_from
-    // drives the "since" text, and derived_from is unioned across every
-    // same-value fact so the belief cites all its corroborating evidence.
+    // One distinct value. derived_from is unioned across every same-value
+    // fact so the belief cites all its corroborating evidence.
     const sameObject = [...byObject.values()][0];
+    // v2.22.9 — determine world-datedness and the "since" value across ALL
+    // same-value facts, not just the single earliest-by-valid_from fact.
+    // valid_from mixes short world dates ('2020-01-01') with long ISO
+    // ingestion-timestamp fallbacks ('2019-05-10T12:00:00.000Z'); an ISO
+    // timestamp that sorts earlier than a genuinely world-dated same-value
+    // fact must NOT mask that real currency. Otherwise the current-state
+    // belief was silently dropped (no record, nothing in `abstained`) or
+    // rendered without its real "since" date.
+    const worldDated = sameObject.filter(hasWorldDate);
+    // Earliest-overall fact is kept only as the ordering representative
+    // (object value, confidence base, future-date tiebreak below).
     const f = sameObject.reduce((a, b) =>
       (a.valid_from ?? "") <= (b.valid_from ?? "") ? a : b);
     const unionedDerivedFrom = [...new Set(
@@ -491,10 +501,16 @@ export function reflect(input: ReflectInput): ReflectionReport {
     }
     // A lone undated fact with no superseded history would make the belief
     // a photocopy of the fact — no added knowledge. Conclude only when
-    // either history exists (supersession established currency) or the
-    // fact carries a world date.
-    if (g.superseded === 0 && !hasWorldDate(f)) continue;
-    const since = hasWorldDate(f) ? ` since ${f.valid_from}` : "";
+    // either history exists (supersession established currency) or SOME
+    // same-value fact carries a world date. Keying on `worldDated` (not the
+    // single earliest fact) stops an ISO ingestion-timestamp fallback that
+    // merely sorts earliest from suppressing a genuinely world-dated value.
+    if (g.superseded === 0 && worldDated.length === 0) continue;
+    // Use the earliest world date among the same-value facts for "since".
+    const sinceFact = worldDated.length > 0
+      ? worldDated.reduce((a, b) => (a.valid_from ?? "") <= (b.valid_from ?? "") ? a : b)
+      : undefined;
+    const since = sinceFact ? ` since ${sinceFact.valid_from}` : "";
     const history = g.superseded > 0 ? `; replaced ${g.superseded} earlier value(s)` : "";
     // v2.22.5 — Rule B gets the same entity->raw migration fallback Rule A has.
     // When the subject's entity is REJECTED between runs the group key reverts

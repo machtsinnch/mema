@@ -119,7 +119,12 @@ export function recordJudgment(vaultRoot: string, input: RecordJudgmentInput): J
   const dir = join(vaultRoot, "cognitive", input.owner, "judgment");
   mkdirSync(dir, { recursive: true });
   const slug = slugify(`judgment-${input.question.split(/\s+/).slice(0, 8).join(" ")}`, "judgment");
-  const file = matter.stringify(record.content, {
+  // v2.22.0 SECURITY parity (mirrors observe()/recordCognitive): a decision
+  // that begins with a "---" YAML fence made gray-matter MERGE that fence
+  // into our frontmatter and DROP it from the stored body. Guard: a leading
+  // newline keeps the fence in the body; judgment readers .trim() it back off.
+  const body = /^\s*---/.test(record.content) ? "\n" + record.content : record.content;
+  const file = matter.stringify(body, {
     id: record.id,
     slug,
     kind: "judgment",

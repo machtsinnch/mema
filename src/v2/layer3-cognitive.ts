@@ -75,7 +75,13 @@ export function recordCognitive(vaultRoot: string, input: RecordCognitiveInput):
 
   const dir = join(vaultRoot, "cognitive", input.owner, input.kind);
   mkdirSync(dir, { recursive: true });
-  const body = record.content;
+  // v2.22.0 SECURITY parity (mirrors observe() in layer1-episodic): a
+  // belief/observation/experience whose content begins with a "---" YAML
+  // fence made gray-matter MERGE that fence into our frontmatter (injecting
+  // fields, e.g. a forged claim_key/belief_kind) and DROP it from the stored
+  // body. Guard: a leading newline keeps the fence in the body; cognitive
+  // readers .trim() it back off.
+  const body = /^\s*---/.test(record.content) ? "\n" + record.content : record.content;
   // Obsidian graph: wikilinks for derived_from chain + supersession edge.
   const links = toWikilinks([
     ...record.derived_from,
