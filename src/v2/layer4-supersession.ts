@@ -167,6 +167,24 @@ export function classifyOnWrite(
     return { kind: "NONE", reason: "stale" };
   }
 
+  // 2b. Covered — a same-object fact's validity WINDOW already contains the
+  //     new fact's date (v2.22.1, round-2 finding). Restating "John works_at
+  //     Google" (dated 2021) when we already hold it for 2020–2024 adds no
+  //     information; writing it as a fresh open-ended fact would wrongly
+  //     resurrect an ended state as "current". Treated as a duplicate so the
+  //     caller merges provenance into the covering fact instead.
+  //     Restricted to CLOSED windows (valid_to set): an OPEN-ended same-
+  //     object fact is left to the accumulate path so multi-valued
+  //     predicates keep every dated assertion.
+  if (sameObject.some(f => {
+    const to = f.valid_to ? String(f.valid_to).slice(0, 10) : null;
+    if (to === null) return false;
+    const from = (f.valid_from ?? "").slice(0, 10);
+    return !!from && from <= normNewDate && normNewDate <= to;
+  })) {
+    return { kind: "NONE", reason: "duplicate" };
+  }
+
   // 3. Functional-predicate gate. Only supersede when the predicate is in
   //    the FUNCTIONAL_PREDICATES allow-list (employment, residence, current
   //    status, etc.). For everything else, accumulate — multi-valued by

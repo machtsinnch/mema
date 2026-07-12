@@ -37,6 +37,7 @@
 // classifier. v2.11 keeps the classifier rule-based.
 
 import type { RetrievalHit } from "./types";
+import { toEpochMs } from "./temporal";
 
 // ─── Public types ────────────────────────────────────────────────────────
 
@@ -144,10 +145,17 @@ export const rules = {
   isCurrent(hit: RetrievalHit, dateISO: string): boolean {
     if (!hit.payload) return false;
     if (hit.payload.invalidated_at) return false;
-    const vf = (hit.payload.valid_from ?? "").slice(0, 10);
-    const d  = dateISO.slice(0, 10);
-    if (!vf) return true;  // missing valid_from = surface (better than hide)
-    return vf <= d;
+    // v2.22.1 (round-2 finding): compare by epoch, not raw strings — the
+    // lexical slice(0,10) compare mis-ordered mixed formats (a question_date
+    // like "2026/07/12 (Sun) 09:00" vs a "2026-07-12" valid_from), admitting
+    // facts dated AFTER the question. Fall back to lexical only when a date
+    // can't be parsed.
+    const vfRaw = hit.payload.valid_from ?? "";
+    if (!vfRaw) return true;  // missing valid_from = surface (better than hide)
+    const vfMs = toEpochMs(vfRaw);
+    const dMs = toEpochMs(dateISO);
+    if (vfMs !== null && dMs !== null) return vfMs <= dMs;
+    return vfRaw.slice(0, 10) <= dateISO.slice(0, 10);
   },
 
   /** A fact is SUPERSEDED if its invalidated_at is set OR superseded_by is set. */

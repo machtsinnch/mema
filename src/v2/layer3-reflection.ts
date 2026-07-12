@@ -156,8 +156,12 @@ export function reflect(input: ReflectInput): ReflectionReport {
       if (!ef.endsWith(".md")) continue;
       try {
         const e = matter(readFileSync(join(entDir, ef), "utf8")).data as
-          { id?: string; name?: string; aliases?: string[] };
+          { id?: string; name?: string; aliases?: string[]; status?: string };
         if (!e.id) continue;
+        // v2.22.1 (round-2 finding): skip rejected AND draft entities — a
+        // reviewer-rejected (e.g. hallucinated) entity's aliases must NOT
+        // glue distinct subjects together and mint false corroboration.
+        if ((e.status ?? "approved") !== "approved") continue;
         for (const n of [e.name, ...(e.aliases ?? [])]) {
           const lc = (n ?? "").trim().toLowerCase();
           if (lc && !entityIdByName.has(lc)) entityIdByName.set(lc, e.id);
@@ -193,9 +197,20 @@ export function reflect(input: ReflectInput): ReflectionReport {
     kind: "belief"; content: string; confidence: number;
     derived_from: string[]; claim_key: string; subject_entity_id?: string | null;
     belief_kind: BeliefKind;
+    // v2.22.1 (round-2 finding): the claim_key changes when a subject's
+    // entity gets registered between runs (raw-name key -> entity-id key),
+    // which minted a DUPLICATE belief. alt_claim_key is the pre-entity
+    // (raw-subject) key; if the primary lookup misses but the alt hits, we
+    // update that record in place AND migrate its key so it's stable after.
+    alt_claim_key?: string;
   }): void => {
     if (records.length >= cap) return;
-    const existing = findCognitiveByClaimKey(input.vaultRoot, input.owner, args.claim_key);
+    let migrateKey: string | undefined;
+    let existing = findCognitiveByClaimKey(input.vaultRoot, input.owner, args.claim_key);
+    if (!existing && args.alt_claim_key && args.alt_claim_key !== args.claim_key) {
+      existing = findCognitiveByClaimKey(input.vaultRoot, input.owner, args.alt_claim_key);
+      if (existing) migrateKey = args.claim_key;   // heal the key on this pass
+    }
     if (existing) {
       const sameSupport =
         JSON.stringify([...new Set(existing.derived_from)].sort())
@@ -230,6 +245,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
       const upd = updateCognitiveSupport(input.vaultRoot, input.owner, existing.id, {
         content: args.content, confidence: args.confidence, derived_from: args.derived_from,
         belief_kind: args.belief_kind,
+        ...(migrateKey ? { claim_key: migrateKey } : {}),
       }, input.actor);
       if (upd) { records.push(upd); updated++; }
       return;
@@ -291,6 +307,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
       confidence,
       derived_from: [...new Set([...g.facts.map(f => f.id), ...g.episodes])],
       claim_key: `corro|${key}`,
+      alt_claim_key: `corro|${g.subject.trim().toLowerCase()}|${canonicalPredicate(g.predicate)}|${g.object.trim().toLowerCase()}`,
       subject_entity_id: g.subjectEntityId,
       belief_kind: "personal",
     });
@@ -330,7 +347,13 @@ export function reflect(input: ReflectInput): ReflectionReport {
       subject: f.subject, predicate: f.predicate,
       subjectEntityId: f.subject_entity_id ?? null,
     };
-    if (f.invalidated_at || f.superseded_by) g.superseded++;
+    // v2.22.1 (round-2 finding): a fact whose validity window already ended
+    // (valid_to in the past) is HISTORY — count it like a superseded value,
+    // never as a current one. Without this, "worked at OldCorp 2018-2020"
+    // was asserted as "currently works_at OldCorp", and once a real current
+    // job arrived Rule B saw two "current" values and abstained wrongly.
+    const ended = f.valid_to && String(f.valid_to).slice(0, 10) <= today;
+    if (f.invalidated_at || f.superseded_by || ended) g.superseded++;
     else g.current.push(f);
     stateGroups.set(key, g);
   }
@@ -367,6 +390,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
       confidence: Math.min(0.95, f.confidence + 0.05 * g.superseded),
       derived_from: [...new Set([f.id, ...(f.derived_from ?? [])])],
       claim_key: `current|${key}`,
+      alt_claim_key: `current|${g.subject.trim().toLowerCase()}|${canonicalPredicate(g.predicate)}`,
       subject_entity_id: g.subjectEntityId,
       belief_kind: "personal",
     });
@@ -493,7 +517,11 @@ export async function reflectLLM(input: ReflectInput): Promise<ReflectionReport>
       errors++;
     }
   }
-  base.cognitive_records_created = base.records.length;
+  // v2.22.1 (round-2 finding): the LLM pass only ever CREATES drafts
+  // (proposed), it never updates existing records. Add its creations to
+  // the rule-based created count instead of overwriting with records.length
+  // (which folded rule-based in-place UPDATES in as if they were created).
+  base.cognitive_records_created += proposed;
   base.llm_drafts_proposed = proposed;
   base.llm_errors = errors;
   return base;

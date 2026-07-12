@@ -21,6 +21,23 @@ Candidate ideas and deferred work. Not committed to a release yet.
 - **mergeFactProvenance leaves the body text's "derived from N episode(s)"
   stale** (cosmetic; frontmatter is authoritative).
 
+## Deferred from review round 2 (2026-07-12)
+
+- **hardErase does not cascade (GDPR/nFADP DSAR).** Erasing an L1 episode
+  tombstones only that file; L2 facts derived from it and L3 beliefs citing
+  them (same personal data) stay live and recallable. Real erasure needs a
+  cascade: episode -> its facts -> beliefs/judgments citing those facts,
+  with audit rows for each tombstone. Sizeable feature; design before build.
+- **CONFLICTS narrative unreachable via /v2/recall/packet.** buildMemoryPacket
+  is designed to narrate supersession conflicts, but recall() filters
+  superseded facts out (factValidAt lt) before the packet compiler sees
+  them, so the CONFLICTS section never populates in production. Decide:
+  surface superseded facts on a dedicated channel for the packet, or drop
+  the CONFLICTS feature. Correctness-neutral (nothing wrong surfaces).
+- **memory-packet isCurrent** now uses toEpochMs (fixed v2.22.1), but its
+  only production caller path is the bench harness; wire question_date
+  through /v2/recall/packet if current-state packets go to real callers.
+
 ## Retrieval
 
 - **Ranking boost for web-confirmed facts?** (Ardin, 2026-07-10, undecided)

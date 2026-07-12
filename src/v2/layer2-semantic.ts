@@ -18,7 +18,7 @@ import { appendAudit } from "./layer6-audit";
 import { factValidAt } from "./temporal";
 import { classifyOnWrite, type SupersessionDecision } from "./layer4-supersession";
 import { canonicalPredicate } from "./predicates";
-import { readEntity } from "./layer2-entities";
+import { readEntity, findEntityByName } from "./layer2-entities";
 
 export interface RecordFactInput {
   subject: string;
@@ -183,12 +183,25 @@ export function approveFact(
     } else if (decision.kind === "NONE") {
       const normObj = probe.object.trim().toLowerCase();
       const dPrefix = String(fm.valid_from ?? "").slice(0, 10);
+      const mergedInto: string[] = [];
       for (const c of fullCandidates) {
         if (c.object?.trim().toLowerCase() !== normObj) continue;
         const cPrefix = (c.valid_from ?? "").slice(0, 10);
         if (decision.reason === "duplicate" && cPrefix !== dPrefix) continue;
         if (decision.reason === "stale" && cPrefix < dPrefix) continue;
-        mergeFactProvenance(vaultRoot, owner, c.id, (fm.derived_from as string[]) ?? []);
+        if (mergeFactProvenance(vaultRoot, owner, c.id, (fm.derived_from as string[]) ?? [])) {
+          mergedInto.push(c.id);
+        }
+      }
+      // v2.22.1 (round-2 finding): the direct write path audits its
+      // duplicate-merge; the approval path must too (no silent record
+      // mutation in a hash-chained-audit product).
+      if (mergedInto.length > 0) {
+        appendAudit({
+          op: "EXTRACT", actor, owner, record_ids: mergedInto,
+          evidence_chain: (fm.derived_from as string[]) ?? [],
+          reason: `provenance_merge_on_approve:${factId}`,
+        });
       }
     }
   } catch (e) {
@@ -567,11 +580,13 @@ function gatherSupersessionCandidates(
   probe: { subject: string; predicate: string; object: string; subject_entity_id?: string | null },
   excludeId?: string,
 ): SemanticFact[] {
-  const nowIso = new Date().toISOString();
+  // v2.22.1 (round-2 finding): CLOSED facts (valid_to passed) are NO LONGER
+  // excluded here — a restatement of a fact whose validity window already
+  // ended must still be caught as duplicate/stale (classifyOnWrite steps
+  // 1-2). The functional gate (step 4, isClosed) still refuses to supersede
+  // a closed fact, so this cannot wrongly invalidate history.
   const usable = (f: SemanticFact): boolean =>
-    !f.invalidated_at && !f.superseded_by
-    && !(f.valid_to && String(f.valid_to) <= nowIso)
-    && f.id !== excludeId;
+    !f.invalidated_at && !f.superseded_by && f.id !== excludeId;
   const out: SemanticFact[] = [];
   const seen = new Set<string>();
   const push = (f: SemanticFact | null) => {
@@ -583,9 +598,23 @@ function gatherSupersessionCandidates(
   for (const f of readApprovedFactsByExactSubjectPredicate(vaultRoot, owner, probe.subject, probe.predicate)) {
     push(f);
   }
-  if (probe.subject_entity_id) {
-    for (const f of readApprovedFactsBySubjectEntity(vaultRoot, owner, probe.subject_entity_id, probe.predicate)) {
+  // v2.22.1 (round-2 finding): bridge entity aliases so supersession works
+  // even when only ONE side carries subject_entity_id (e.g. a fact ingested
+  // before its entity existed, then a linked fact under a different alias).
+  // Resolve the subject to a single entity — from the passed id or by name —
+  // then scan by the entity id AND every alias surface string.
+  const entity = probe.subject_entity_id
+    ? readEntity(vaultRoot, owner, probe.subject_entity_id)
+    : findEntityByName(vaultRoot, owner, probe.subject);
+  if (entity) {
+    for (const f of readApprovedFactsBySubjectEntity(vaultRoot, owner, entity.id, probe.predicate)) {
       push(f);
+    }
+    for (const alias of [entity.name, ...(entity.aliases ?? [])]) {
+      if (alias.trim().toLowerCase() === probe.subject.trim().toLowerCase()) continue;
+      for (const f of readApprovedFactsByExactSubjectPredicate(vaultRoot, owner, alias, probe.predicate)) {
+        push(f);
+      }
     }
   }
   return out;

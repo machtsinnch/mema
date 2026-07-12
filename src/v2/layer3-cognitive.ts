@@ -316,7 +316,7 @@ export function updateCognitiveSupport(
   vaultRoot: string,
   owner: string,
   id: string,
-  updates: { content: string; confidence: number; derived_from: string[]; belief_kind?: BeliefKind },
+  updates: { content: string; confidence: number; derived_from: string[]; belief_kind?: BeliefKind; claim_key?: string },
   actor: string,
 ): CognitiveRecord | null {
   const path = pathForCognitive(vaultRoot, owner, id);
@@ -328,6 +328,9 @@ export function updateCognitiveSupport(
   fm.derived_from = [...new Set(updates.derived_from)];
   // v2.18.0 — also backfills the knowledge label onto pre-label records.
   if (updates.belief_kind) fm.belief_kind = updates.belief_kind;
+  // v2.22.1 — migrate the stable claim_key when the subject's entity got
+  // registered between reflect runs (see reflection upsert alt_claim_key).
+  if (updates.claim_key) fm.claim_key = updates.claim_key;
   fm.reflected_at = new Date().toISOString();
   fm.links = toWikilinks([
     ...(fm.derived_from as string[]),

@@ -434,7 +434,10 @@ export function consensusMerge(perPass: ExtractionResult[], sourceText?: string)
       if (lc && !entityCased.has(lc)) entityCased.set(lc, e.name.trim());
     }
   }
-  const tokensOf = (s: string) => s.split(/[^a-z0-9]+/).filter(Boolean);
+  // v2.22.1 (round-2 finding): unicode-aware split — the ASCII-only
+  // /[^a-z0-9]+/ fragmented accented names ("Zürich" -> ["z","rich"]) and
+  // falsely anchored unrelated subjects. Mirrors the evidence-gate fix.
+  const tokensOf = (s: string) => s.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
   const containsTokens = (haystack: string[], needle: string[]): boolean => {
     if (needle.length === 0 || needle.length > haystack.length) return false;
     for (let i = 0; i + needle.length <= haystack.length; i++) {
@@ -651,6 +654,7 @@ export class AnthropicExtractor implements LLMExtractor {
       try { parts.push(await this.extractOnce(chunk)); }
       catch { failed++; }
     }
+    if (chunks.length === 0) return { facts: [], entities: [], chunk_stats: { total: 0, failed: 0 } };
     if (parts.length === 0) throw new Error(`anthropic extractor: all ${chunks.length} chunk(s) failed`);
     const merged = mergeExtractionResults(parts);
     return { ...merged, chunk_stats: { total: chunks.length, failed } };
@@ -803,6 +807,10 @@ export class ClaudeCLIExtractor implements LLMExtractor {
     // Every chunk failed (CLI unavailable / all passes timed out) — surface
     // it so /v2/observe records pending_retry instead of silently zero facts.
     if (perChunkConsensus.length === 0) {
+      // v2.22.1 (round-2 finding): zero chunks means the input had no
+      // extractable text (e.g. whitespace only) — return empty, don't
+      // throw a misleading "all 0 chunks failed" that forces pending_retry.
+      if (chunks.length === 0) return { facts: [], entities: [], chunk_stats: { total: 0, failed: 0 } };
       throw new Error(`claude CLI extractor: all ${chunks.length} chunk(s) failed (${passes} passes each)`);
     }
     const merged = mergeExtractionResults(perChunkConsensus);
