@@ -309,6 +309,41 @@ export function findCognitiveByClaimKey(
   return best;
 }
 
+// v2.22.4 — general non-superseded scan with a caller-supplied predicate.
+// Backs the bidirectional entity-key migration in reflection: when a
+// subject's entity is REMOVED (rejected) between reflect runs, the group key
+// reverts from the entity-id form to the raw name, but the surviving belief
+// is still keyed by the entity-id form. The raw-alt migration only heals the
+// raw->entity direction, so without an entity->raw fallback a duplicate
+// belief was minted. Returns the newest non-superseded record the matcher
+// accepts, or null. The matcher sees each record's frontmatter (claim_key,
+// subject_entity_id, ...) plus its trimmed body as content.
+export function findCognitiveMatch(
+  vaultRoot: string,
+  owner: string,
+  match: (r: CognitiveRecord) => boolean,
+): CognitiveRecord | null {
+  const base = join(vaultRoot, "cognitive", owner);
+  if (!existsSync(base)) return null;
+  let best: CognitiveRecord | null = null;
+  for (const kind of readdirSync(base)) {
+    const dir = join(base, kind);
+    let files: string[];
+    try { files = readdirSync(dir); } catch { continue; }
+    for (const f of files) {
+      if (!f.endsWith(".md")) continue;
+      try {
+        const parsed = matter(readFileSync(join(dir, f), "utf8"));
+        const r = { ...(parsed.data as CognitiveRecord), content: parsed.content.trim() };
+        if (r.superseded_by) continue;
+        if (!match(r)) continue;
+        if (!best || r.reflected_at > best.reflected_at) best = r;
+      } catch { /* skip malformed */ }
+    }
+  }
+  return best;
+}
+
 // Update an existing conclusion in place (same id, same file identity):
 // refresh content, confidence, support and reflected_at. Used when
 // reflection re-runs and the underlying evidence changed. Audit-logged.

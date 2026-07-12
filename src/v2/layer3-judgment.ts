@@ -325,6 +325,21 @@ export interface ScreenResult {
   dropped_flags: Array<{ judgment_id: string; fact_id: string; reason: string }>;
 }
 
+// v2.22.4 — flag screening is an INDEPENDENT job type from web fact-checking.
+// It is a plain relevance model call (no web-search quota spend), so it must
+// NOT share the MEMA_FACTCHECK_AUTO switch: an operator turning web
+// fact-checking off to save quota was silently disabling judgment flag
+// screening entirely, stranding every candidate flag on its judgment forever
+// and never writing the "dropped with reason" audit rows. On by default; off
+// under `bun test` (no hidden model calls in tests) unless explicitly forced;
+// MEMA_FLAG_SCREEN_AUTO=false turns it off anywhere.
+export function flagScreenAutoEnabled(): boolean {
+  const flag = process.env.MEMA_FLAG_SCREEN_AUTO;
+  if (flag === "false") return false;
+  if (flag === "true") return true;
+  return process.env.NODE_ENV !== "test";
+}
+
 export async function screenJudgmentCandidates(
   vaultRoot: string,
   owner: string,

@@ -23,7 +23,8 @@ import { join } from "node:path";
 import matter from "gray-matter";
 import type { Episode, SemanticFact, CognitiveRecord, BeliefKind } from "./types";
 import {
-  recordCognitive, findCognitiveByClaimKey, updateCognitiveSupport, supersedeBelief,
+  recordCognitive, findCognitiveByClaimKey, findCognitiveMatch,
+  updateCognitiveSupport, supersedeBelief,
 } from "./layer3-cognitive";
 import { canonicalPredicate } from "./predicates";
 import { isFunctionalFor } from "./layer4-supersession";
@@ -150,6 +151,11 @@ export function reflect(input: ReflectInput): ReflectionReport {
   // split into two claim groups and corroboration counts halved. Resolve
   // unlinked subjects through the entity registry (name + aliases).
   const entityIdByName = new Map<string, string>();
+  // v2.22.4 — reverse map (entity id -> its names/aliases, lowercased) built
+  // for ALL entities regardless of status. Powers the entity->raw key-migration
+  // fallback below: a belief keyed by a now-rejected entity's id can still be
+  // matched back to the raw-name group by resolving its subject_entity_id here.
+  const entityNamesById = new Map<string, Set<string>>();
   const entDir = join(input.vaultRoot, "v2-entities", input.owner);
   if (existsSync(entDir)) {
     for (const ef of readdirSync(entDir)) {
@@ -158,13 +164,18 @@ export function reflect(input: ReflectInput): ReflectionReport {
         const e = matter(readFileSync(join(entDir, ef), "utf8")).data as
           { id?: string; name?: string; aliases?: string[]; status?: string };
         if (!e.id) continue;
+        const names = new Set<string>();
+        for (const n of [e.name, ...(e.aliases ?? [])]) {
+          const lc = (n ?? "").trim().toLowerCase();
+          if (lc) names.add(lc);
+        }
+        entityNamesById.set(e.id, names);
         // v2.22.1 (round-2 finding): skip rejected AND draft entities — a
         // reviewer-rejected (e.g. hallucinated) entity's aliases must NOT
         // glue distinct subjects together and mint false corroboration.
         if ((e.status ?? "approved") !== "approved") continue;
-        for (const n of [e.name, ...(e.aliases ?? [])]) {
-          const lc = (n ?? "").trim().toLowerCase();
-          if (lc && !entityIdByName.has(lc)) entityIdByName.set(lc, e.id);
+        for (const lc of names) {
+          if (!entityIdByName.has(lc)) entityIdByName.set(lc, e.id);
         }
       } catch { /* skip malformed */ }
     }
@@ -203,6 +214,13 @@ export function reflect(input: ReflectInput): ReflectionReport {
     // (raw-subject) key; if the primary lookup misses but the alt hits, we
     // update that record in place AND migrate its key so it's stable after.
     alt_claim_key?: string;
+    // v2.22.4 — the OTHER migration direction. When the primary + raw-alt keys
+    // both miss (the subject's entity was REJECTED between runs, so the group
+    // reverted to a raw-name key while the surviving belief is still keyed by
+    // the entity-id), this locates that entity-id-keyed belief so we update it
+    // in place instead of minting a duplicate. Consulted only when the raw-alt
+    // lookup could not disambiguate (alt === primary).
+    entity_fallback?: () => ReturnType<typeof findCognitiveByClaimKey>;
   }): void => {
     if (records.length >= cap) return;
     let migrateKey: string | undefined;
@@ -210,6 +228,12 @@ export function reflect(input: ReflectInput): ReflectionReport {
     if (!existing && args.alt_claim_key && args.alt_claim_key !== args.claim_key) {
       existing = findCognitiveByClaimKey(input.vaultRoot, input.owner, args.alt_claim_key);
       if (existing) migrateKey = args.claim_key;   // heal the key on this pass
+    }
+    if (!existing && args.entity_fallback) {
+      existing = args.entity_fallback();
+      // heal the surviving record onto the current (raw-name) key so future
+      // runs hit the primary lookup directly.
+      if (existing && existing.claim_key !== args.claim_key) migrateKey = args.claim_key;
     }
     if (existing) {
       const sameSupport =
@@ -301,13 +325,32 @@ export function reflect(input: ReflectInput): ReflectionReport {
     }
     const meanConf = g.facts.reduce((s, f) => s + f.confidence, 0) / g.facts.length;
     const confidence = Math.min(0.95, meanConf * (0.75 + 0.1 * g.episodes.size));
+    const primaryClaimKey = `corro|${key}`;
+    // v2.22.4 — entity->raw migration probe: when the group is on a raw-name
+    // key (the subject's entity was REJECTED between runs), find the surviving
+    // belief still keyed by that entity's id. Matches on the (predicate|object)
+    // key suffix AND requires the key's subject segment to be an entity id that
+    // the all-status reverse map resolves back to THIS group's raw subject (or
+    // the record's subject_entity_id to do so), so we never fold a different
+    // subject that merely shares the same predicate/object.
+    const rawSubj = g.subject.trim().toLowerCase();
+    const keySuffix = `|${canonicalPredicate(g.predicate)}|${g.object.trim().toLowerCase()}`;
+    const namesResolveToSubj = (id: string | null | undefined): boolean =>
+      !!id && (entityNamesById.get(id)?.has(rawSubj) ?? false);
     upsert({
       kind: "belief",
       content: `${g.subject} ${g.predicate} ${g.object} — independently stated in ${g.episodes.size} documents.`,
       confidence,
       derived_from: [...new Set([...g.facts.map(f => f.id), ...g.episodes])],
-      claim_key: `corro|${key}`,
-      alt_claim_key: `corro|${g.subject.trim().toLowerCase()}|${canonicalPredicate(g.predicate)}|${g.object.trim().toLowerCase()}`,
+      claim_key: primaryClaimKey,
+      alt_claim_key: `corro|${rawSubj}${keySuffix}`,
+      entity_fallback: () => findCognitiveMatch(input.vaultRoot, input.owner, r => {
+        const ck = r.claim_key;
+        if (typeof ck !== "string" || ck === primaryClaimKey) return false;
+        if (!ck.startsWith("corro|") || !ck.endsWith(keySuffix)) return false;
+        const subjPart = ck.slice("corro|".length, ck.length - keySuffix.length);
+        return namesResolveToSubj(subjPart) || namesResolveToSubj(r.subject_entity_id);
+      }),
       subject_entity_id: g.subjectEntityId,
       belief_kind: "personal",
     });

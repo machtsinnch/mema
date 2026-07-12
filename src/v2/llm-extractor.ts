@@ -614,12 +614,35 @@ export class OllamaExtractor implements LLMExtractor {
   readonly name: string;
   private url: string;
   private model: string;
+  // v2.22.4 — Bug A retrofit: the old path capped input at text.slice(0, 8000)
+  // and returned no chunk_stats, so any episode past ~8 KB had its tail
+  // silently dropped while /v2/observe still reported "complete" (the exact
+  // Bug A closed for the Anthropic/CLI paths but never for this fallback).
+  // Local Ollama models run with a modest context, so keep a per-call budget
+  // in the same 8 KB range — but when the text exceeds it, chunk the FULL
+  // content on boundaries, extract each chunk, merge, and report honest
+  // chunk_stats so the observe status becomes "partial" instead of a lie.
+  private static readonly SINGLE_SHOT_CHARS = 8_000;
   constructor(opts: { url?: string; model?: string } = {}) {
     this.url = opts.url ?? process.env.OLLAMA_URL ?? "http://localhost:11434";
     this.model = opts.model ?? process.env.OLLAMA_MODEL ?? "llama3.1:8b";
     this.name = `ollama:${this.model}`;
   }
   async extract(text: string): Promise<ExtractionResult> {
+    if (text.length <= OllamaExtractor.SINGLE_SHOT_CHARS) return this.extractOnce(text);
+    const chunks = chunkOnBoundaries(text, OllamaExtractor.SINGLE_SHOT_CHARS);
+    if (chunks.length === 0) return { facts: [], entities: [], chunk_stats: { total: 0, failed: 0 } };
+    const parts: ExtractionResult[] = [];
+    let failed = 0;
+    for (const chunk of chunks) {
+      try { parts.push(await this.extractOnce(chunk)); }
+      catch { failed++; }
+    }
+    if (parts.length === 0) throw new Error(`ollama extractor: all ${chunks.length} chunk(s) failed`);
+    const merged = mergeExtractionResults(parts);
+    return { ...merged, chunk_stats: { total: chunks.length, failed } };
+  }
+  private async extractOnce(text: string): Promise<ExtractionResult> {
     const r = await fetch(`${this.url}/api/chat`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -632,7 +655,7 @@ export class OllamaExtractor implements LLMExtractor {
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: FEW_SHOT_USER },
           { role: "assistant", content: FEW_SHOT_ASSISTANT },
-          { role: "user", content: `Text:\n${text.slice(0, 8000)}` },
+          { role: "user", content: `Text:\n${text}` },
         ],
       }),
     });
@@ -893,12 +916,35 @@ export class OpenAIExtractor implements LLMExtractor {
   readonly name: string;
   private apiKey: string;
   private model: string;
+  // v2.22.4 — Bug A retrofit: the old path capped input at text.slice(0, 8000)
+  // and returned no chunk_stats, so any episode past ~8 KB had its tail
+  // silently dropped while /v2/observe still reported "complete". gpt-4o-mini
+  // has a 128K context, so the 8000 cap was a pure leftover, not a model
+  // limit — raise it well above 8000 and, past that, chunk the FULL content
+  // on boundaries, extract each chunk, merge, and report honest chunk_stats
+  // (same single-pass treatment as AnthropicExtractor — this path has no
+  // consensus vote) so the observe status becomes "partial", never a lie.
+  private static readonly SINGLE_SHOT_CHARS = 24_000;
   constructor(opts: { apiKey: string; model?: string }) {
     this.apiKey = opts.apiKey;
     this.model = opts.model ?? "gpt-4o-mini";
     this.name = `openai:${this.model}`;
   }
   async extract(text: string): Promise<ExtractionResult> {
+    if (text.length <= OpenAIExtractor.SINGLE_SHOT_CHARS) return this.extractOnce(text);
+    const chunks = chunkOnBoundaries(text, 20_000);
+    if (chunks.length === 0) return { facts: [], entities: [], chunk_stats: { total: 0, failed: 0 } };
+    const parts: ExtractionResult[] = [];
+    let failed = 0;
+    for (const chunk of chunks) {
+      try { parts.push(await this.extractOnce(chunk)); }
+      catch { failed++; }
+    }
+    if (parts.length === 0) throw new Error(`openai extractor: all ${chunks.length} chunk(s) failed`);
+    const merged = mergeExtractionResults(parts);
+    return { ...merged, chunk_stats: { total: chunks.length, failed } };
+  }
+  private async extractOnce(text: string): Promise<ExtractionResult> {
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -913,7 +959,7 @@ export class OpenAIExtractor implements LLMExtractor {
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: FEW_SHOT_USER },
           { role: "assistant", content: FEW_SHOT_ASSISTANT },
-          { role: "user", content: `Text:\n${text.slice(0, 8000)}` },
+          { role: "user", content: `Text:\n${text}` },
         ],
       }),
     });

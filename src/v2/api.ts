@@ -20,6 +20,7 @@ const flagScreenInFlight = new Set<string>();
 import {
   recordJudgment, readJudgment, listJudgments, supersedeJudgment,
   flagJudgmentsForFact, clearJudgmentFlags, screenJudgmentCandidates,
+  flagScreenAutoEnabled,
 } from "./layer3-judgment";
 import {
   createEntity, readEntity, findEntityByName, listEntities, mergeEntities,
@@ -963,27 +964,33 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     // v2.21.0/v2.21.1 — one run per owner PER JOB TYPE at a time: no
     // double web-search spend, and a slow fact-check run no longer
     // starves flag screening.
-    if (factCheckAutoEnabled()) {
-      if (!factCheckInFlight.has(owner)) {
-        const pending = listUnverifiedClaims(cfg.vaultRoot, owner);
-        factChecksStarted = Math.min(pending.length, 5);
-        if (factChecksStarted > 0) {
-          factCheckInFlight.add(owner);
-          factCheckUnverified(cfg.vaultRoot, owner, actor, { limit: 5 })
-            .then(r => console.log(`[fact-check] ${owner}: ${r.checked.length} checked, ${r.errors.length} errors, ${r.pending} still pending`))
-            .catch(e => console.error(`[fact-check] ${owner}: ${(e as Error).message}`))
-            .finally(() => factCheckInFlight.delete(owner));
-        }
+    if (factCheckAutoEnabled() && !factCheckInFlight.has(owner)) {
+      const pending = listUnverifiedClaims(cfg.vaultRoot, owner);
+      factChecksStarted = Math.min(pending.length, 5);
+      if (factChecksStarted > 0) {
+        factCheckInFlight.add(owner);
+        factCheckUnverified(cfg.vaultRoot, owner, actor, { limit: 5 })
+          .then(r => console.log(`[fact-check] ${owner}: ${r.checked.length} checked, ${r.errors.length} errors, ${r.pending} still pending`))
+          .catch(e => console.error(`[fact-check] ${owner}: ${(e as Error).message}`))
+          .finally(() => factCheckInFlight.delete(owner));
       }
-      if (!flagScreenInFlight.has(owner)) {
-        flagScreenInFlight.add(owner);
-        // v2.19.2 — candidate review flags get their relevance check in the
-        // same background slot (one model call per touched judgment).
-        screenJudgmentCandidates(cfg.vaultRoot, owner, actor, { limit: 5 })
-          .then(r => { if (r.judgments_screened > 0) console.log(`[flag-screen] ${owner}: ${r.kept} kept, ${r.dropped} dropped`); })
-          .catch(e => console.error(`[flag-screen] ${owner}: ${(e as Error).message}`))
-          .finally(() => flagScreenInFlight.delete(owner));
-      }
+    }
+    // v2.22.4 — flag screening is its OWN job type, gated independently of the
+    // web-fact-check toggle. It used to sit INSIDE `if (factCheckAutoEnabled())`,
+    // so MEMA_FACTCHECK_AUTO=false (a documented, quota-saving switch) also
+    // disabled judgment flag screening entirely — candidate flags then lived on
+    // their judgment forever and the "dropped with reason" audit rows were never
+    // written. Web fact-checking spends web-search quota; flag screening is a
+    // plain relevance model call, so they must not share one enable switch. Its
+    // own flagScreenInFlight guard still prevents overlapping runs per owner.
+    if (flagScreenAutoEnabled() && !flagScreenInFlight.has(owner)) {
+      flagScreenInFlight.add(owner);
+      // v2.19.2 — candidate review flags get their relevance check in a
+      // background slot (one model call per touched judgment).
+      screenJudgmentCandidates(cfg.vaultRoot, owner, actor, { limit: 5 })
+        .then(r => { if (r.judgments_screened > 0) console.log(`[flag-screen] ${owner}: ${r.kept} kept, ${r.dropped} dropped`); })
+        .catch(e => console.error(`[flag-screen] ${owner}: ${(e as Error).message}`))
+        .finally(() => flagScreenInFlight.delete(owner));
     }
     return c.json({ report, fact_checks_started: factChecksStarted });
   });
