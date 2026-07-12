@@ -194,6 +194,23 @@ export function classifyOnWrite(
     return { kind: "ADD", reason: "non_functional_predicate" };
   }
 
+  // 3b. Future-dated plan (v2.22.7 — l3-reflect finding). A new functional
+  //     fact whose event_date is in the FUTURE ("Ardin works_at BMW starting
+  //     2027-03") is a not-yet-effective PLAN, not the present state. Letting
+  //     it supersede a currently-valid fact would stamp invalidated_at = now()
+  //     (invalidateFact always uses now(), never the successor's valid_from)
+  //     on a still-true present fact — so current-state reads go EMPTY between
+  //     today and the future date: the live fact reads as ended, the future
+  //     fact is excluded as not-yet-current. A future plan must not
+  //     retroactively end a present fact. ADD only; the present fact stays
+  //     live and the future fact simply reads as future-dated (isCurrent=false
+  //     until its valid_from). Duplicate/stale/covered checks already ran
+  //     above, so a genuinely redundant future restatement is still skipped.
+  const today = new Date().toISOString().slice(0, 10);
+  if (normNewDate > today) {
+    return { kind: "ADD", reason: "future_dated_plan" };
+  }
+
   // 4. Update — different object, OLDER event than the new fact, still
   //    current. These get superseded by the new fact.
   //

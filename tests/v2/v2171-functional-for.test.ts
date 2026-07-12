@@ -137,7 +137,14 @@ describe("reflection Rule B respects subject type and future dates", () => {
     rmSync(vault, { recursive: true, force: true });
   });
 
-  test("future-dated fact → abstain with a visible reason, no 'currently' belief", () => {
+  // v2.22.7 (l3-reflect finding): a future-dated fact is still a plan, not a
+  // current state — but it must NOT erase the present employer. Before the
+  // fix the future SpaceLab fact superseded Anthropic at write time (stamping
+  // invalidated_at=now()), so Rule B saw only the plan and abstained, and the
+  // current employer read as UNKNOWN. Now the future fact does not supersede;
+  // Anthropic stays live and is correctly concluded as current, while
+  // SpaceLab reads as a not-yet-current plan (no "currently ... SpaceLab").
+  test("future-dated fact is a plan, not current — the present employer is retained", () => {
     const vault = fresh();
     const ep = observe(vault, { kind: "document", content: "x", actor: "t", owner: "o" });
     recordFactWithSupersession(vault, {
@@ -149,8 +156,10 @@ describe("reflection Rule B respects subject type and future dates", () => {
       derived_from: [ep.id], actor: "t", owner: "o",
     });
     const r = reflect({ vaultRoot: vault, owner: "o", actor: "t", since: SINCE });
-    expect(r.records.filter(x => x.content.includes("currently"))).toHaveLength(0);
-    expect(r.abstained?.some(a => a.reason.includes("future"))).toBe(true);
+    // The future plan is never concluded as the current state.
+    expect(r.records.some(x => x.content.includes("SpaceLab") && x.content.includes("currently"))).toBe(false);
+    // The present employer is NOT erased by the future plan.
+    expect(r.records.some(x => x.content.includes("Marcel currently works_at Anthropic"))).toBe(true);
     rmSync(vault, { recursive: true, force: true });
   });
 });

@@ -436,10 +436,32 @@ export function reflect(input: ReflectInput): ReflectionReport {
     // conflict, it is agreement. Collapsing by normalized object stops a
     // fabricated "N candidate values" abstention from suppressing an
     // unambiguous current-state belief. Only >=2 DISTINCT values abstain.
+    // v2.22.7 (l3-reflect finding): partition the live facts into
+    // NOT-YET-CURRENT (future-dated plans) vs ACTUALLY-CURRENT *before*
+    // counting distinct values. The future-date guard used to live only
+    // inside the single-value branch (below), AFTER this multi-value
+    // abstention — so a future plan and a genuinely current fact together
+    // counted as "2 distinct current values" and abstained, when the future
+    // date in fact ORDERS them (the plan is not yet current). Exclude
+    // future-dated facts here so the multi-value branch is consistent with
+    // the single-value future guard.
+    const actuallyCurrent = g.current.filter(
+      cf => !(hasWorldDate(cf) && (cf.valid_from ?? "") > today),
+    );
+    // v2.22.6 — count DISTINCT object values, not fact count (same-value
+    // corroboration is agreement, not a conflict).
     const byObject = new Map<string, SemanticFact[]>();
-    for (const cf of g.current) {
+    for (const cf of actuallyCurrent) {
       const ok = cf.object.trim().toLowerCase();
       (byObject.get(ok) ?? byObject.set(ok, []).get(ok)!).push(cf);
+    }
+    if (byObject.size === 0) {
+      // Every live value is future-dated — all plans, nothing current yet.
+      abstained.push({
+        rule: "current-state", subject: g.subject, predicate: g.predicate,
+        reason: `all current-state facts are future-dated — a plan, not a current state`,
+      });
+      continue;
     }
     if (byObject.size > 1) {
       abstained.push({

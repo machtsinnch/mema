@@ -551,7 +551,14 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     // that matched a judgment's foundations at write time was intentionally
     // NOT flagged (unreviewed); now that it is trusted, flag here — this
     // also catches drafts written before the judgment existed.
-    const judgmentsFlagged = flagJudgmentsForFact(cfg.vaultRoot, owner, r.fact, actor);
+    // v2.22.7 (l3-judgment finding): bind the flag to the approval EVENT, not
+    // to every approve call. A retried/duplicate POST on an already-approved
+    // fact is an idempotent no-op (r.changed === false); flagging it would
+    // resurrect a review flag a human already reviewed and cleared. Flag only
+    // on the real draft->approved transition.
+    const judgmentsFlagged = r.changed
+      ? flagJudgmentsForFact(cfg.vaultRoot, owner, r.fact, actor)
+      : 0;
     // v2.21.1 — explicit visibility: approval-time supersession is
     // reported, never silent (matches POST /v2/fact's superseded[]).
     return c.json({
@@ -643,7 +650,12 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     // no-op in that case and a real invalidation otherwise.
     const invalidated = invalidateFact(cfg.vaultRoot, oldId, owner, actor, newId);
     // v2.22.6 (round-6 finding): approval fires the living loop (see /approve).
-    const judgmentsFlagged = flagJudgmentsForFact(cfg.vaultRoot, owner, approvedResult.fact, actor);
+    // v2.22.7 (l3-judgment finding): only on the real draft->approved
+    // transition — a redundant approve is idempotent (changed === false) and
+    // must not re-inject a human-cleared review flag.
+    const judgmentsFlagged = approvedResult.changed
+      ? flagJudgmentsForFact(cfg.vaultRoot, owner, approvedResult.fact, actor)
+      : 0;
     return c.json({
       approved: approvedResult.fact,
       invalidated,

@@ -125,14 +125,19 @@ export function approveFact(
   owner: string,
   actor: string,
   reason?: string,
-): { fact: SemanticFact | null; supersededIds: string[] } {
+  // v2.22.7 (l3-judgment finding): `changed` reports whether this call
+  // actually performed the draft->approved TRANSITION. It is false on the
+  // idempotent early-return below (already-approved record) so callers can
+  // bind approval-EVENT side effects (the living-loop judgment flag) to the
+  // real transition, not to every retried/duplicate approve.
+): { fact: SemanticFact | null; supersededIds: string[]; changed: boolean } {
   const path = factPath(vaultRoot, owner, factId);
-  if (!path) return { fact: null, supersededIds: [] };
+  if (!path) return { fact: null, supersededIds: [], changed: false };
   const parsed = matter(readFileSync(path, "utf8"));
   const fm = parsed.data as any;
-  if (fm.owner !== owner) return { fact: null, supersededIds: [] };
+  if (fm.owner !== owner) return { fact: null, supersededIds: [], changed: false };
   // Idempotent: re-approving an approved record is a no-op + no audit churn.
-  if (fm.status === "approved") return { fact: fm as SemanticFact, supersededIds: [] };
+  if (fm.status === "approved") return { fact: fm as SemanticFact, supersededIds: [], changed: false };
   fm.status = "approved";
   fm.reviewed_by = actor;
   fm.reviewed_at = new Date().toISOString();
@@ -211,7 +216,7 @@ export function approveFact(
   } catch (e) {
     console.warn(`[approve-supersession] ${factId}: ${e}`);
   }
-  return { fact: readFact(vaultRoot, owner, factId), supersededIds };
+  return { fact: readFact(vaultRoot, owner, factId), supersededIds, changed: true };
 }
 
 // v2.7+ acceptance lifecycle — reject a draft fact. Sets status="rejected"
