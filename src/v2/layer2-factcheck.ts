@@ -202,13 +202,18 @@ export async function checkClaimWithCLI(
     env: { ...process.env, MACHTSINN_PORT: "65535" },
     cwd: "/tmp",
   });
-  const timer = new Promise<"__timeout__">(resolve =>
-    setTimeout(() => resolve("__timeout__"), timeoutMs));
+  let timerId: ReturnType<typeof setTimeout> | undefined;
+  const timer = new Promise<"__timeout__">(resolve => {
+    timerId = setTimeout(() => resolve("__timeout__"), timeoutMs);
+  });
   const reader = (async () => {
     if (!proc.stdout) return "";
     return new TextDecoder().decode(await new Response(proc.stdout).arrayBuffer());
   })();
   const result = await Promise.race([reader, timer]);
+  // v2.21.0 — clear the race timer; an uncancelled one kept scripts alive
+  // for up to timeoutMs after the last successful call.
+  if (timerId !== undefined) clearTimeout(timerId);
   if (result === "__timeout__") {
     try { proc.kill(); } catch { /* already gone */ }
     setTimeout(() => { try { proc.kill(9); } catch { /* already gone */ } }, 2000);

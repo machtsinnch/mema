@@ -190,13 +190,34 @@ export function classifyOnWrite(
   // The duplicate check (step 1) keeps date-prefix because "same day same
   // object" really IS a duplicate semantically; only UPDATE needs precision.
   const newTs = newFact.event_date ?? "";
+  // v2.21.0 — mixed date formats (general-review finding): valid_from is a
+  // full ISO timestamp for undated facts (now()) but a plain world date
+  // ("2026-07-12") for dated ones. Raw string '<' let the FORMAT decide
+  // the winner ("2026-07-12T07:38:10Z" < "2026-07-12" is false), so a
+  // dated same-day contradiction never superseded an undated fact while
+  // the mirror case did. Compare at the shared precision; when the day
+  // ties AND the formats differ, the NEW fact wins (last-write-wins, the
+  // same spirit as the v2.14.1 same-day fix).
+  const olderThanNew = (existing: string): boolean => {
+    if (existing.length > 10 && newTs.length > 10) return existing < newTs;
+    const a = existing.slice(0, 10);
+    const b = newTs.slice(0, 10);
+    if (a !== b) return a < b;
+    return existing.length !== newTs.length;
+  };
+  // v2.21.0 — a CLOSED fact (valid_to already passed at the new fact's
+  // date) ended on its own terms; superseding it would stamp "we learned
+  // this was wrong" on something that was never wrong.
+  const isClosed = (f: SemanticFact): boolean =>
+    !!f.valid_to && String(f.valid_to).slice(0, 10) <= newTs.slice(0, 10);
   const olderDifferent = candidates.filter(f =>
     f.object?.trim().toLowerCase() !== normNewObject
-    && (f.valid_from ?? "") < newTs
+    && olderThanNew(f.valid_from ?? "")
     // The caller pre-filtered for !invalidated_at && !superseded_by, but
     // belt-and-suspenders: enforce here too.
     && !f.invalidated_at
     && !f.superseded_by
+    && !isClosed(f)
   );
   if (olderDifferent.length > 0) {
     return { kind: "UPDATE", superseded: olderDifferent };

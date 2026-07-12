@@ -146,7 +146,44 @@ export function approveFact(
     evidence_chain: (fm.derived_from ?? []) as string[],
     reason,
   });
-  return fm as SemanticFact;
+  // v2.21.0 — approval IS the write into approved space: run the
+  // supersession check that was deliberately deferred while this fact was
+  // a draft (drafts never supersede — see recordFactWithSupersession).
+  // Only the UPDATE branch applies: an explicitly approved fact is never
+  // silently skipped as duplicate/stale.
+  try {
+    const contradictions = findContradictions(vaultRoot, owner, {
+      subject: String(fm.subject ?? ""),
+      predicate: String(fm.predicate ?? ""),
+      object: String(fm.object ?? ""),
+    }).filter(c => c.fact_id !== factId);
+    const fullCandidates: SemanticFact[] = [];
+    for (const c of contradictions) {
+      const f = readFact(vaultRoot, owner, c.fact_id);
+      if (f) fullCandidates.push(f);
+    }
+    const subjType = fm.subject_entity_id
+      ? (readEntity(vaultRoot, owner, String(fm.subject_entity_id))?.type ?? null)
+      : null;
+    const decision = classifyOnWrite(
+      {
+        subject: String(fm.subject ?? ""),
+        predicate: String(fm.predicate ?? ""),
+        object: String(fm.object ?? ""),
+        event_date: String(fm.valid_from ?? new Date().toISOString()),
+      },
+      fullCandidates,
+      subjType,
+    );
+    if (decision.kind === "UPDATE") {
+      for (const old of decision.superseded) {
+        invalidateFact(vaultRoot, old.id, owner, actor, factId);
+      }
+    }
+  } catch (e) {
+    console.warn(`[approve-supersession] ${factId}: ${e}`);
+  }
+  return readFact(vaultRoot, owner, factId);
 }
 
 // v2.7+ acceptance lifecycle — reject a draft fact. Sets status="rejected"
@@ -214,9 +251,14 @@ export function invalidateFact(
   parsed.data.invalidated_at = new Date().toISOString();
   if (supersededBy) parsed.data.superseded_by = supersededBy;
   // Rebuild Obsidian links to include the new supersession edge.
+  // v2.21.0 — general-review fix: keep the ENTITY edges too; the old
+  // rebuild dropped subject/object entity links, silently disconnecting
+  // every superseded fact from its entities in the graph.
   parsed.data.links = toWikilinks([
     ...((parsed.data.derived_from ?? []) as string[]),
     ...(parsed.data.superseded_by ? [parsed.data.superseded_by] : []),
+    ...(parsed.data.subject_entity_id ? [parsed.data.subject_entity_id] : []),
+    ...(parsed.data.object_entity_id ? [parsed.data.object_entity_id] : []),
   ]);
   atomicWriteFile(path, matter.stringify(parsed.content, parsed.data));
   appendAudit({
@@ -239,6 +281,35 @@ export function readFact(vaultRoot: string, owner: string, id: string): Semantic
 // Get all facts for an owner that were valid at a given point in time.
 // Skips facts invalidated before `at`, or whose valid_to is before `at`.
 // v2.7+: skips drafts and rejected records unless includeDrafts is true.
+// v2.21.0 — merge additional source-episode IDs into an existing fact's
+// derived_from (duplicate-skip provenance; see recordFactWithSupersession).
+// Returns true when the file changed.
+export function mergeFactProvenance(
+  vaultRoot: string,
+  owner: string,
+  factId: string,
+  episodeIds: string[],
+): boolean {
+  if (!episodeIds.length) return false;
+  const path = pathForFact(vaultRoot, owner, factId);
+  if (!path) return false;
+  const parsed = matter(readFileSync(path, "utf8"));
+  const fm = parsed.data as Record<string, unknown>;
+  if (fm.owner !== owner) return false;
+  const before = (fm.derived_from as string[]) ?? [];
+  const merged = [...new Set([...before, ...episodeIds])];
+  if (merged.length === before.length) return false;
+  fm.derived_from = merged;
+  fm.links = toWikilinks([
+    ...merged,
+    ...(fm.superseded_by ? [String(fm.superseded_by)] : []),
+    ...(fm.subject_entity_id ? [String(fm.subject_entity_id)] : []),
+    ...(fm.object_entity_id ? [String(fm.object_entity_id)] : []),
+  ]);
+  atomicWriteFile(path, matter.stringify(parsed.content, fm));
+  return true;
+}
+
 // v2.18.0 — world claims stay in Layer 2 (Ardin's boundary rule,
 // 2026-07-10). When reflection finds the same WORLD claim independently
 // stated in several documents, it must NOT create a Layer 3 belief
@@ -374,6 +445,9 @@ export function findContradictions(
       if ((fact.status ?? "approved") !== "approved") continue;
       if (fact.invalidated_at) continue;
       if (fact.superseded_by) continue;
+      // v2.21.0 — a fact that already ENDED (valid_to in the past) is
+      // history, not a current claim; it cannot be contradicted.
+      if (fact.valid_to && String(fact.valid_to) <= new Date().toISOString()) continue;
       if (fact.subject?.trim().toLowerCase() !== subj) continue;
       if (fact.predicate?.trim().toLowerCase() !== pred) continue;
       // Same (subject, predicate) — contradiction iff object differs.
@@ -461,6 +535,20 @@ export function recordFactWithSupersession(
   vaultRoot: string,
   input: RecordFactInput,
 ): RecordFactWithSupersessionResult {
+  // v2.21.0 — CRITICAL general-review fix: drafts NEVER supersede. An
+  // unreviewed fact must not invalidate approved knowledge (rejecting the
+  // draft afterwards could not restore it — permanent corruption through
+  // the very gate that promises fail-closed review). Drafts are written
+  // as plain ADDs; the supersession decision is re-run at APPROVAL time
+  // (approveFact), which is the actual write into approved space.
+  if ((input.status ?? "approved") !== "approved") {
+    const draft = recordFact(vaultRoot, input);
+    return {
+      written: draft,
+      decision: { kind: "ADD", reason: "draft_supersession_deferred_to_approval" },
+      supersededIds: [],
+    };
+  }
   // 1. Pre-filter candidates: existing approved + not-invalidated + not-
   //    superseded facts with the SAME (subject, predicate, owner) as the
   //    new fact. findContradictions already does exactly this filter; the
@@ -532,11 +620,25 @@ export function recordFactWithSupersession(
 
   // 3. Branch on decision.
   if (decision.kind === "NONE") {
+    // v2.21.0 — general-review fix: a skipped duplicate still carries
+    // PROVENANCE. A second document independently stating the same fact
+    // is exactly what corroboration counts — merge its episode IDs into
+    // the surviving fact so Rule A and the auto fact-check can see every
+    // source (they were structurally blind to same-wording duplicates).
+    const survivorIds: string[] = [];
+    const normObjForMerge = input.object.trim().toLowerCase();
+    for (const c of fullCandidates) {
+      if (c.object?.trim().toLowerCase() !== normObjForMerge) continue;
+      if (mergeFactProvenance(vaultRoot, input.owner, c.id, input.derived_from ?? [])) {
+        survivorIds.push(c.id);
+      }
+    }
     appendAudit({
       op: "EXTRACT",  // re-use existing op; reason carries the skip context
       actor: input.actor,
       owner: input.owner,
-      record_ids: [],
+      record_ids: survivorIds,
+      evidence_chain: input.derived_from,
       reason: `supersession_skip:${decision.reason}`,
     });
     return { written: null, decision, supersededIds: [] };

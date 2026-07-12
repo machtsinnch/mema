@@ -9,6 +9,11 @@ import {
   findContradictions,
 } from "./layer2-semantic";
 import { factCheckAutoEnabled, factCheckUnverified, listUnverifiedClaims } from "./layer2-factcheck";
+
+// v2.21.0 — per-owner guard so overlapping /v2/reflect calls cannot run
+// duplicate background enrichment (double web-search spend on the same
+// claims). In-process only; module-scoped by design.
+const enrichmentInFlight = new Set<string>();
 import {
   recordJudgment, readJudgment, listJudgments, supersedeJudgment,
   flagJudgmentsForFact, clearJudgmentFlags, screenJudgmentCandidates,
@@ -409,7 +414,10 @@ export function mountV2(app: Hono, cfg: V2Config): void {
 
       // v2.15.0 — a run that lost chunks is NOT complete. "partial" tells the
       // caller which fraction of the document actually reached L2.
-      extractionStatus = chunkStats && chunkStats.failed > 0 ? "partial" : "complete";
+      // v2.21.0 — truncated input (document larger than the extractor cap)
+      // also means the run did NOT cover the whole document.
+      extractionStatus = chunkStats && (chunkStats.failed > 0 || chunkStats.truncated)
+        ? "partial" : "complete";
     } catch (e: any) {
       extractionStatus = "pending_retry";
       extractionError = String(e?.message ?? e).slice(0, 500);
@@ -863,6 +871,17 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     if (supersedes_id && !supersession_reason) {
       return c.json({ error: "supersession_reason is required when supersedes_id is set — the reason IS the design story" }, 400);
     }
+    // v2.21.0 — general-review fix: validate the supersession TARGET before
+    // creating anything, so a typo'd id can no longer leave an orphan
+    // judgment while the old decision silently stays current — and an
+    // already-superseded judgment is never forked/overwritten.
+    if (supersedes_id) {
+      const old = readJudgment(cfg.vaultRoot, owner, supersedes_id);
+      if (!old) return c.json({ error: "supersedes_id_not_found" }, 404);
+      if (old.superseded_by) {
+        return c.json({ error: "already_superseded", superseded_by: old.superseded_by }, 409);
+      }
+    }
     const judgment = recordJudgment(cfg.vaultRoot, { ...body, actor, owner });
     let superseded = false;
     if (supersedes_id && supersession_reason) {
@@ -916,19 +935,24 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     // response only reports how many started; results land on the fact
     // records and in the audit log as they finish.
     let factChecksStarted = 0;
-    if (factCheckAutoEnabled()) {
+    // v2.21.0 — general-review fix: one enrichment run per owner at a
+    // time. Two overlapping /v2/reflect calls used to each spawn up to 5
+    // web-search subprocesses for the SAME unchecked claims.
+    if (factCheckAutoEnabled() && !enrichmentInFlight.has(owner)) {
       const pending = listUnverifiedClaims(cfg.vaultRoot, owner);
       factChecksStarted = Math.min(pending.length, 5);
-      if (factChecksStarted > 0) {
-        factCheckUnverified(cfg.vaultRoot, owner, actor, { limit: 5 })
-          .then(r => console.log(`[fact-check] ${owner}: ${r.checked.length} checked, ${r.errors.length} errors, ${r.pending} still pending`))
-          .catch(e => console.error(`[fact-check] ${owner}: ${(e as Error).message}`));
-      }
-      // v2.19.2 — candidate review flags get their relevance check in the
-      // same background slot (one model call per touched judgment).
-      screenJudgmentCandidates(cfg.vaultRoot, owner, actor, { limit: 5 })
-        .then(r => { if (r.judgments_screened > 0) console.log(`[flag-screen] ${owner}: ${r.kept} kept, ${r.dropped} dropped`); })
-        .catch(e => console.error(`[flag-screen] ${owner}: ${(e as Error).message}`));
+      enrichmentInFlight.add(owner);
+      Promise.allSettled([
+        factChecksStarted > 0
+          ? factCheckUnverified(cfg.vaultRoot, owner, actor, { limit: 5 })
+              .then(r => console.log(`[fact-check] ${owner}: ${r.checked.length} checked, ${r.errors.length} errors, ${r.pending} still pending`))
+          : Promise.resolve(),
+        // v2.19.2 — candidate review flags get their relevance check in the
+        // same background slot (one model call per touched judgment).
+        screenJudgmentCandidates(cfg.vaultRoot, owner, actor, { limit: 5 })
+          .then(r => { if (r.judgments_screened > 0) console.log(`[flag-screen] ${owner}: ${r.kept} kept, ${r.dropped} dropped`); }),
+      ]).catch(e => console.error(`[enrichment] ${owner}: ${(e as Error).message}`))
+        .finally(() => enrichmentInFlight.delete(owner));
     }
     return c.json({ report, fact_checks_started: factChecksStarted });
   });

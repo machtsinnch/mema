@@ -54,7 +54,9 @@ export interface ExtractionResult {
   entities: ExtractedEntity[];
   // v2.15.0 — populated by chunked extraction so /v2/observe can report
   // "partial" instead of pretending a run with dead chunks was "complete".
-  chunk_stats?: { total: number; failed: number };
+  // v2.21.0 — truncated: input exceeded MAX_CHARS and the tail was never
+  // extracted; /v2/observe must report partial, not complete.
+  chunk_stats?: { total: number; failed: number; truncated?: boolean };
 }
 
 // v2.15.0 — validate a model-supplied event_date at the boundary. Accepts
@@ -320,15 +322,19 @@ export function chunkOnBoundaries(text: string, maxChars: number): string[] {
 // common (an entity recurs across sections); the write layer dedups too, but
 // collapsing here avoids redundant writes + audit noise. First write wins.
 export function mergeExtractionResults(results: ExtractionResult[]): ExtractionResult {
-  const facts: ExtractedFact[] = [];
   const entities: ExtractedEntity[] = [];
-  const seenF = new Set<string>();
   const seenE = new Set<string>();
+  // v2.21.0 — general-review fix: cross-chunk dedup was first-wins, so a
+  // 0.6-confidence evidence-rescued copy from an early chunk shadowed a
+  // 3/3-majority copy of the SAME fact from a later chunk. Keep the
+  // strongest copy: more votes first, then confidence.
+  const factByKey = new Map<string, ExtractedFact>();
+  const strength = (f: ExtractedFact) => (f.votes ?? 1) * 10 + (f.confidence ?? 0);
   for (const r of results) {
     for (const f of r.facts ?? []) {
       const k = `${(f.subject ?? "").toLowerCase()}|${(f.predicate ?? "").toLowerCase()}|${(f.object ?? "").toLowerCase()}`;
-      if (seenF.has(k)) continue;
-      seenF.add(k); facts.push(f);
+      const prev = factByKey.get(k);
+      if (!prev || strength(f) > strength(prev)) factByKey.set(k, f);
     }
     for (const e of r.entities ?? []) {
       const k = `${(e.name ?? "").toLowerCase()}|${(e.type ?? "").toLowerCase()}`;
@@ -336,7 +342,7 @@ export function mergeExtractionResults(results: ExtractionResult[]): ExtractionR
       seenE.add(k); entities.push(e);
     }
   }
-  return { facts, entities };
+  return { facts: [...factByKey.values()], entities };
 }
 
 // ── Consensus extraction (v2.16.0) ──────────────────────────────────
@@ -359,6 +365,24 @@ export function mergeExtractionResults(results: ExtractionResult[]): ExtractionR
 // extra model calls. Agreement stays the gold gate; verbatim evidence is
 // the silver one — rescued facts enter with capped confidence and
 // explicit "+evidence" provenance.
+// v2.21.0 — general-review fix: the first version accepted ANY token >= 3
+// chars as a raw substring, so "The Board" matched via "the" and "plan"
+// matched "planning" — the quote never actually had to name the triple's
+// sides. Now: stopwords excluded, word-boundary matching, and an empty
+// side always fails.
+const GATE_STOPWORDS = new Set([
+  "the", "and", "for", "nor", "but", "with", "that", "this", "these",
+  "those", "from", "into", "onto", "are", "was", "were", "has", "have",
+  "had", "its", "their", "our", "your", "all", "any", "not", "can",
+  "will", "would", "should", "may", "might", "also", "than", "then",
+  "when", "where", "which", "who", "how", "what", "why", "only", "very",
+  "more", "most", "some", "such", "each", "per", "via", "one", "two",
+  "new", "now", "out", "over", "under", "about",
+]);
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const wordBoundaryHit = (haystack: string, needle: string): boolean =>
+  new RegExp(`(^|[^a-z0-9])${escapeRe(needle)}([^a-z0-9]|$)`).test(haystack);
+
 export function evidencePassesGate(f: ExtractedFact, sourceText: string): boolean {
   const ev = (f.evidence ?? "").trim();
   if (ev.length < 20) return false;
@@ -366,9 +390,12 @@ export function evidencePassesGate(f: ExtractedFact, sourceText: string): boolea
   if (!norm(sourceText).includes(norm(ev))) return false;
   const evNorm = norm(ev);
   const mentions = (side: string): boolean => {
-    const toks = side.toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length >= 3);
-    if (toks.length === 0) return evNorm.includes(side.toLowerCase().trim());
-    return toks.some(t => evNorm.includes(t));
+    const phrase = norm(side);
+    if (phrase.length < 2) return false;
+    const toks = phrase.split(/[^a-z0-9]+/)
+      .filter(t => t.length >= 3 && !GATE_STOPWORDS.has(t));
+    if (toks.length === 0) return wordBoundaryHit(evNorm, phrase);
+    return toks.some(t => wordBoundaryHit(evNorm, t));
   };
   return mentions(f.subject ?? "") && mentions(f.object ?? "");
 }
@@ -602,7 +629,28 @@ export class AnthropicExtractor implements LLMExtractor {
     this.model = opts.model ?? "claude-sonnet-5";
     this.name = `anthropic:${this.model}`;
   }
+  // v2.21.0 — general-review fix: the single-shot path sent up to 600 KB
+  // of input against a fixed 8192-token OUTPUT ceiling, so large documents
+  // truncated mid-JSON and deterministically failed on every retry. Inputs
+  // beyond one comfortable call are now chunked (single pass per chunk —
+  // this path never had consensus) and merged, with honest chunk_stats.
+  private static readonly SINGLE_SHOT_CHARS = 24_000;
+
   async extract(text: string): Promise<ExtractionResult> {
+    if (text.length <= AnthropicExtractor.SINGLE_SHOT_CHARS) return this.extractOnce(text);
+    const chunks = chunkOnBoundaries(text, 20_000);
+    const parts: ExtractionResult[] = [];
+    let failed = 0;
+    for (const chunk of chunks) {
+      try { parts.push(await this.extractOnce(chunk)); }
+      catch { failed++; }
+    }
+    if (parts.length === 0) throw new Error(`anthropic extractor: all ${chunks.length} chunk(s) failed`);
+    const merged = mergeExtractionResults(parts);
+    return { ...merged, chunk_stats: { total: chunks.length, failed } };
+  }
+
+  private async extractOnce(text: string): Promise<ExtractionResult> {
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -704,7 +752,8 @@ export class ClaudeCLIExtractor implements LLMExtractor {
   // (truncation) stays closed; the v2.15.1 variance finding (4 vs 25 facts
   // from the same document) is what this stabilizes.
   async extract(text: string): Promise<ExtractionResult> {
-    const capped = text.length > ClaudeCLIExtractor.MAX_CHARS
+    const truncated = text.length > ClaudeCLIExtractor.MAX_CHARS;
+    const capped = truncated
       ? text.slice(0, ClaudeCLIExtractor.MAX_CHARS)
       : text;
     const chunks = chunkOnBoundaries(capped, this.chunkChars);
@@ -751,7 +800,11 @@ export class ClaudeCLIExtractor implements LLMExtractor {
       throw new Error(`claude CLI extractor: all ${chunks.length} chunk(s) failed (${passes} passes each)`);
     }
     const merged = mergeExtractionResults(perChunkConsensus);
-    merged.chunk_stats = { total: chunks.length, failed: failedChunks };
+    merged.chunk_stats = {
+      total: chunks.length,
+      failed: failedChunks,
+      ...(truncated ? { truncated: true } : {}),
+    };
     return merged;
   }
 
@@ -780,13 +833,18 @@ export class ClaudeCLIExtractor implements LLMExtractor {
       env: { ...process.env, MACHTSINN_PORT: "65535" },
       cwd: "/tmp",
     });
-    const timer = new Promise<"__timeout__">(resolve =>
-      setTimeout(() => resolve("__timeout__"), this.timeoutMs));
+    let timerId: ReturnType<typeof setTimeout> | undefined;
+    const timer = new Promise<"__timeout__">(resolve => {
+      timerId = setTimeout(() => resolve("__timeout__"), this.timeoutMs);
+    });
     const reader = (async () => {
       if (!proc.stdout) return "";
       return new TextDecoder().decode(await new Response(proc.stdout).arrayBuffer());
     })();
     const result = await Promise.race([reader, timer]);
+    // v2.21.0 — general-review fix: an uncancelled timer kept the process
+    // alive for up to timeoutMs after every successful call.
+    if (timerId !== undefined) clearTimeout(timerId);
     if (result === "__timeout__") {
       try { proc.kill(); } catch {}
       setTimeout(() => { try { proc.kill(9); } catch {} }, 2000);

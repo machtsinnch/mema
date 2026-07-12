@@ -199,6 +199,11 @@ export function supersedeJudgment(
   const oldParsed = matter(readFileSync(oldPath, "utf8"));
   const oldFm = oldParsed.data as Record<string, unknown>;
   if (oldFm.owner !== owner || oldFm.kind !== "judgment") return false;
+  // v2.21.0 — general-review fix: re-superseding an already-superseded
+  // judgment would overwrite the original written reason and fork the
+  // chain into two live heads. The chain is the design story — refuse.
+  if (oldFm.superseded_by) return false;
+  if (oldId === newId) return false;
   oldFm.superseded_by = newId;
   oldFm.judgment_status = "superseded";
   oldFm.supersession_reason = reason;
@@ -309,6 +314,8 @@ export interface ScreenResult {
   kept: number;
   dropped: number;
   errors: Array<{ judgment_id: string; error: string }>;
+  // v2.21.0 — which flags the screener removed and why (also audited).
+  dropped_flags: Array<{ judgment_id: string; fact_id: string; reason: string }>;
 }
 
 export async function screenJudgmentCandidates(
@@ -322,7 +329,7 @@ export async function screenJudgmentCandidates(
 ): Promise<ScreenResult> {
   const limit = opts.limit ?? 5;
   const screener = opts.screener ?? screenFlagsWithCLI;
-  const out: ScreenResult = { judgments_screened: 0, kept: 0, dropped: 0, errors: [] };
+  const out: ScreenResult = { judgments_screened: 0, kept: 0, dropped: 0, errors: [], dropped_flags: [] };
   const dir = join(vaultRoot, "cognitive", owner, "judgment");
   if (!existsSync(dir)) return out;
   for (const f of readdirSync(dir)) {
@@ -351,31 +358,56 @@ export async function screenJudgmentCandidates(
       out.errors.push({ judgment_id: String(fm.id), error: (e as Error).message });
       continue;
     }
+    // v2.21.0 — CRITICAL general-review fix: re-read the file AFTER the
+    // model call. Flags appended during the await (fact writes are not
+    // blocked by screening) must survive; verdicts apply only to the
+    // candidates THIS run screened. There is no await between this
+    // re-read and the write, so in-process interleaving cannot occur
+    // (single-threaded event loop); cross-process runs stay best-effort.
+    let fresh: ReturnType<typeof matter>;
+    try { fresh = matter(readFileSync(join(dir, f), "utf8")); } catch { continue; }
+    const freshFm = fresh.data as Record<string, unknown>;
+    if (freshFm.superseded_by) continue;
+    const freshFlags = (freshFm.review_flags as JudgmentReviewFlag[]) ?? [];
     const byId = new Map(verdicts.map(v => [v.fact_id, v]));
+    const screenedIds = new Set(candidates.map(c => c.fact_id));
     const next: JudgmentReviewFlag[] = [];
+    const droppedDetails: Array<{ fact_id: string; reason: string }> = [];
     let kept = 0, dropped = 0;
-    for (const fl of flags) {
-      if ((fl.status ?? "candidate") !== "candidate") { next.push(fl); continue; }
+    for (const fl of freshFlags) {
+      if ((fl.status ?? "candidate") !== "candidate" || !screenedIds.has(fl.fact_id)) {
+        next.push(fl);                               // untouched: already screened OR arrived mid-await
+        continue;
+      }
       const v = byId.get(fl.fact_id);
       if (!v) { next.push(fl); continue; }          // no verdict → stays candidate, retried next run
       if (v.relevant) {
         next.push({ ...fl, status: "relevant", screen_reason: v.reason });
         kept++;
       } else {
-        dropped++;                                   // removed — reason preserved in audit
+        dropped++;
+        droppedDetails.push({ fact_id: fl.fact_id, reason: v.reason });
       }
     }
-    fm.review_flags = next;
-    atomicWriteFile(join(dir, f), matter.stringify(parsed.content, fm));
+    freshFm.review_flags = next;
+    atomicWriteFile(join(dir, f), matter.stringify(fresh.content, freshFm));
+    // v2.21.0 — general-review fix: dropped flags are audited PER FACT
+    // (id in the evidence chain, screener reason in the reason string) —
+    // a removed review signal must stay discoverable.
     appendAudit({
       op: "REFLECT",
       actor,
       owner,
-      record_ids: [String(fm.id)],
-      reason: `judgment_flags_screened:kept=${kept},dropped=${dropped}`,
+      record_ids: [String(freshFm.id)],
+      evidence_chain: droppedDetails.map(d => d.fact_id),
+      reason: `judgment_flags_screened:kept=${kept},dropped=${dropped}`
+        + (droppedDetails.length
+          ? `;${droppedDetails.map(d => `${d.fact_id}=${d.reason}`).join("|")}`.slice(0, 900)
+          : ""),
     });
     out.kept += kept;
     out.dropped += dropped;
+    out.dropped_flags.push(...droppedDetails.map(d => ({ judgment_id: String(freshFm.id), ...d })));
   }
   return out;
 }

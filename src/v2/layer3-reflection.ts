@@ -145,6 +145,31 @@ export function reflect(input: ReflectInput): ReflectionReport {
   const facts = loadFacts(input.vaultRoot, input.owner);
   const windowedFacts = facts.filter(f => learnTime(f) >= cutoff).length;
 
+  // v2.21.0 — general-review fix (split groups): facts ingested BEFORE
+  // their entity existed carry no subject_entity_id, so the same subject
+  // split into two claim groups and corroboration counts halved. Resolve
+  // unlinked subjects through the entity registry (name + aliases).
+  const entityIdByName = new Map<string, string>();
+  const entDir = join(input.vaultRoot, "v2-entities", input.owner);
+  if (existsSync(entDir)) {
+    for (const ef of readdirSync(entDir)) {
+      if (!ef.endsWith(".md")) continue;
+      try {
+        const e = matter(readFileSync(join(entDir, ef), "utf8")).data as
+          { id?: string; name?: string; aliases?: string[] };
+        if (!e.id) continue;
+        for (const n of [e.name, ...(e.aliases ?? [])]) {
+          const lc = (n ?? "").trim().toLowerCase();
+          if (lc && !entityIdByName.has(lc)) entityIdByName.set(lc, e.id);
+        }
+      } catch { /* skip malformed */ }
+    }
+  }
+  const subjKeyOf = (f: SemanticFact): string =>
+    f.subject_entity_id
+    ?? entityIdByName.get(f.subject.trim().toLowerCase())
+    ?? f.subject.trim().toLowerCase();
+
   const records: CognitiveRecord[] = [];
   let created = 0, updated = 0, unchanged = 0;
   const abstained: NonNullable<ReflectionReport["abstained"]> = [];
@@ -180,7 +205,15 @@ export function reflect(input: ReflectInput): ReflectionReport {
       // backfilled in place instead of counting as unchanged.
       const sameKind = existing.belief_kind === args.belief_kind;
       if (sameSupport && sameContent && sameKind) { unchanged++; return; }
-      if (!sameContent && existing.kind === "belief") {
+      // v2.21.0 — general-review fix: the source COUNT baked into the text
+      // ("in 2 documents" -> "in 3 documents") is new evidence, not a new
+      // conclusion. Compare with counts normalized so growth updates in
+      // place instead of superseding an unchanged conclusion every time.
+      const stripVolatile = (s: string) => s
+        .replace(/independently stated in \d+ documents/g, "independently stated in N documents")
+        .replace(/replaced \d+ earlier value\(s\)/g, "replaced N earlier value(s)");
+      const sameConclusion = stripVolatile(existing.content.trim()) === stripVolatile(args.content.trim());
+      if (!sameConclusion && existing.kind === "belief") {
         // The conclusion itself changed (e.g. a new current employer):
         // keep history — supersede the old belief with a fresh record.
         const fresh = recordCognitive(input.vaultRoot, {
@@ -222,7 +255,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
   const groups = new Map<string, Group>();
   const active = facts.filter(f => !f.invalidated_at && !f.superseded_by);
   for (const f of active) {
-    const subjKey = f.subject_entity_id ?? f.subject.trim().toLowerCase();
+    const subjKey = subjKeyOf(f);
     const key = `${subjKey}|${canonicalPredicate(f.predicate)}|${f.object.trim().toLowerCase()}`;
     const g = groups.get(key) ?? {
       facts: [], episodes: new Set<string>(),
@@ -290,7 +323,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
   const today = new Date().toISOString().slice(0, 10);
   for (const f of facts) {
     if (!isFunctionalFor(f.predicate, subjectTypeOf(f))) continue;
-    const subjKey = f.subject_entity_id ?? f.subject.trim().toLowerCase();
+    const subjKey = subjKeyOf(f);
     const key = `${subjKey}|${canonicalPredicate(f.predicate)}`;
     const g = stateGroups.get(key) ?? {
       current: [], superseded: 0,
@@ -427,6 +460,11 @@ export async function reflectLLM(input: ReflectInput): Promise<ReflectionReport>
         const conf = Number(belief?.confidence ?? 0);
         const excerpt = String(belief?.evidence_excerpt ?? "").trim();
         if (!content || conf < 0.75) continue;
+        // v2.21.0 — general-review fix: includes("") matches EVERY episode,
+        // so a missing excerpt anchored beliefs to arbitrary documents.
+        // No usable quote -> no anchor -> drop (fail-closed for the
+        // untrusted LLM path).
+        if (excerpt.length < 10) continue;
         // Find a supporting episode for derived_from — match by excerpt
         // substring against each loaded episode body.
         const supports: string[] = [];
