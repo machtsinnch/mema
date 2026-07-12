@@ -184,6 +184,13 @@ export function reflect(input: ReflectInput): ReflectionReport {
     f.subject_entity_id
     ?? entityIdByName.get(f.subject.trim().toLowerCase())
     ?? f.subject.trim().toLowerCase();
+  // v2.22.5 — shared entity->raw resolution for the bidirectional key-migration
+  // fallback. Both Rule A (corroboration) and Rule B (current-state) use it to
+  // decide whether an entity-id-keyed belief belongs to a raw-name group whose
+  // entity was rejected between runs: true when the reverse map resolves `id`
+  // back to this group's raw subject. entityNamesById is all-status on purpose.
+  const namesResolveTo = (rawSubj: string, id: string | null | undefined): boolean =>
+    !!id && (entityNamesById.get(id)?.has(rawSubj) ?? false);
 
   const records: CognitiveRecord[] = [];
   let created = 0, updated = 0, unchanged = 0;
@@ -243,7 +250,21 @@ export function reflect(input: ReflectInput): ReflectionReport {
       // v2.18.0 — records written before labels existed get the label
       // backfilled in place instead of counting as unchanged.
       const sameKind = existing.belief_kind === args.belief_kind;
-      if (sameSupport && sameContent && sameKind) { unchanged++; return; }
+      if (sameSupport && sameContent && sameKind) {
+        // v2.22.5 — even when nothing else changed, heal a drifting key onto
+        // the current (raw-name) form when a migration probe matched an
+        // entity-id-keyed survivor; otherwise the key never converges and
+        // every future run re-runs the fallback scan.
+        if (migrateKey && existing.claim_key !== migrateKey) {
+          const healed = updateCognitiveSupport(input.vaultRoot, input.owner, existing.id, {
+            content: existing.content, confidence: existing.confidence,
+            derived_from: existing.derived_from, belief_kind: existing.belief_kind,
+            claim_key: migrateKey,
+          }, input.actor);
+          if (healed) { records.push(healed); updated++; return; }
+        }
+        unchanged++; return;
+      }
       // v2.21.0 — general-review fix: the source COUNT baked into the text
       // ("in 2 documents" -> "in 3 documents") is new evidence, not a new
       // conclusion. Compare with counts normalized so growth updates in
@@ -336,7 +357,7 @@ export function reflect(input: ReflectInput): ReflectionReport {
     const rawSubj = g.subject.trim().toLowerCase();
     const keySuffix = `|${canonicalPredicate(g.predicate)}|${g.object.trim().toLowerCase()}`;
     const namesResolveToSubj = (id: string | null | undefined): boolean =>
-      !!id && (entityNamesById.get(id)?.has(rawSubj) ?? false);
+      namesResolveTo(rawSubj, id);
     upsert({
       kind: "belief",
       content: `${g.subject} ${g.predicate} ${g.object} — independently stated in ${g.episodes.size} documents.`,
@@ -434,13 +455,33 @@ export function reflect(input: ReflectInput): ReflectionReport {
     if (g.superseded === 0 && !hasWorldDate(f)) continue;
     const since = hasWorldDate(f) ? ` since ${f.valid_from}` : "";
     const history = g.superseded > 0 ? `; replaced ${g.superseded} earlier value(s)` : "";
+    // v2.22.5 — Rule B gets the same entity->raw migration fallback Rule A has.
+    // When the subject's entity is REJECTED between runs the group key reverts
+    // from `current|<ENTID>|<pred>` to `current|<raw>|<pred>`; the primary and
+    // raw-alt lookups both miss the surviving entity-id-keyed belief (here alt
+    // === primary, so the alt probe is skipped), and without this fallback a
+    // SECOND identical live belief was minted. This locates the entity-id-keyed
+    // survivor by (predicate) key suffix, requiring the key's subject segment —
+    // or the record's subject_entity_id — to resolve back to THIS raw subject.
+    const rawSubj = g.subject.trim().toLowerCase();
+    const keySuffix = `|${canonicalPredicate(g.predicate)}`;
+    const namesResolveToSubj = (id: string | null | undefined): boolean =>
+      namesResolveTo(rawSubj, id);
+    const primaryClaimKey = `current|${key}`;
     upsert({
       kind: "belief",
       content: `${g.subject} currently ${g.predicate} ${f.object}${since}${history}.`,
       confidence: Math.min(0.95, f.confidence + 0.05 * g.superseded),
       derived_from: [...new Set([f.id, ...(f.derived_from ?? [])])],
-      claim_key: `current|${key}`,
-      alt_claim_key: `current|${g.subject.trim().toLowerCase()}|${canonicalPredicate(g.predicate)}`,
+      claim_key: primaryClaimKey,
+      alt_claim_key: `current|${rawSubj}${keySuffix}`,
+      entity_fallback: () => findCognitiveMatch(input.vaultRoot, input.owner, r => {
+        const ck = r.claim_key;
+        if (typeof ck !== "string" || ck === primaryClaimKey) return false;
+        if (!ck.startsWith("current|") || !ck.endsWith(keySuffix)) return false;
+        const subjPart = ck.slice("current|".length, ck.length - keySuffix.length);
+        return namesResolveToSubj(subjPart) || namesResolveToSubj(r.subject_entity_id);
+      }),
       subject_entity_id: g.subjectEntityId,
       belief_kind: "personal",
     });
