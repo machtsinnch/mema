@@ -10,10 +10,13 @@ import {
 } from "./layer2-semantic";
 import { factCheckAutoEnabled, factCheckUnverified, listUnverifiedClaims } from "./layer2-factcheck";
 
-// v2.21.0 — per-owner guard so overlapping /v2/reflect calls cannot run
+// v2.21.0 — per-owner guards so overlapping /v2/reflect calls cannot run
 // duplicate background enrichment (double web-search spend on the same
-// claims). In-process only; module-scoped by design.
-const enrichmentInFlight = new Set<string>();
+// claims). v2.21.1 — breaker finding: ONE shared guard starved flag
+// screening for the whole duration of a slow fact-check run; each job
+// type now has its own guard. In-process only; module-scoped by design.
+const factCheckInFlight = new Set<string>();
+const flagScreenInFlight = new Set<string>();
 import {
   recordJudgment, readJudgment, listJudgments, supersedeJudgment,
   flagJudgmentsForFact, clearJudgmentFlags, screenJudgmentCandidates,
@@ -312,7 +315,7 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     let factCount = 0;
     let entityCount = 0;
     let extractionError: string | undefined;
-    let chunkStats: { total: number; failed: number } | undefined;
+    let chunkStats: { total: number; failed: number; truncated?: boolean } | undefined;
     let extractorName: string | undefined;
     const rejectedFacts: Array<{ reason: string }> = [];
 
@@ -533,9 +536,14 @@ export function mountV2(app: Hono, cfg: V2Config): void {
         }, 422);
       }
     }
-    const f = approveFact(cfg.vaultRoot, id, owner, actor, parsed.body.reason);
-    if (!f) return c.json({ error: "not found" }, 404);
-    return c.json({ fact: f });
+    const r = approveFact(cfg.vaultRoot, id, owner, actor, parsed.body.reason);
+    if (!r.fact) return c.json({ error: "not found" }, 404);
+    // v2.21.1 — explicit visibility: approval-time supersession is
+    // reported, never silent (matches POST /v2/fact's superseded[]).
+    return c.json({
+      fact: r.fact,
+      ...(r.supersededIds.length > 0 ? { superseded: r.supersededIds } : {}),
+    });
   });
 
   app.post("/v2/fact/:id/reject", async c => {
@@ -609,10 +617,17 @@ export function mountV2(app: Hono, cfg: V2Config): void {
         return c.json({ error: "evidence_check_failed", missing: ec.missing }, 422);
       }
     }
-    const approved = approveFact(cfg.vaultRoot, newId, owner, actor, parsed.body.reason);
-    if (!approved) return c.json({ error: "approve failed" }, 500);
+    const approvedResult = approveFact(cfg.vaultRoot, newId, owner, actor, parsed.body.reason);
+    if (!approvedResult.fact) return c.json({ error: "approve failed" }, 500);
+    // approveFact's auto-supersession usually already invalidated oldId;
+    // invalidateFact is idempotent (v2.21.1) so this explicit call is a
+    // no-op in that case and a real invalidation otherwise.
     const invalidated = invalidateFact(cfg.vaultRoot, oldId, owner, actor, newId);
-    return c.json({ approved, invalidated });
+    return c.json({
+      approved: approvedResult.fact,
+      invalidated,
+      ...(approvedResult.supersededIds.length > 0 ? { superseded: approvedResult.supersededIds } : {}),
+    });
   });
 
   app.get("/v2/facts/valid-at", async c => {
@@ -935,24 +950,30 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     // response only reports how many started; results land on the fact
     // records and in the audit log as they finish.
     let factChecksStarted = 0;
-    // v2.21.0 — general-review fix: one enrichment run per owner at a
-    // time. Two overlapping /v2/reflect calls used to each spawn up to 5
-    // web-search subprocesses for the SAME unchecked claims.
-    if (factCheckAutoEnabled() && !enrichmentInFlight.has(owner)) {
-      const pending = listUnverifiedClaims(cfg.vaultRoot, owner);
-      factChecksStarted = Math.min(pending.length, 5);
-      enrichmentInFlight.add(owner);
-      Promise.allSettled([
-        factChecksStarted > 0
-          ? factCheckUnverified(cfg.vaultRoot, owner, actor, { limit: 5 })
-              .then(r => console.log(`[fact-check] ${owner}: ${r.checked.length} checked, ${r.errors.length} errors, ${r.pending} still pending`))
-          : Promise.resolve(),
+    // v2.21.0/v2.21.1 — one run per owner PER JOB TYPE at a time: no
+    // double web-search spend, and a slow fact-check run no longer
+    // starves flag screening.
+    if (factCheckAutoEnabled()) {
+      if (!factCheckInFlight.has(owner)) {
+        const pending = listUnverifiedClaims(cfg.vaultRoot, owner);
+        factChecksStarted = Math.min(pending.length, 5);
+        if (factChecksStarted > 0) {
+          factCheckInFlight.add(owner);
+          factCheckUnverified(cfg.vaultRoot, owner, actor, { limit: 5 })
+            .then(r => console.log(`[fact-check] ${owner}: ${r.checked.length} checked, ${r.errors.length} errors, ${r.pending} still pending`))
+            .catch(e => console.error(`[fact-check] ${owner}: ${(e as Error).message}`))
+            .finally(() => factCheckInFlight.delete(owner));
+        }
+      }
+      if (!flagScreenInFlight.has(owner)) {
+        flagScreenInFlight.add(owner);
         // v2.19.2 — candidate review flags get their relevance check in the
         // same background slot (one model call per touched judgment).
         screenJudgmentCandidates(cfg.vaultRoot, owner, actor, { limit: 5 })
-          .then(r => { if (r.judgments_screened > 0) console.log(`[flag-screen] ${owner}: ${r.kept} kept, ${r.dropped} dropped`); }),
-      ]).catch(e => console.error(`[enrichment] ${owner}: ${(e as Error).message}`))
-        .finally(() => enrichmentInFlight.delete(owner));
+          .then(r => { if (r.judgments_screened > 0) console.log(`[flag-screen] ${owner}: ${r.kept} kept, ${r.dropped} dropped`); })
+          .catch(e => console.error(`[flag-screen] ${owner}: ${(e as Error).message}`))
+          .finally(() => flagScreenInFlight.delete(owner));
+      }
     }
     return c.json({ report, fact_checks_started: factChecksStarted });
   });

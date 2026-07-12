@@ -196,6 +196,17 @@ export function supersedeJudgment(
   const newPath = pathForCognitive(vaultRoot, owner, newId);
   if (!oldPath || !newPath) return false;
 
+  // v2.21.1 — breaker finding: validate the NEW record BEFORE mutating
+  // the old one. The previous order half-wrote the old file when the new
+  // id was invalid (e.g. a belief id), bricking the judgment with no
+  // audit row and no recovery path. Also refuse a superseded record as
+  // the superseder — that closed the A↔B cycle that emptied the active
+  // list and made chain walkers loop forever.
+  const newParsed = matter(readFileSync(newPath, "utf8"));
+  const newFm = newParsed.data as Record<string, unknown>;
+  if (newFm.owner !== owner || newFm.kind !== "judgment") return false;
+  if (newFm.superseded_by) return false;
+
   const oldParsed = matter(readFileSync(oldPath, "utf8"));
   const oldFm = oldParsed.data as Record<string, unknown>;
   if (oldFm.owner !== owner || oldFm.kind !== "judgment") return false;
@@ -208,10 +219,6 @@ export function supersedeJudgment(
   oldFm.judgment_status = "superseded";
   oldFm.supersession_reason = reason;
   atomicWriteFile(oldPath, matter.stringify(oldParsed.content, oldFm));
-
-  const newParsed = matter(readFileSync(newPath, "utf8"));
-  const newFm = newParsed.data as Record<string, unknown>;
-  if (newFm.owner !== owner || newFm.kind !== "judgment") return false;
   newFm.supersedes = [...new Set([...(newFm.supersedes as string[] ?? []), oldId])];
   const newIter = (oldFm.iteration as number ?? 1) + 1;
   if ((newFm.iteration as number ?? 1) < newIter) newFm.iteration = newIter;

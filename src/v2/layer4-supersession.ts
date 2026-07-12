@@ -208,8 +208,16 @@ export function classifyOnWrite(
   // v2.21.0 — a CLOSED fact (valid_to already passed at the new fact's
   // date) ended on its own terms; superseding it would stamp "we learned
   // this was wrong" on something that was never wrong.
-  const isClosed = (f: SemanticFact): boolean =>
-    !!f.valid_to && String(f.valid_to).slice(0, 10) <= newTs.slice(0, 10);
+  // v2.21.1 — breaker finding: coarse event dates ("2023") defeated the
+  // full-precision compare ("2023-05-31" <= "2023" is false). Compare at
+  // the SHARED precision instead.
+  const isClosed = (f: SemanticFact): boolean => {
+    if (!f.valid_to) return false;
+    const vt = String(f.valid_to);
+    const n = Math.min(vt.length, Math.max(newTs.length, 4), 10);
+    if (n < 4) return false;
+    return vt.slice(0, n) <= newTs.slice(0, n);
+  };
   const olderDifferent = candidates.filter(f =>
     f.object?.trim().toLowerCase() !== normNewObject
     && olderThanNew(f.valid_from ?? "")

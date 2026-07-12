@@ -380,8 +380,11 @@ const GATE_STOPWORDS = new Set([
   "new", "now", "out", "over", "under", "about",
 ]);
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// v2.21.1 — breaker finding: ASCII-only boundaries split "Zürich" into
+// "z"+"rich" and matched quotes about "rich history". Unicode-aware
+// token splitting and boundaries.
 const wordBoundaryHit = (haystack: string, needle: string): boolean =>
-  new RegExp(`(^|[^a-z0-9])${escapeRe(needle)}([^a-z0-9]|$)`).test(haystack);
+  new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRe(needle)}([^\\p{L}\\p{N}]|$)`, "u").test(haystack);
 
 export function evidencePassesGate(f: ExtractedFact, sourceText: string): boolean {
   const ev = (f.evidence ?? "").trim();
@@ -392,9 +395,12 @@ export function evidencePassesGate(f: ExtractedFact, sourceText: string): boolea
   const mentions = (side: string): boolean => {
     const phrase = norm(side);
     if (phrase.length < 2) return false;
-    const toks = phrase.split(/[^a-z0-9]+/)
+    const toks = phrase.split(/[^\p{L}\p{N}]+/u)
       .filter(t => t.length >= 3 && !GATE_STOPWORDS.has(t));
-    if (toks.length === 0) return wordBoundaryHit(evNorm, phrase);
+    // v2.21.1 — breaker finding: the phrase fallback let stopword-only
+    // sides ("This", "It") match nearly any sentence. A side with no
+    // distinctive token can never be verified — fail closed.
+    if (toks.length === 0) return false;
     return toks.some(t => wordBoundaryHit(evNorm, t));
   };
   return mentions(f.subject ?? "") && mentions(f.object ?? "");

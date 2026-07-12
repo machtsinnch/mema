@@ -16,7 +16,7 @@ import { createEntity } from "../../src/v2/layer2-entities";
 import { observe } from "../../src/v2/layer1-episodic";
 import { reflect } from "../../src/v2/layer3-reflection";
 import {
-  recordJudgment, readJudgment, supersedeJudgment, flagJudgmentsForFact, screenJudgmentCandidates,
+  recordJudgment, readJudgment, listJudgments, supersedeJudgment, flagJudgmentsForFact, screenJudgmentCandidates,
 } from "../../src/v2/layer3-judgment";
 import { mergeExtractionResults, evidencePassesGate } from "../../src/v2/llm-extractor";
 import type { SemanticFact } from "../../src/v2/types";
@@ -291,6 +291,167 @@ describe("growing corroboration updates the belief in place", () => {
     expect(r2.cognitive_records_created).toBe(0);   // no superseding copy
     expect(r2.updated).toBe(1);                     // refreshed in place
     expect(r2.records[0].content).toContain("3 documents");
+    rmSync(vault, { recursive: true, force: true });
+  });
+});
+
+// ── Round 2: fixes for what the fix-verification breakers found ──────
+
+describe("approval-time supersession has full write-path parity", () => {
+  test("synonym-predicate draft supersedes on approval (employed_by ≡ works_at)", () => {
+    const vault = fresh();
+    const ep = observe(vault, { kind: "document", content: "x", actor: "t", owner: "o" });
+    const google = recordFactWithSupersession(vault, {
+      subject: "John", predicate: "works_at", object: "Google", valid_from: "2020-01",
+      derived_from: [ep.id], actor: "t", owner: "o",
+    }).written!;
+    const draft = recordFactWithSupersession(vault, {
+      subject: "John", predicate: "employed_by", object: "Anthropic", valid_from: "2026-01",
+      derived_from: [ep.id], actor: "llm", owner: "o", status: "draft",
+    }).written!;
+    const r = approveFact(vault, draft.id, "o", "reviewer");
+    expect(r.supersededIds).toEqual([google.id]);
+    expect(readFact(vault, "o", google.id)!.superseded_by).toBe(draft.id);
+    rmSync(vault, { recursive: true, force: true });
+  });
+
+  test("entity-alias draft supersedes on approval (Marcel ≡ Marcel Schmidt)", () => {
+    const vault = fresh();
+    const ep = observe(vault, { kind: "document", content: "x", actor: "t", owner: "o" });
+    const marcel = createEntity(vault, { name: "Marcel Schmidt", type: "person", aliases: ["Marcel"], actor: "t", owner: "o" });
+    const google = recordFactWithSupersession(vault, {
+      subject: "Marcel Schmidt", predicate: "works_at", object: "Google", valid_from: "2020-01",
+      subject_entity_id: marcel.id, derived_from: [ep.id], actor: "t", owner: "o",
+    }).written!;
+    const draft = recordFactWithSupersession(vault, {
+      subject: "Marcel", predicate: "works_at", object: "Anthropic", valid_from: "2026-01",
+      subject_entity_id: marcel.id, derived_from: [ep.id], actor: "llm", owner: "o", status: "draft",
+    }).written!;
+    const r = approveFact(vault, draft.id, "o", "reviewer");
+    expect(r.supersededIds).toEqual([google.id]);
+    rmSync(vault, { recursive: true, force: true });
+  });
+
+  test("approving a duplicate draft merges its provenance into the survivor", () => {
+    const vault = fresh();
+    const ep1 = observe(vault, { kind: "document", content: "a", actor: "t", owner: "o" });
+    const ep2 = observe(vault, { kind: "document", content: "b", actor: "t", owner: "o" });
+    const orig = recordFactWithSupersession(vault, {
+      subject: "TSMC", predicate: "supplies", object: "Nvidia", valid_from: "2024-01",
+      derived_from: [ep1.id], actor: "t", owner: "o",
+    }).written!;
+    const draft = recordFactWithSupersession(vault, {
+      subject: "TSMC", predicate: "supplies", object: "Nvidia", valid_from: "2024-01",
+      derived_from: [ep2.id], actor: "llm", owner: "o", status: "draft",
+    }).written!;
+    approveFact(vault, draft.id, "o", "reviewer");
+    expect([...readFact(vault, "o", orig.id)!.derived_from].sort()).toEqual([ep1.id, ep2.id].sort());
+    rmSync(vault, { recursive: true, force: true });
+  });
+});
+
+describe("invalidateFact is idempotent and first-wins", () => {
+  test("second invalidation cannot re-stamp or overwrite the superseder", () => {
+    const vault = fresh();
+    const ep = observe(vault, { kind: "document", content: "x", actor: "t", owner: "o" });
+    const f = recordFact(vault, { subject: "A", predicate: "works_at", object: "B", derived_from: [ep.id], actor: "t", owner: "o" });
+    invalidateFact(vault, f.id, "o", "t", "01FIRSTWINNER");
+    const stamped = readFact(vault, "o", f.id)!;
+    invalidateFact(vault, f.id, "o", "t", "01USURPER");
+    const after = readFact(vault, "o", f.id)!;
+    expect(after.superseded_by).toBe("01FIRSTWINNER");
+    expect(after.invalidated_at).toBe(stamped.invalidated_at);
+    rmSync(vault, { recursive: true, force: true });
+  });
+});
+
+describe("coarse event dates cannot pierce the closed-fact shield", () => {
+  test("a year-only new fact does not supersede a fact closed within that year", () => {
+    const closed: SemanticFact = {
+      id: "f1", subject: "John", predicate: "works_at", object: "Google",
+      valid_from: "2020-01-15", valid_to: "2023-05-31", invalidated_at: null,
+      superseded_by: null, derived_from: [], confidence: 0.9, owner: "o", status: "approved",
+    };
+    const d = classifyOnWrite(
+      { subject: "John", predicate: "works_at", object: "Anthropic", event_date: "2023" },
+      [closed], "person",
+    );
+    expect(d.kind).toBe("ADD");
+  });
+});
+
+describe("judgment supersession cannot half-write or cycle", () => {
+  test("a non-judgment superseder is refused BEFORE the old record is touched", () => {
+    const vault = fresh();
+    const ep = observe(vault, { kind: "document", content: "x", actor: "a", owner: "o" });
+    const f = recordFact(vault, { subject: "X", predicate: "uses", object: "Y", derived_from: [ep.id], actor: "a", owner: "o" });
+    const j = recordJudgment(vault, { question: "q", decision: "d", rationale: "r", based_on: [f.id], actor: "a", owner: "o" });
+    // A belief id resolves via pathForCognitive but is NOT a judgment.
+    const { recordCognitive } = require("../../src/v2/layer3-cognitive");
+    const belief = recordCognitive(vault, { kind: "belief", content: "b", confidence: 0.9, derived_from: [ep.id], actor: "a", owner: "o" });
+    expect(supersedeJudgment(vault, "o", j.id, belief.id, "bad", "a")).toBe(false);
+    const after = readJudgment(vault, "o", j.id)!;
+    expect(after.superseded_by ?? null).toBeNull();          // NOT bricked
+    expect(after.judgment_status).toBe("accepted");
+    rmSync(vault, { recursive: true, force: true });
+  });
+
+  test("a superseded judgment can never become a superseder (no A↔B cycle)", () => {
+    const vault = fresh();
+    const ep = observe(vault, { kind: "document", content: "x", actor: "a", owner: "o" });
+    const f = recordFact(vault, { subject: "X", predicate: "uses", object: "Y", derived_from: [ep.id], actor: "a", owner: "o" });
+    const a = recordJudgment(vault, { question: "q", decision: "dA", rationale: "r", based_on: [f.id], actor: "a", owner: "o" });
+    const b = recordJudgment(vault, { question: "q", decision: "dB", rationale: "r", based_on: [f.id], actor: "a", owner: "o" });
+    expect(supersedeJudgment(vault, "o", a.id, b.id, "forward", "a")).toBe(true);
+    expect(supersedeJudgment(vault, "o", b.id, a.id, "cycle!", "a")).toBe(false);
+    expect(listJudgments(vault, "o").map(j => j.id)).toEqual([b.id]);  // one live head
+    rmSync(vault, { recursive: true, force: true });
+  });
+});
+
+describe("gate round 2: stopword-only sides and unicode", () => {
+  test("a side made only of stopwords or short tokens is never rescued", () => {
+    const SRC = "The general availability index was announced this week for the region.";
+    expect(evidencePassesGate(
+      { subject: "This", predicate: "improves", object: "index", confidence: 0.9,
+        evidence: "The general availability index was announced this week for the region." } as never,
+      SRC,
+    )).toBe(false);
+  });
+
+  test("accented subjects match whole, not via ASCII fragments", () => {
+    const SRC = "The rich history of the region attracts visitors. Zürich hosts the summit in May.";
+    const zurichFact = (evidence: string) => ({
+      subject: "Zürich", predicate: "hosts", object: "summit", confidence: 0.9, evidence,
+    }) as never;
+    expect(evidencePassesGate(zurichFact("The rich history of the region attracts visitors."), SRC)).toBe(false);
+    expect(evidencePassesGate(zurichFact("Zürich hosts the summit in May."), SRC)).toBe(true);
+  });
+});
+
+describe("provenance merge targets only the justifying candidate", () => {
+  test("a stale restatement merges into the covering fact, not every same-object fact", () => {
+    const vault = fresh();
+    const ep1 = observe(vault, { kind: "document", content: "a", actor: "t", owner: "o" });
+    const ep2 = observe(vault, { kind: "document", content: "b", actor: "t", owner: "o" });
+    const ep3 = observe(vault, { kind: "document", content: "c", actor: "t", owner: "o" });
+    // Non-functional predicate → both coexist.
+    const early = recordFactWithSupersession(vault, {
+      subject: "mema", predicate: "supports", object: "markdown", valid_from: "2024-01-01",
+      derived_from: [ep1.id], actor: "t", owner: "o",
+    }).written!;
+    const late = recordFactWithSupersession(vault, {
+      subject: "mema", predicate: "supports", object: "markdown", valid_from: "2026-06-01",
+      derived_from: [ep2.id], actor: "t", owner: "o",
+    }).written!;
+    // 2025 restatement: stale (covered by the 2026 fact only).
+    const skip = recordFactWithSupersession(vault, {
+      subject: "mema", predicate: "supports", object: "markdown", valid_from: "2025-05-05",
+      derived_from: [ep3.id], actor: "t", owner: "o",
+    });
+    expect(skip.written).toBeNull();
+    expect(readFact(vault, "o", late.id)!.derived_from).toContain(ep3.id);
+    expect(readFact(vault, "o", early.id)!.derived_from).not.toContain(ep3.id);
     rmSync(vault, { recursive: true, force: true });
   });
 });

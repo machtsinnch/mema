@@ -2,6 +2,25 @@
 
 Candidate ideas and deferred work. Not committed to a release yet.
 
+## Ingestion / extraction
+
+- **Episode idempotency (re-ingest self-corroboration).** (breaker finding,
+  2026-07-12) /v2/observe has no content-hash dedup, so re-POSTing the same
+  document (the documented retry remedy) mints a new episode id and the
+  duplicate-skip provenance merge counts it as a second "independent"
+  source — corroboration and the auto fact-checker can be inflated by
+  retries. Fix idea: per-owner content hash on observe; same hash → return
+  the existing episode instead of minting.
+
+- **Evidence gate: one generic token per side still suffices.** (breaker
+  finding) "Acme Board approved Zenith merger" can be rescued by a quote
+  containing only "board" and "merger". Word boundaries + stopwords closed
+  the vacuous cases; requiring the MOST distinctive token (or 2+ tokens)
+  would cut real recall — revisit with corpus data.
+
+- **mergeFactProvenance leaves the body text's "derived from N episode(s)"
+  stale** (cosmetic; frontmatter is authoritative).
+
 ## Retrieval
 
 - **Ranking boost for web-confirmed facts?** (Ardin, 2026-07-10, undecided)

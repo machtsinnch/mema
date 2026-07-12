@@ -125,14 +125,14 @@ export function approveFact(
   owner: string,
   actor: string,
   reason?: string,
-): SemanticFact | null {
+): { fact: SemanticFact | null; supersededIds: string[] } {
   const path = factPath(vaultRoot, owner, factId);
-  if (!path) return null;
+  if (!path) return { fact: null, supersededIds: [] };
   const parsed = matter(readFileSync(path, "utf8"));
   const fm = parsed.data as any;
-  if (fm.owner !== owner) return null;
+  if (fm.owner !== owner) return { fact: null, supersededIds: [] };
   // Idempotent: re-approving an approved record is a no-op + no audit churn.
-  if (fm.status === "approved") return fm as SemanticFact;
+  if (fm.status === "approved") return { fact: fm as SemanticFact, supersededIds: [] };
   fm.status = "approved";
   fm.reviewed_by = actor;
   fm.reviewed_at = new Date().toISOString();
@@ -149,27 +149,28 @@ export function approveFact(
   // v2.21.0 — approval IS the write into approved space: run the
   // supersession check that was deliberately deferred while this fact was
   // a draft (drafts never supersede — see recordFactWithSupersession).
-  // Only the UPDATE branch applies: an explicitly approved fact is never
-  // silently skipped as duplicate/stale.
+  // v2.21.1 — breaker findings: use the SAME candidate gathering as the
+  // direct write path (synonym predicates + entity aliases were escaping),
+  // merge provenance on duplicate (the approved fact stays — never
+  // silently skipped — but the survivor still learns the new sources),
+  // and report what was superseded instead of doing it silently.
+  const supersededIds: string[] = [];
   try {
-    const contradictions = findContradictions(vaultRoot, owner, {
+    const probe = {
       subject: String(fm.subject ?? ""),
       predicate: String(fm.predicate ?? ""),
       object: String(fm.object ?? ""),
-    }).filter(c => c.fact_id !== factId);
-    const fullCandidates: SemanticFact[] = [];
-    for (const c of contradictions) {
-      const f = readFact(vaultRoot, owner, c.fact_id);
-      if (f) fullCandidates.push(f);
-    }
+      subject_entity_id: (fm.subject_entity_id as string | undefined) ?? null,
+    };
+    const fullCandidates = gatherSupersessionCandidates(vaultRoot, owner, probe, factId);
     const subjType = fm.subject_entity_id
       ? (readEntity(vaultRoot, owner, String(fm.subject_entity_id))?.type ?? null)
       : null;
     const decision = classifyOnWrite(
       {
-        subject: String(fm.subject ?? ""),
-        predicate: String(fm.predicate ?? ""),
-        object: String(fm.object ?? ""),
+        subject: probe.subject,
+        predicate: probe.predicate,
+        object: probe.object,
         event_date: String(fm.valid_from ?? new Date().toISOString()),
       },
       fullCandidates,
@@ -177,13 +178,23 @@ export function approveFact(
     );
     if (decision.kind === "UPDATE") {
       for (const old of decision.superseded) {
-        invalidateFact(vaultRoot, old.id, owner, actor, factId);
+        if (invalidateFact(vaultRoot, old.id, owner, actor, factId)) supersededIds.push(old.id);
+      }
+    } else if (decision.kind === "NONE") {
+      const normObj = probe.object.trim().toLowerCase();
+      const dPrefix = String(fm.valid_from ?? "").slice(0, 10);
+      for (const c of fullCandidates) {
+        if (c.object?.trim().toLowerCase() !== normObj) continue;
+        const cPrefix = (c.valid_from ?? "").slice(0, 10);
+        if (decision.reason === "duplicate" && cPrefix !== dPrefix) continue;
+        if (decision.reason === "stale" && cPrefix < dPrefix) continue;
+        mergeFactProvenance(vaultRoot, owner, c.id, (fm.derived_from as string[]) ?? []);
       }
     }
   } catch (e) {
     console.warn(`[approve-supersession] ${factId}: ${e}`);
   }
-  return readFact(vaultRoot, owner, factId);
+  return { fact: readFact(vaultRoot, owner, factId), supersededIds };
 }
 
 // v2.7+ acceptance lifecycle — reject a draft fact. Sets status="rejected"
@@ -248,6 +259,11 @@ export function invalidateFact(
   if (!path) return null;
   const raw = readFileSync(path, "utf8");
   const parsed = matter(raw);
+  // v2.21.1 — breaker finding: idempotent, first-wins. Re-invalidating
+  // (the approve-supersedes route did it twice) must not re-stamp the
+  // epistemic timestamp, double-audit, or overwrite the original
+  // superseded_by pointer.
+  if (parsed.data.invalidated_at) return readFact(vaultRoot, owner, factId);
   parsed.data.invalidated_at = new Date().toISOString();
   if (supersededBy) parsed.data.superseded_by = supersededBy;
   // Rebuild Obsidian links to include the new supersession edge.
@@ -531,6 +547,45 @@ export interface RecordFactWithSupersessionResult {
   supersededIds: string[];
 }
 
+// v2.21.1 — breaker finding: the approval path gathered candidates only
+// via findContradictions (exact predicate, no entity link), so synonym-
+// predicate and entity-alias drafts escaped supersession once approved.
+// ONE gathering path now serves both the direct write and approveFact:
+//   1. findContradictions (exact subject+predicate, different object);
+//   2. canonical-predicate scan (employed_by ≡ works_at);
+//   3. subject-entity scan (Marcel ≡ Marcel Schmidt);
+// all filtered to approved, current (not invalidated/superseded) and not
+// CLOSED (valid_to already passed — history can't be contradicted).
+function gatherSupersessionCandidates(
+  vaultRoot: string,
+  owner: string,
+  probe: { subject: string; predicate: string; object: string; subject_entity_id?: string | null },
+  excludeId?: string,
+): SemanticFact[] {
+  const nowIso = new Date().toISOString();
+  const usable = (f: SemanticFact): boolean =>
+    !f.invalidated_at && !f.superseded_by
+    && !(f.valid_to && String(f.valid_to) <= nowIso)
+    && f.id !== excludeId;
+  const out: SemanticFact[] = [];
+  const seen = new Set<string>();
+  const push = (f: SemanticFact | null) => {
+    if (f && usable(f) && !seen.has(f.id)) { seen.add(f.id); out.push(f); }
+  };
+  for (const c of findContradictions(vaultRoot, owner, probe)) {
+    push(readFact(vaultRoot, owner, c.fact_id));
+  }
+  for (const f of readApprovedFactsByExactSubjectPredicate(vaultRoot, owner, probe.subject, probe.predicate)) {
+    push(f);
+  }
+  if (probe.subject_entity_id) {
+    for (const f of readApprovedFactsBySubjectEntity(vaultRoot, owner, probe.subject_entity_id, probe.predicate)) {
+      push(f);
+    }
+  }
+  return out;
+}
+
 export function recordFactWithSupersession(
   vaultRoot: string,
   input: RecordFactInput,
@@ -549,53 +604,12 @@ export function recordFactWithSupersession(
       supersededIds: [],
     };
   }
-  // 1. Pre-filter candidates: existing approved + not-invalidated + not-
-  //    superseded facts with the SAME (subject, predicate, owner) as the
-  //    new fact. findContradictions already does exactly this filter; the
-  //    return type omits invalidated_at/superseded_by/derived_from/owner,
-  //    so we re-load full records for the ones that matter.
-  const matchObjects = findContradictions(vaultRoot, input.owner, {
+  const fullCandidates = gatherSupersessionCandidates(vaultRoot, input.owner, {
     subject: input.subject,
     predicate: input.predicate,
     object: input.object,
+    subject_entity_id: input.subject_entity_id ?? null,
   });
-  // findContradictions filters OUT same-object candidates (it's looking for
-  // contradictions). For supersession classification we also need same-
-  // object matches (duplicate/stale detection). Hydrate full records for
-  // the contradicting candidates AND scan again for same-object matches.
-  const candidateIds = new Set(matchObjects.map(c => c.fact_id));
-  const fullCandidates: SemanticFact[] = [];
-  for (const id of candidateIds) {
-    const f = readFact(vaultRoot, input.owner, id);
-    if (f) fullCandidates.push(f);
-  }
-  // Also scan by (subject, canonical predicate) for duplicate/stale detection
-  // AND (v2.16.1) synonym-predicate contradictions that findContradictions'
-  // exact-predicate match misses ("employed_by Google" vs "works_at X").
-  const canonMatches = readApprovedFactsByExactSubjectPredicate(
-    vaultRoot, input.owner, input.subject, input.predicate,
-  ).filter(f => !f.invalidated_at && !f.superseded_by);
-  for (const f of canonMatches) {
-    if (!candidateIds.has(f.id) && !fullCandidates.some(c => c.id === f.id)) {
-      fullCandidates.push(f);
-    }
-  }
-
-  // v2.15.1 — entity-linked candidates. Exact string matching misses facts
-  // about the same real-world entity under a different surface string
-  // ("Marcel" vs "Marcel Schmidt"). When the new fact carries a resolved
-  // subject_entity_id, also gather approved current facts with the SAME
-  // predicate whose subject resolved to the SAME entity — those are equally
-  // valid supersession/duplicate candidates.
-  if (input.subject_entity_id) {
-    for (const f of readApprovedFactsBySubjectEntity(
-      vaultRoot, input.owner, input.subject_entity_id, input.predicate,
-    )) {
-      if (f.invalidated_at || f.superseded_by) continue;
-      if (candidateIds.has(f.id) || fullCandidates.some(c => c.id === f.id)) continue;
-      fullCandidates.push(f);
-    }
-  }
 
   // 2. Classify (pure function — fully testable).
   //
@@ -627,8 +641,14 @@ export function recordFactWithSupersession(
     // source (they were structurally blind to same-wording duplicates).
     const survivorIds: string[] = [];
     const normObjForMerge = input.object.trim().toLowerCase();
+    // v2.21.1 — breaker finding: merge ONLY into the candidate(s) whose
+    // dates justified the skip, not every same-object fact ever recorded.
+    const newDatePrefix = (input.valid_from ?? new Date().toISOString()).slice(0, 10);
     for (const c of fullCandidates) {
       if (c.object?.trim().toLowerCase() !== normObjForMerge) continue;
+      const cPrefix = (c.valid_from ?? "").slice(0, 10);
+      if (decision.reason === "duplicate" && cPrefix !== newDatePrefix) continue;
+      if (decision.reason === "stale" && cPrefix < newDatePrefix) continue;
       if (mergeFactProvenance(vaultRoot, input.owner, c.id, input.derived_from ?? [])) {
         survivorIds.push(c.id);
       }

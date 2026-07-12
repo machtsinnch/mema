@@ -83,7 +83,7 @@ describe("v2.7 acceptance lifecycle — facts", () => {
       derived_from: [ep.id], confidence: 0.9,
       actor: "test:extractor", owner: "ardin", status: "draft",
     });
-    const approved = approveFact(vault, fact.id, "ardin", "test:reviewer", "looks good");
+    const approved = approveFact(vault, fact.id, "ardin", "test:reviewer", "looks good").fact;
     expect(approved).not.toBeNull();
     expect(approved!.status).toBe("approved");
     expect(approved!.reviewed_by).toBe("test:reviewer");
@@ -243,7 +243,7 @@ describe("v2.9.0 fail-closed fact approval (P0-B)", () => {
     });
     // Layer-level approve has no evidence gate — that lives in the API
     // endpoint by design (the gate needs vaultRoot + endpoint context).
-    const a = approveFact(vault, fact.id, "ardin", "rev");
+    const a = approveFact(vault, fact.id, "ardin", "rev").fact;
     expect(a).not.toBeNull();
     expect(a!.status).toBe("approved");
   });
