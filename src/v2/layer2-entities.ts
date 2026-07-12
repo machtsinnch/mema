@@ -13,7 +13,7 @@ import { atomicWriteFile } from "./atomic";
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { Entity, RecordStatus } from "./types";
-import { slugify, recordFilename, idFromFilename } from "./types";
+import { slugify, recordFilename, idFromFilename, isWikilinkSafeId } from "./types";
 import { appendAudit } from "./layer6-audit";
 
 export interface CreateEntityInput {
@@ -373,6 +373,8 @@ export function pathForEntity(vaultRoot: string, owner: string, id: string): str
   return entityPath(vaultRoot, owner, id);
 }
 function entityPath(vaultRoot: string, owner: string, id: string): string | null {
+  // v2.22.0 SECURITY (round-2 finding): see factPath — reject traversal ids.
+  if (!isWikilinkSafeId(id)) return null;
   const dir = join(vaultRoot, "v2-entities", owner);
   if (!existsSync(dir)) return null;
   const legacy = join(dir, `${id}.md`);

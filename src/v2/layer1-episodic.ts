@@ -7,7 +7,7 @@ import { atomicWriteFile } from "./atomic";
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { Episode, EpisodeKind } from "./types";
-import { toWikilinks, slugify, recordFilename, idFromFilename } from "./types";
+import { toWikilinks, slugify, recordFilename, idFromFilename, isWikilinkSafeId } from "./types";
 import { basename } from "node:path";
 import { appendAudit } from "./layer6-audit";
 
@@ -55,7 +55,12 @@ export function observe(vaultRoot: string, input: ObserveInput): Episode {
   };
   if (input.source !== undefined) frontmatter.source = input.source;
 
-  const body = input.content;
+  // v2.22.0 SECURITY (round-2 finding): a document whose content begins
+  // with a "---" YAML fence made gray-matter MERGE that fence into our
+  // frontmatter (injecting fields, e.g. a forged `source`) and DROP it
+  // from the stored content. Guard: a leading newline keeps the fence in
+  // the body; readers .trim() it back off.
+  const body = /^\s*---/.test(input.content) ? "\n" + input.content : input.content;
   // Human-readable filename: `{slug}--{ulid}.md` so Obsidian's file
   // explorer + graph view show meaningful labels. Slug derived from the
   // source-document basename (when imported) or the first words of content.
@@ -105,6 +110,7 @@ export function pathForEpisode(vaultRoot: string, owner: string, id: string): st
 // Read an episode by ID. Filenames are `{slug}--{ulid}.md` (v2.3+) or
 // legacy `{ulid}.md` (pre-v2.3). idFromFilename handles both.
 export function findEpisode(vaultRoot: string, owner: string, id: string): Episode | null {
+  if (!isWikilinkSafeId(id)) return null;   // v2.22.0 SECURITY parity guard
   const ownerDir = join(vaultRoot, "episodes", owner);
   try {
     const buckets = readdirSync(ownerDir);

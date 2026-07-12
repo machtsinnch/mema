@@ -44,7 +44,7 @@ import {
 } from "./layer7-assets";
 import { buildGraphView } from "./layer5-graph-view";
 import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { z } from "zod";
 import {
   observeBody, factBody, factInvalidateBody, reasonForceBody, reasonBody, factFindBody,
@@ -595,6 +595,10 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     if (!newFact) return c.json({ error: "new fact not found" }, 404);
     const oldFact = readFact(cfg.vaultRoot, owner, oldId);
     if (!oldFact) return c.json({ error: "old fact not found" }, 404);
+    // v2.22.0 (round-2 finding): a fact cannot supersede itself — that would
+    // stamp the just-approved fact invalidated + superseded_by=own-id and
+    // silently drop it from retrieval.
+    if (oldId === newId) return c.json({ error: "a fact cannot supersede itself" }, 400);
     if (oldFact.subject !== newFact.subject || oldFact.predicate !== newFact.predicate) {
       return c.json({ error: "old and new facts must share (subject, predicate)" }, 400);
     }
@@ -1033,20 +1037,30 @@ export function mountV2(app: Hono, cfg: V2Config): void {
     if (!parsed.ok) return parsed.response;
     const owner = c.get("owner");
     const actor = c.get("actor");
-    const p = parsed.body.record_path.startsWith("/")
-      ? parsed.body.record_path
-      : join(cfg.vaultRoot, parsed.body.record_path);
-    // CRITICAL: owner-of-path check. Without this, any authenticated tenant
-    // could pass another tenant's path and tombstone their data. (Codex
-    // finding C2 — pre-existing bug since v2.0.0.) Symmetric with the
-    // checks on /v2/asset/wrap, /v2/asset/verify-integrity, etc.
+    // v2.22.0 SECURITY (round-2 findings): (a) absolute paths and "../"
+    // escapes let a caller tombstone ANY file on disk; (b) a target whose
+    // frontmatter lacked an `owner` field skipped the cross-tenant guard.
+    // Now: resolve within the vault, require containment, and require the
+    // resolved path to live under THIS caller's owner subtree — plus the
+    // frontmatter-owner check as defense in depth.
+    const vaultRootAbs = resolve(cfg.vaultRoot);
+    const p = resolve(vaultRootAbs, parsed.body.record_path);
+    if (p !== vaultRootAbs && !p.startsWith(vaultRootAbs + "/")) {
+      return c.json({ error: "not found" }, 404);   // escaped the vault
+    }
+    // Must be under one of the caller's own owner directories.
+    const ownerDirs = ["facts", "episodes", "v2-entities", "cognitive"]
+      .map(layer => resolve(vaultRootAbs, layer, owner) + "/");
+    if (!ownerDirs.some(d => p.startsWith(d))) {
+      return c.json({ error: "not found" }, 404);   // not this owner's record
+    }
     if (!existsSync(p)) return c.json({ error: "not found" }, 404);
     const matterMod = (await import("gray-matter")).default;
     let rec;
     try { rec = matterMod(readFileSync(p, "utf8")); }
     catch { return c.json({ error: "not found" }, 404); }
-    if (rec.data.owner && rec.data.owner !== owner) {
-      // Uniform 404 instead of 403 — no existence oracle for cross-tenant probes.
+    // Missing owner frontmatter => DENY (was: guard skipped when absent).
+    if (rec.data.owner !== owner) {
       return c.json({ error: "not found" }, 404);
     }
     const r = hardErase({

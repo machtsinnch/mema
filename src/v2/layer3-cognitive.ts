@@ -13,12 +13,14 @@ import { atomicWriteFile } from "./atomic";
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { CognitiveRecord, CognitiveKind, BeliefKind } from "./types";
-import { clampConfidence, toWikilinks, slugify, recordFilename, idFromFilename } from "./types";
+import { clampConfidence, toWikilinks, slugify, recordFilename, idFromFilename, isWikilinkSafeId } from "./types";
 
 // Resolve a cognitive record's on-disk path by ULID, regardless of kind
 // (belief/observation/experience/judgment) and regardless of slug schema.
 // Returns null when not found.
 export function pathForCognitive(vaultRoot: string, owner: string, id: string): string | null {
+  // v2.22.0 SECURITY (round-2 finding): see factPath — reject traversal ids.
+  if (!isWikilinkSafeId(id)) return null;
   for (const kind of ["belief", "observation", "experience", "judgment"]) {
     const kindDir = join(vaultRoot, "cognitive", owner, kind);
     if (!existsSync(kindDir)) continue;

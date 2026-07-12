@@ -13,7 +13,7 @@ import { atomicWriteFile } from "./atomic";
 import { join } from "node:path";
 import matter from "gray-matter";
 import type { SemanticFact, RecordStatus } from "./types";
-import { clampConfidence, toWikilinks, slugify, recordFilename, idFromFilename } from "./types";
+import { clampConfidence, toWikilinks, slugify, recordFilename, idFromFilename, isWikilinkSafeId } from "./types";
 import { appendAudit } from "./layer6-audit";
 import { factValidAt } from "./temporal";
 import { classifyOnWrite, type SupersessionDecision } from "./layer4-supersession";
@@ -238,6 +238,11 @@ export function pathForFact(vaultRoot: string, owner: string, id: string): strin
   return factPath(vaultRoot, owner, id);
 }
 function factPath(vaultRoot: string, owner: string, id: string): string | null {
+  // v2.22.0 SECURITY (round-2 finding): reject ids that aren't a plain
+  // record id — a "../<owner>/<file>" id would escape into another owner's
+  // directory via the legacy join below. Legitimate ids are always
+  // wikilink-safe (no slashes, no "..").
+  if (!isWikilinkSafeId(id)) return null;
   const dir = join(vaultRoot, "facts", owner);
   if (!existsSync(dir)) return null;
   const legacy = join(dir, `${id}.md`);
