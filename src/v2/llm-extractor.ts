@@ -248,9 +248,18 @@ const TYPE_REMAP: Record<string, string> = {
 function filterFewShotLeak(r: ExtractionResult): ExtractionResult {
   return {
     facts: r.facts.filter(f => {
-      const s = (f.subject ?? "").toLowerCase();
-      const p = (f.predicate ?? "").toLowerCase();
-      const o = (f.object ?? "").toLowerCase();
+      // v2.22.11 (l2-extract): fail per-fact, not per-batch. A weak model
+      // sometimes renders a subject/predicate/object as a bare JSON number
+      // ({"object": 2024}) despite the prompt saying numeric objects are
+      // invalid. The .toLowerCase() calls below throw TypeError on a number,
+      // and that exception used to propagate out of parseStrictJson and
+      // discard EVERY fact from the whole chunk/document — its valid siblings
+      // included. Drop only the malformed triple so the good facts survive.
+      if (typeof f.subject !== "string" || typeof f.predicate !== "string"
+          || typeof f.object !== "string") return false;
+      const s = f.subject.toLowerCase();
+      const p = f.predicate.toLowerCase();
+      const o = f.object.toLowerCase();
       if (FEW_SHOT_TRIPLES.has(`${s}|${p}|${o}`)) return false;
       if (FEW_SHOT_PRED_OBJ.has(`${p}|${o}`)) return false;
       // v2.14.3+: drop any fact whose subject OR object CONTAINS a few-shot
@@ -351,7 +360,9 @@ export function mergeExtractionResults(results: ExtractionResult[]): ExtractionR
   const strength = (f: ExtractedFact) => (f.votes ?? 1) * 10 + (f.confidence ?? 0);
   for (const r of results) {
     for (const f of r.facts ?? []) {
-      const k = `${(f.subject ?? "").toLowerCase()}|${(f.predicate ?? "").toLowerCase()}|${(f.object ?? "").toLowerCase()}`;
+      // v2.22.11 (l2-extract): String()-coerce defensively — a non-string
+      // slot (numeric object) would otherwise throw here and nuke the merge.
+      const k = `${String(f.subject ?? "").toLowerCase()}|${String(f.predicate ?? "").toLowerCase()}|${String(f.object ?? "").toLowerCase()}`;
       const prev = factByKey.get(k);
       if (!prev || strength(f) > strength(prev)) factByKey.set(k, f);
     }
@@ -412,7 +423,7 @@ export function evidencePassesGate(f: ExtractedFact, sourceText: string): boolea
   if (!norm(sourceText).includes(norm(ev))) return false;
   const evNorm = norm(ev);
   const mentions = (side: string): boolean => {
-    const phrase = norm(side);
+    const phrase = norm(String(side ?? ""));
     if (phrase.length < 2) return false;
     const toks = phrase.split(/[^\p{L}\p{N}]+/u)
       .filter(t => t.length >= 3 && !GATE_STOPWORDS.has(t));
@@ -465,7 +476,8 @@ export function consensusMerge(perPass: ExtractionResult[], sourceText?: string)
     return false;
   };
   const normalizeRef = (raw: string): string => {
-    const s = (raw ?? "").trim().toLowerCase();
+    // v2.22.11 (l2-extract): String()-coerce so a non-string slot can't throw.
+    const s = String(raw ?? "").trim().toLowerCase();
     if (!s || entityCased.has(s)) return s;          // exact match (or literal) stays
     const refTokens = tokensOf(s);
     let hit: string | null = null;

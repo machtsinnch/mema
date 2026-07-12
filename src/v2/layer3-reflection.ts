@@ -156,6 +156,17 @@ export function reflect(input: ReflectInput): ReflectionReport {
   // fallback below: a belief keyed by a now-rejected entity's id can still be
   // matched back to the raw-name group by resolving its subject_entity_id here.
   const entityNamesById = new Map<string, Set<string>>();
+  // v2.22.11 (l3-reflect finding): the set of APPROVED entity ids. subjKeyOf /
+  // subjectTypeOf must skip a fact's subject_entity_id when it points at a
+  // DRAFT or REJECTED entity — otherwise a draft/rejected-linked fact groups
+  // under that id while its sibling raw-name facts group under the raw name,
+  // splitting one claim into two groups and halving the distinct-source count
+  // (breaking Rule A corroboration + Rule B current-state). The ingest
+  // resolver findEntityByName does NOT filter by status, so facts CAN carry a
+  // draft/rejected id. This restores the documented invariant that subjKeyOf
+  // skips draft AND rejected entities (matching the entityIdByName bridge,
+  // which already excludes them).
+  const approvedEntityIds = new Set<string>();
   const entDir = join(input.vaultRoot, "v2-entities", input.owner);
   if (existsSync(entDir)) {
     for (const ef of readdirSync(entDir)) {
@@ -174,14 +185,24 @@ export function reflect(input: ReflectInput): ReflectionReport {
         // reviewer-rejected (e.g. hallucinated) entity's aliases must NOT
         // glue distinct subjects together and mint false corroboration.
         if ((e.status ?? "approved") !== "approved") continue;
+        approvedEntityIds.add(e.id);
         for (const lc of names) {
           if (!entityIdByName.has(lc)) entityIdByName.set(lc, e.id);
         }
       } catch { /* skip malformed */ }
     }
   }
+  // v2.22.11 (l3-reflect finding): use a fact's subject_entity_id ONLY when it
+  // is an APPROVED entity; a draft/rejected id falls through to the entity-name
+  // registry (which likewise excludes non-approved) and finally the raw name,
+  // so raw-name facts and draft/rejected-linked facts about the same subject
+  // unify under one key.
+  const approvedSubjectId = (f: SemanticFact): string | undefined =>
+    f.subject_entity_id && approvedEntityIds.has(f.subject_entity_id)
+      ? f.subject_entity_id
+      : undefined;
   const subjKeyOf = (f: SemanticFact): string =>
-    f.subject_entity_id
+    approvedSubjectId(f)
     ?? entityIdByName.get(f.subject.trim().toLowerCase())
     ?? f.subject.trim().toLowerCase();
   // v2.22.5 — shared entity->raw resolution for the bidirectional key-migration
@@ -399,7 +420,11 @@ export function reflect(input: ReflectInput): ReflectionReport {
     // person-only location-predicate gate (isFunctionalFor) dropped it out of
     // Rule B entirely — desyncing filtering from grouping and asserting an
     // outdated residence as current. Consult entityIdByName too.
-    const eid = f.subject_entity_id ?? entityIdByName.get(f.subject.trim().toLowerCase());
+    // v2.22.11 (l3-reflect finding): mirror subjKeyOf — trust the fact's
+    // subject_entity_id only when it is APPROVED, else resolve through the
+    // (approved-only) entity-name registry, so the person-only Rule B gate
+    // stays consistent with the grouping key.
+    const eid = approvedSubjectId(f) ?? entityIdByName.get(f.subject.trim().toLowerCase());
     if (!eid) return null;
     let t = entityTypeCache.get(eid);
     if (t === undefined) {
