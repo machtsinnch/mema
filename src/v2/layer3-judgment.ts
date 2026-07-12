@@ -26,6 +26,7 @@ import type { CognitiveRecord, SemanticFact } from "./types";
 import { toWikilinks, slugify, recordFilename, clampConfidence } from "./types";
 import { pathForCognitive } from "./layer3-cognitive";
 import { readFact } from "./layer2-semantic";
+import { readEntity } from "./layer2-entities";
 import { appendAudit } from "./layer6-audit";
 
 export interface JudgmentAlternative {
@@ -264,8 +265,28 @@ export function flagJudgmentsForFact(
     const fm = parsed.data as Record<string, unknown>;
     if (fm.kind !== "judgment" || fm.superseded_by) continue;
     const watches = new Set((fm.watches as string[]) ?? []);
+    // v2.22.13 — living-loop cross-surface fix (l3-judgment breaker): a
+    // judgment freezes its foundation fact's watches at CREATION. When the
+    // foundation fact was written before its entity existed, its
+    // subject_entity_id was null, so watches captured only the raw string.
+    // A later contradicting fact about the SAME entity carrying a DIFFERENT
+    // surface string then slipped past — the judgment loop was strictly
+    // weaker than the L2 supersession it mirrors, which DOES bridge surface
+    // strings through the entity link. Fix: when the incoming fact carries
+    // an entity id, also treat it as a hit if any of that entity's
+    // name/aliases intersect the watched strings.
+    let entityNameHit = false;
+    if (fact.subject_entity_id) {
+      const entity = readEntity(vaultRoot, owner, fact.subject_entity_id);
+      if (entity) {
+        for (const surface of [entity.name, ...(entity.aliases ?? [])]) {
+          if (watches.has(surface.trim().toLowerCase())) { entityNameHit = true; break; }
+        }
+      }
+    }
     const hit = (fact.subject_entity_id && watches.has(fact.subject_entity_id))
-      || watches.has(fact.subject.trim().toLowerCase());
+      || watches.has(fact.subject.trim().toLowerCase())
+      || entityNameHit;
     if (!hit) continue;
     if ((fm.derived_from as string[] ?? []).includes(fact.id)) continue;   // its own foundation
     const flags = (fm.review_flags as JudgmentReviewFlag[]) ?? [];
