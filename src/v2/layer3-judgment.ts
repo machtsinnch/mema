@@ -80,7 +80,12 @@ export interface RecordJudgmentInput {
 function deriveWatches(vaultRoot: string, owner: string, basedOn: string[]): string[] {
   const watches = new Set<string>();
   for (const id of basedOn) {
-    const f = readFact(vaultRoot, owner, id);
+    let f: SemanticFact | null = null;
+    try {
+      f = readFact(vaultRoot, owner, id);
+    } catch {
+      continue;                // malformed foundation file — treat like a missing one
+    }
     if (!f) continue;          // episode IDs land here — episodes aren't watched
     if (f.subject_entity_id) watches.add(f.subject_entity_id);
     if (f.subject) watches.add(f.subject.trim().toLowerCase());
