@@ -14,6 +14,7 @@
 
 import { $ } from "bun";
 import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import matter from "gray-matter";
 import type {
   RetrievalQuery, RetrievalResult, RetrievalHit, RetrievalKind,
@@ -45,13 +46,21 @@ export function morphVariants(token: string): string[] {
   const t = token.toLowerCase();
   const out = new Set<string>([t]);
   for (const v of IRREGULARS[t] ?? []) out.add(v);
+  // v2.22.0 (round-2 finding): guard against degenerate stems. "ring" ->
+  // "r" flooded recall AND forged a full titleBoost via includes("r").
+  // Only keep a stem of >= 3 chars.
+  // v2.22.0 (round-2 finding): only emit variants of >= 3 chars. "ring" ->
+  // "r" flooded recall and forged a titleBoost; but "using" -> "use" (a
+  // 2-char stem yielding a valid 3-char form) must still work, so each
+  // candidate is filtered independently by length.
+  const addV = (...cands: string[]) => { for (const c of cands) if (c.length >= 3) out.add(c); };
   if (t.length >= 4) {
-    if (t.endsWith("ing")) { const s = t.slice(0, -3); out.add(s); out.add(s + "e"); }
-    else if (t.endsWith("ied")) out.add(t.slice(0, -3) + "y");
-    else if (t.endsWith("ed")) { out.add(t.slice(0, -2)); out.add(t.slice(0, -1)); }
-    else if (t.endsWith("es")) { out.add(t.slice(0, -2)); out.add(t.slice(0, -1)); }
-    else if (t.endsWith("s") && !t.endsWith("ss")) out.add(t.slice(0, -1));
-    else { out.add(t + "s"); out.add(t + "ed"); out.add(t + "ing"); }
+    if (t.endsWith("ing")) { const s = t.slice(0, -3); addV(s, s + "e"); }
+    else if (t.endsWith("ied")) addV(t.slice(0, -3) + "y");
+    else if (t.endsWith("ed")) addV(t.slice(0, -2), t.slice(0, -1));
+    else if (t.endsWith("es")) addV(t.slice(0, -2), t.slice(0, -1));
+    else if (t.endsWith("s") && !t.endsWith("ss")) addV(t.slice(0, -1));
+    else addV(t + "s", t + "ed", t + "ing");
   }
   return [...out];
 }
@@ -76,6 +85,7 @@ interface RawHit {
 async function ripgrepAcross(
   vaultRoot: string,
   query: string,
+  owner: string,
 ): Promise<{ byPath: Map<string, { matches: number; firstLine: string; tokensMatched: Set<string> }>, tokenDocFreq: Map<string, number> }> {
   if (!query.trim()) return { byPath: new Map(), tokenDocFreq: new Map() };
   const tokens = query
@@ -94,7 +104,10 @@ async function ripgrepAcross(
     }
   }
   const eFlags = [...variantToBase.keys()].flatMap(v => ["-e", v]);
-  const proc = await $`rg --json -i -g "*.md" ${eFlags} ${vaultRoot}`
+  // v2.22.0 (round-2 finding R2): -F treats every pattern as a literal, so
+  // a query token with regex metacharacters ("sin(x") can't produce an
+  // invalid regex and crash the whole recall.
+  const proc = await $`rg --json -i -F -g "*.md" ${eFlags} ${vaultRoot}`
     .nothrow().quiet();
   const result = proc.text();
   // Detect missing ripgrep binary. `rg` returns 1 for "no matches" (normal) and
@@ -129,10 +142,23 @@ async function ripgrepAcross(
   const tokenDocFreq = new Map<string, number>();
   for (const [, info] of byPath) {
     for (const t of info.tokensMatched) {
-      tokenDocFreq.set(t, (tokenDocFreq.get(t) ?? 0) + 1);
+      tokenDocFreq.set(t, (tokenDocFreq.get(t) ?? 0) + 1);   // narrowed to owner below
     }
   }
-  return { byPath, tokenDocFreq };
+  // v2.22.0 (round-2 finding R5): IDF/doc-frequency must reflect only THIS
+  // owner's corpus — otherwise score_components.idf becomes an existence
+  // oracle for other tenants' content. Candidate discovery below already
+  // filters by frontmatter owner; narrow the keyword stats here to match.
+  const ownerPrefixes = ["episodes", "facts", "v2-entities", "cognitive", "generalized"]
+    .map(layer => join(vaultRoot, layer, owner));
+  const underOwner = (p: string) => ownerPrefixes.some(pre => p === pre || p.startsWith(pre + "/"));
+  const ownedByPath = new Map([...byPath].filter(([p]) => underOwner(p)));
+  const ownedFreq = new Map<string, number>();
+  for (const [, { tokensMatched }] of ownedByPath) {
+    for (const t of tokensMatched) ownedFreq.set(t, (ownedFreq.get(t) ?? 0) + 1);
+  }
+  return { byPath: ownedByPath, tokenDocFreq: ownedFreq };
+
 }
 
 function classifyPath(path: string): RetrievalKind | "v1_memory" {
@@ -158,7 +184,7 @@ export async function recall(
   vaultRoot: string,
   query: RetrievalQuery,
 ): Promise<RetrievalResult> {
-  const { byPath: matches, tokenDocFreq } = await ripgrepAcross(vaultRoot, query.query);
+  const { byPath: matches, tokenDocFreq } = await ripgrepAcross(vaultRoot, query.query, query.owner);
   const totalDocs = matches.size || 1;
   const queryTokens = query.query
     .toLowerCase()
@@ -244,9 +270,12 @@ export async function recall(
     // routing context + per-call policy mode if the caller supplied them.
     const gov = rec.frontmatter.governance as Governance | undefined;
     const policy = policyCheck(gov, {
+      // v2.22.0 (round-2 finding): retention expiry is a wall-clock erasure
+      // concept — evaluate it at real now, NOT the caller-supplied
+      // temporal.valid_at (which otherwise resurfaces expired records).
+      now: new Date().toISOString(),
       actor: query.actor,
       purpose: query.purpose,
-      now: validAt,
       mode: query.policy_mode,
       jurisdiction: query.jurisdiction,
       model: query.model,
@@ -409,6 +438,10 @@ export async function recall(
         idf: idfNorm, title: titleBoost, vector: vectorScore,
         confidence, layerPrior,
         graph_support: graphSupport, recency, contradiction,
+        // v2.22.0 (round-2 finding): expose the demotion multiplier so RRF
+        // fusion can apply it too (below) — a contradicted / web-refuted
+        // record must never out-rank a clean one, in EITHER fusion mode.
+        contradiction_penalty: contradictionPenalty,
       },
       excerpt,
       governance: policy,
@@ -503,7 +536,10 @@ export async function recall(
     for (const f of fused) {
       const h = idToHit.get(f.id);
       if (!h) continue;
-      h.score = f.rrf_score;
+      // v2.22.0 (round-2 finding): RRF replaced the fused score wholesale
+      // and lost the contradiction / fact-check demotion. Re-apply it here.
+      const pen = (h.score_components as { contradiction_penalty?: number }).contradiction_penalty ?? 0;
+      h.score = f.rrf_score * (1 - pen);
       h.score_components = { ...h.score_components, rrf: f.rrf_score };
       hits.push(h);
     }
