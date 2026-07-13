@@ -1,72 +1,26 @@
 # mema
 
-**Verifiable seven-layer memory infrastructure for AI agents.**
+**Verifiable seven-layer memory for AI agents.**
 
-Markdown-vault substrate + bi-temporal facts + epistemic cognitive layer +
-purpose-bound governance + hybrid retrieval (keyword + IDF + vector + graph
-+ temporal + policy) + SHA-256-hash-chained audit log + verifiable memory
-assets (UAL + content hash + anchor lifecycle).
-
-Designed for **regulated enterprise contexts** — Swiss / EU financial
-services, healthcare, public sector — where audit replay, hard erasure,
-multi-tenant isolation, jurisdiction-aware governance, and inspectable
-storage matter as much as benchmark recall.
-
-[![v2.10.0](https://img.shields.io/badge/release-v2.10.0-blue)](https://github.com/machtsinnch/mema/releases/tag/v2.10.0)
-[![tests](https://img.shields.io/badge/tests-231_passing-green)](https://github.com/machtsinnch/mema/blob/main/tests/)
-[![benchmark](https://img.shields.io/badge/Precision@1-96.0%25-green)](https://github.com/machtsinnch/mema/blob/main/bench/recall-benchmark-v2.py)
-[![license](https://img.shields.io/badge/license-BUSL--1.1-orange)](LICENSE)
+mema gives an agent a memory that a regulator, an auditor, or a customer can
+inspect. It is built for Swiss and EU contexts where FINMA, GDPR, and the
+revised nFADP apply, and where audit replay, hard erasure, tenant isolation,
+and jurisdiction-aware governance matter as much as recall quality. The
+substrate is a plain markdown vault: no graph database, no vector database
+extension, no blockchain. The filesystem is the source of truth, and every
+index is derived state that can be rebuilt from it.
 
 ---
 
-## Status
+## Why
 
-**v2.10.0** — Architecture-complete checkpoint for the v3.0
-evidence-package push. RRF is now wired into `/v2/recall` as an
-opt-in fusion mode (`fusion: "rrf"`); cognitive records have
-approve/reject parity with facts and entities; the LongMemEval
-harness gains `--retrieval-mode {hybrid,bm25,vector,full-context}`
-and `--fusion {weighted,rrf}` for one-flag ablations; new
-`bench/locomo-harness.ts` runs LoCoMo QA; new
-`bench/swiss-trust-bench.ts` ships **9 end-to-end trust scenarios
-(9/9 passing)** — the differentiator no other memory system has.
-v3.0 itself waits on the full benchmark evidence (LongMemEval N=500
-with judge, LoCoMo QA full run, Zep/Hindsight apples-to-apples).
-
-- **231 tests passing** across 26 test files (551 `expect()` assertions)
-- **96.0% Precision@1** on a 25-query retrieval benchmark over a real
-  347-document corpus (vs 44.0% for the v1 baseline — **+52 percentage
-  points**). External harness for LongMemEval included in `bench/`.
-- **Acceptance gate rejected ~27% of LLM-proposed facts for failing
-  source-evidence checks** on a real 20-episode smoke run of Ardin's
-  vault (111 drafts → 55 auto-approved / 30 auto-rejected for evidence
-  failure / 26 held for human review). Honest framing: evidence-check
-  failure can mean hallucination, alias/synonym mismatch, or extraction
-  phrasing mismatch — a "hallucination caught" claim needs human-labeled
-  ground truth before it's defensible.
-- **First LongMemEval result** (Wu et al., ICLR 2025, retrieval-only,
-  176 questions): Overall **Hit@1=46.0%, Hit@5=84.1%, Hit@10=91.5%**;
-  knowledge-update 65.8 / 88.2 / 93.4; temporal-reasoning 30.0 / 86.7 /
-  96.7; multi-session 32.5 / 72.5 / 80.0. Honest framing: this is
-  session-level retrieval recall, not LongMemEval official
-  answer-correctness — the LLM judge layer is the next milestone.
-- **Draft → approved/rejected lifecycle** on L2 facts and entities,
-  with `PROPOSE`/`APPROVE`/`REJECT` audit ops in the hash chain.
-- **Strict policy mode** (`MEMA_POLICY_MODE=strict`) denies missing
-  governance, jurisdiction mismatches, and regulated-cloud routing
-  without human review — Swiss enterprise mode.
-- **Hard-erase audit provenance** captures pre-erasure record_id +
-  content/metadata hashes + legal_basis without retaining content.
-- **Atomic writes everywhere** in v2 — tmp + fsync + rename via
-  `src/v2/atomic.ts`. The README invariant now holds.
-- **Graph-influenced ranking** — derived_from in-degree, temporal
-  recency, contradiction penalty added to score components.
-- **Ollama embedder** — opt-in transformer-quality local embeddings.
-- **MCP v2 surface live** — 9 tools for Claude Code / Cursor / any MCP client
-- Full architecture documented in [`docs/WHITEPAPER.md`](docs/WHITEPAPER.md)
-
-> **v1 is preserved unchanged** at `/v1/*` endpoints for backwards
-> compatibility. New deployments should use v2.
+Memory errors compound. A single wrong or unattributed fact written today
+becomes the premise an agent reasons from tomorrow, and the cost of that
+mistake grows the longer it stays uncaught. mema puts the controls on the
+write path, so bad records are stopped before they enter the retrieval
+surface rather than caught after they have done damage. Every recall returns
+a receipt: `score_components`, `why_retrieved`, the `governance` decision, a
+content hash, and a UAL for records that have been wrapped as assets.
 
 ---
 
@@ -90,17 +44,49 @@ with judge, LoCoMo QA full run, Zep/Hindsight apples-to-apples).
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-Each layer is one or more TypeScript files under `src/v2/layer{N}-*.ts`.
-The filesystem layout mirrors the architecture: `data/episodes/`,
-`data/facts/`, `data/cognitive/`, `data/v2-entities/`,
-`data/_meta/audit.sqlite`, `data/_meta/vectors.sqlite`,
-`data/_meta/anchors.sqlite`.
+Each layer is one or more TypeScript files under `src/v2/layer{N}-*.ts`. The
+filesystem layout mirrors the architecture: `data/episodes/`, `data/facts/`,
+`data/cognitive/`, `data/v2-entities/`, `data/_meta/audit.sqlite`,
+`data/_meta/vectors.sqlite`, `data/_meta/anchors.sqlite`.
 
-**Inspired by** Zep (bi-temporal facts), Hindsight (epistemic separation),
-Mem0 (production memory pipeline), and OriginTrail/DKG (verifiable
-knowledge assets). **Ships without** graph-DB substrate, online LLM
-extraction, or blockchain dependencies. See [`docs/WHITEPAPER.md`](docs/WHITEPAPER.md)
-for full related-work positioning.
+mema draws on Zep (bi-temporal facts), Hindsight (epistemic separation), Mem0
+(production memory pipeline), and OriginTrail (verifiable knowledge assets),
+but ships without a graph-DB substrate, online LLM extraction, or blockchain
+dependencies. See [`docs/WHITEPAPER.md`](docs/WHITEPAPER.md) for the full
+related-work positioning.
+
+---
+
+## Highlights
+
+- **v2.22.13.** 538 tests passing across 63 test files (1,362 `expect()`
+  assertions), running in under 4 seconds via `bun test`.
+- **96.0% Precision@1** on a 25-query retrieval benchmark over a 347-document
+  corpus, versus 44.0% for the v1 keyword baseline. This is the measurement
+  recorded for the v2.0.0 architecture in `bench/recall-benchmark-v2.py`;
+  re-run it against your own corpus to reproduce.
+- **External evaluation harnesses** for LongMemEval (`bench/longmemeval-harness.ts`)
+  and LoCoMo (`bench/locomo-harness.ts`), with retrieval-mode and fusion-mode
+  flags for one-flag ablations.
+- **Trust benchmark** (`bench/swiss-trust-bench.ts`): 12 end-to-end scenarios
+  covering strict-mode denial, purpose and jurisdiction mismatch, cross-tenant
+  isolation, hard-erase audit replay, and audit-chain integrity. These are the
+  procurement-checkbox properties that recall benchmarks do not measure.
+- **Acceptance lifecycle** for untrusted producers: LLM extractors propose
+  drafts, an evidence check gates promotion, and every transition is recorded
+  in the audit chain.
+- **Strict policy mode** (`MEMA_POLICY_MODE=strict`) denies missing
+  governance, jurisdiction mismatches, and regulated-cloud routing without
+  human review.
+- **Hard erase with audit provenance**: erasure records the pre-erasure
+  `record_id`, content and metadata hashes, and `legal_basis` without
+  retaining the erased content.
+- **MCP server** exposing nine v2 tools to Claude Code, Cursor, or any MCP
+  client, alongside three independent adversarial security reviews with
+  shipped mitigations.
+
+> **v1 is preserved unchanged** at `/v1/*` for backwards compatibility. New
+> deployments should use v2.
 
 ---
 
@@ -110,7 +96,7 @@ for full related-work positioning.
 git clone https://github.com/machtsinnch/mema && cd mema
 bun install
 
-# Start the server (with permissive rate-limit for development)
+# Start the server (permissive rate limit for development)
 MACHTSINN_RATE_LIMIT_BURST=10000 ./scripts/start.sh
 
 # Verify
@@ -131,130 +117,46 @@ python3 bench/recall-benchmark-v2.py
 
 ---
 
-## Acceptance lifecycle for untrusted producers (v2.7+)
-
-LLM extractors and other untrusted producers do not write directly into
-the retrieval surface. They propose drafts; an evidence-checked review
-step promotes them to `approved` (or marks them `rejected`).
-
-```
-raw episode ─▶ LLM extractor ─▶ DRAFT fact/entity (status: "draft")
-                                        │
-                                        ▼
-                              evidence-check guard
-                                        │
-                            ┌───────────┴───────────┐
-                            ▼                       ▼
-                       APPROVED                  REJECTED
-                  (visible in recall)       (kept for audit,
-                                             never retrievable)
-```
-
-Pipeline:
-
-```bash
-# 1) Extract drafts (status="draft", with evidence excerpts)
-bun scripts/extract-facts-llm.ts --owner ardin
-
-# 2a) Auto-review high-confidence drafts (>=0.9 + evidence passes)
-bun scripts/review-proposals.ts --owner ardin --auto
-
-# 2b) Interactively review the remainder
-bun scripts/review-proposals.ts --owner ardin
-
-# 3) Wire + reindex only after drafts have been resolved
-bun scripts/wire-entity-graph.ts
-curl -X POST http://localhost:3001/v2/vector/reindex -H "x-api-key: dev-ardin"
-```
-
-The evidence-check guard runs server-side on `/v2/fact/:id/approve` and
-returns `422 evidence_check_failed` when the proposed fact's `subject`
-or `object` strings do not appear (case-insensitive substring) in the
-source episode body. Pass `force: true` to override for synonym/alias
-cases. Every state transition appends an `APPROVE` or `REJECT` entry to
-the hash-chained audit log; `verifyChain()` includes these in the chain.
-
-Records written through `/v2/fact` and `/v2/entity` without an explicit
-`status` field default to `approved` — the lifecycle is opt-in and
-fully backward-compatible with existing vaults.
-
----
-
-## Architecture invariants (DO NOT BREAK)
-
-1. **Filesystem is the source of truth.** SQLite (audit, vectors, anchors)
-   and any future index is derived state, rebuildable from the markdown
-   vault.
-2. **All write paths use atomic write** (temp + rename + fsync). As
-   of v2.8.0 every v2 layer writer uses `atomicWriteFile` from
-   `src/v2/atomic.ts` — no direct `writeFileSync` remains in the v2
-   surface.
-3. **All read endpoints filter through `canRead` (v1) or `owner !==
-   query.owner → deny` (v2).** No exceptions.
-4. **Uniform 404** for not-found vs not-readable.
-5. **Path sanitization on every user-supplied path segment** (including
-   inside UALs after URL-decode).
-6. **N=3 promotion rule** for v1 generalized layer is server-side enforced.
-7. **Audit log is append-only with hash chain + external sealed witness.**
-8. **Untrusted producers write drafts only** (v2.7+). LLM-derived facts
-   and entities are gated by the acceptance lifecycle before they enter
-   the retrieval surface.
-
----
-
-## HTTP API surface
+## HTTP API
 
 ### v2 (recommended)
 
 | Method | Endpoint | Layer | Purpose |
 |---|---|---|---|
-| POST | `/v2/observe` | L1 | Ingest a raw episode |
-| POST | `/v2/fact` | L2 | Record a semantic fact (bi-temporal). Pass `status: "draft"` + `evidence_excerpt` for untrusted producers |
-| POST | `/v2/fact/:id/invalidate` | L2 | Mark a fact invalidated/superseded |
-| POST | `/v2/fact/:id/approve` | L2 | Promote a draft fact to `approved` (runs server-side evidence check unless `force:true`) |
+| POST | `/v2/observe` | L1 | Ingest a raw episode (runs extraction by default) |
+| POST | `/v2/fact` | L2 | Record a bi-temporal fact. Pass `status: "draft"` + `evidence_excerpt` for untrusted producers |
+| POST | `/v2/fact/:id/invalidate` | L2 | Mark a fact invalidated or superseded |
+| POST | `/v2/fact/:id/approve` | L2 | Promote a draft fact (runs the server-side evidence check unless `force: true`) |
 | POST | `/v2/fact/:id/reject` | L2 | Reject a draft fact (requires `reason`) |
-| GET | `/v2/facts/drafts` | L2 | List all draft facts for the owner (review tools) |
-| GET | `/v2/facts/valid-at?at=...&include_drafts=true` | L2 | Facts valid at a given timestamp |
-| POST | `/v2/entity` | L2 | Create an entity. Pass `status: "draft"` for untrusted producers |
-| POST | `/v2/entity/:id/approve` | L2 | Promote a draft entity to `approved` |
-| POST | `/v2/entity/:id/reject` | L2 | Reject a draft entity (requires `reason`) |
-| GET | `/v2/entities/drafts` | L2 | List all draft entities for the owner |
-| GET | `/v2/entity/find/:name` | L2 | Resolve name/alias to entity |
+| GET | `/v2/facts/drafts` | L2 | List draft facts for the owner |
+| GET | `/v2/facts/valid-at?at=...` | L2 | Facts valid at a given timestamp |
+| POST | `/v2/entity` | L2 | Create an entity (supports `status: "draft"`) |
+| GET | `/v2/entity/find/:name` | L2 | Resolve a name or alias to an entity |
 | POST | `/v2/entity/:keeperId/merge/:mergedId` | L2 | Merge two entities |
-| POST | `/v2/cognitive` | L3 | Record an experience/observation/belief |
+| POST | `/v2/cognitive` | L3 | Record an experience, observation, or belief |
 | POST | `/v2/reflect` | L3 | Run automated reflection |
 | POST | `/v2/governance/build` | L4 | Compute a governance block from source |
 | POST | `/v2/erase` | L4 | Hard-erase a record (tombstone + audit) |
-| POST | `/v2/recall` | L5 | Hybrid retrieval (returns verifiable packets) |
-| POST | `/v2/vector/reindex` | L5 | Rebuild vector index |
+| POST | `/v2/recall` | L5 | Hybrid retrieval, returns verifiable packets |
+| POST | `/v2/recall/packet` | L5 | Compiled memory packet for a query |
+| POST | `/v2/vector/reindex` | L5 | Rebuild the vector index |
 | GET | `/v2/graph/derived-from/:id` | L5 | Walk supporting records |
 | GET | `/v2/audit/log` | L6 | Query the audit log |
-| GET | `/v2/audit/verify` | L6 | Verify the hash chain integrity |
+| GET | `/v2/audit/verify` | L6 | Verify hash-chain integrity |
 | POST | `/v2/asset/wrap` | L7 | Wrap a record as a verifiable asset |
 | POST | `/v2/asset/anchor` | L7 | Anchor an asset to a target |
-| GET | `/v2/asset/anchors?ual=...` | L7 | List anchors for caller |
-| POST | `/v2/asset/verification-status` | L7 | Transition lifecycle state |
+| GET | `/v2/asset/anchors?ual=...` | L7 | List anchors for the caller |
 
-### v1 (legacy, preserved)
+The full route set, including cognitive approval, judgments, contradictions,
+and supersession, lives in `src/index.ts`. v1 operations (`/v1/remember`,
+`/v1/recall`, `/v1/memory/:id`, `/v1/forget`, `/v1/promote`, `/v1/link`,
+`/v1/log`, `/v1/stats`) are preserved at `/v1/*`.
 
-| Op | Endpoint |
-|---|---|
-| WRITE | `POST /v1/remember` |
-| RETRIEVE | `POST /v1/recall` |
-| READ | `GET /v1/memory/:id` |
-| UPDATE | `PUT /v1/memory/:id` |
-| FORGET | `POST /v1/forget` (soft) |
-| PROMOTE | `POST /v1/promote` |
-| LINK | `POST /v1/link` |
-| HEALTH | `GET /v1/topology/health` |
-| STATS | `GET /v1/stats` |
-| AUDIT | `GET /v1/log` |
-
-Auth: `x-api-key` header. Dev keys: `dev-ardin` / `dev-marcel` / `dev-founder3`.
+Auth: `x-api-key` header. Dev keys: `dev-ardin`, `dev-marcel`, `dev-founder3`.
 
 ---
 
-## MCP server (Claude Code / Cursor / any MCP client)
+## MCP server
 
 Add to `~/.claude.json` or `~/.cursor/mcp.json`:
 
@@ -274,177 +176,120 @@ Add to `~/.claude.json` or `~/.cursor/mcp.json`:
 }
 ```
 
-**v2 tools:** `memory_v2_observe` · `memory_v2_fact` · `memory_v2_recall` ·
-`memory_v2_reflect` · `memory_v2_audit_log` · `memory_v2_audit_verify` ·
-`memory_v2_erase` · `memory_v2_asset_wrap` · `memory_v2_asset_anchor`
+v2 tools: `memory_v2_observe`, `memory_v2_fact`, `memory_v2_recall`,
+`memory_v2_reflect`, `memory_v2_audit_log`, `memory_v2_audit_verify`,
+`memory_v2_erase`, `memory_v2_asset_wrap`, `memory_v2_asset_anchor`. The eight
+v1 tools (`memory_remember`, `memory_recall`, `memory_show`, `memory_forget`,
+`memory_promote`, `memory_stats`, `memory_health`, `memory_log`) remain
+available.
+
+---
+
+## Acceptance lifecycle for untrusted producers
+
+LLM extractors and other untrusted producers do not write directly into the
+retrieval surface. They propose drafts, and an evidence-checked review step
+promotes them to `approved` or marks them `rejected`.
+
+```
+raw episode ─▶ LLM extractor ─▶ DRAFT fact/entity (status: "draft")
+                                        │
+                                        ▼
+                              evidence-check guard
+                                        │
+                            ┌───────────┴───────────┐
+                            ▼                       ▼
+                       APPROVED                  REJECTED
+                  (visible in recall)       (kept for audit,
+                                             never retrievable)
+```
+
+The guard runs server-side on `/v2/fact/:id/approve` and returns
+`422 evidence_check_failed` when the fact's `subject` or `object` does not
+appear in the source episode body (case-insensitive). Pass `force: true` to
+override for synonym or alias cases. Every transition appends an `APPROVE` or
+`REJECT` entry to the hash-chained audit log, and `verifyChain()` includes
+them. Records written without an explicit `status` default to `approved`, so
+the lifecycle is opt-in and backward-compatible with existing vaults.
+
+---
+
+## Architecture invariants
+
+1. **Filesystem is the source of truth.** SQLite (audit, vectors, anchors) is
+   derived state, rebuildable from the markdown vault.
+2. **All write paths are atomic** (temp + fsync + rename via `src/v2/atomic.ts`).
+   No direct `writeFileSync` remains in the v2 surface.
+3. **All reads filter by owner** (`canRead` in v1, deny-on-owner-mismatch in
+   v2). No exceptions.
+4. **Uniform 404** for not-found versus not-readable.
+5. **Path sanitization on every user-supplied segment**, including inside UALs
+   after URL-decode.
+6. **Audit log is append-only** with a hash chain plus an external sealed
+   witness.
+7. **Untrusted producers write drafts only** and are gated by the acceptance
+   lifecycle before entering the retrieval surface.
+
+---
+
+## Threat model
+
+mema v2 underwent three independent adversarial reviews. Mitigations shipped:
+
+| Attack | Mitigation |
+|---|---|
+| Audit row deletion or suffix-drop | seq-contiguity check + `sqlite_sequence` comparison + external sealed witness |
+| Audit chain fork via race | `appendAudit` wrapped in a `BEGIN IMMEDIATE` transaction |
+| Cross-tenant recall or anchor leak | owner filter is deny-by-default; `listAnchors` is owner-scoped |
+| UAL path traversal | `SAFE_SEGMENT` regex applied after URL-decode |
+| NaN/Inf confidence poisoning | `clampConfidence()` at every write and read boundary |
+| Disk-fill DoS | per-request body cap (`MACHTSINN_V2_MAX_BODY_BYTES`) |
+| Silent retrieval failure | ripgrep exit-code check, throws on a missing binary |
+| Vector cross-embedder pollution | vector search filters by embedder name |
+
+Full detail in [`docs/WHITEPAPER.md`](docs/WHITEPAPER.md) sections 4.4 to 4.5.
 
 ---
 
 ## Graph view
 
-Three ways to see the network of memories:
+Three ways to see the network of memories, all sharing one layer-color
+palette:
 
-### Obsidian (with layer coloring)
-Open `data/` as an Obsidian vault, then install the layer-coloring config:
-
-```bash
-./scripts/install-obsidian-config.sh           # writes data/.obsidian/graph.json
-# or, by hand: cp docs/obsidian-graph.example.json data/.obsidian/graph.json
-```
-
-`Cmd+G` to open the graph. Each layer renders in its own colour:
-
-| Layer | Path | Colour |
-|---|---|---|
-| L1 episodes | `episodes/`     | cyan `#66cccc` |
-| L2 facts    | `facts/`        | amber `#ffcc66` |
-| L3 cognitive | `cognitive/`   | purple `#cc99ff` |
-| L2 v2 entities | `v2-entities/` | green `#99cc99` |
-| v1 generalized hubs | `generalized/` | gold `#daa520` |
-| v1 user notes | `users/`       | white `#ffffff` |
-| v1 entity-scoped | `entities/`  | gray `#888888` |
-
-The same palette is used by the built-in viewer below.
-
-### Built-in `/graph` viewer (zero-dependency)
-```
-http://localhost:3001/graph
-```
-Loads in any browser. Enter your API key in the form, click *Load graph*. Canvas
-force-directed layout with pan / zoom / drag / hover tooltips. Same colour
-palette as the Obsidian config.
-
-### Any external tool via JSON
-```bash
-curl 'http://localhost:3001/v2/graph?limit=2000' -H 'x-api-key: dev-ardin'
-```
-Returns `{nodes, edges, stats}` ready for cytoscape, vis-network, Gephi, D3.
-
-**v1 tools (preserved):** `memory_remember` · `memory_recall` · `memory_show`
-· `memory_forget` · `memory_promote` · `memory_stats` · `memory_health` ·
-`memory_log`
-
----
-
-## Verifiable Memory Assets (Layer 7)
-
-Every record can be **wrapped as an asset** — promoting it from a plain
-markdown file to a versioned, hash-stamped, UAL-addressable verifiable
-artifact:
-
-```yaml
-ual: mema://owner/ardin/fact/marcel-r/memory/01KR...
-content_hash: sha256:abc...
-metadata_hash: sha256:def...
-asset_version: 1
-verification_status: anchored   # unverified | verified | anchored
-anchored_at: 2026-05-15T14:32:11Z
-anchor_targets: [local, customer-audit-bundle]
-```
-
-### What recall returns
-
-`/v2/recall` always returns `score`, `score_components`, `governance`,
-`why_retrieved`, and `excerpt` for every hit. **Cryptographic asset
-metadata is opt-in** — `ual`, `content_hash`, `metadata_hash`,
-`asset_version`, and `verification_status` are populated only after the
-record has been wrapped via `/v2/asset/wrap`:
-
-```json
-{
-  "kind": "fact",
-  "score": 0.86,
-  "score_components": { "idf": 0.72, "title": 0.80, "vector": 0.41, ... },
-  "why_retrieved": "rare-term keyword match + title match + semantic similarity (0.41)",
-  "governance": { "allowed": true, "reason": "policy_pass" },
-  "excerpt": "Pillar 3a tax optimization strategy — ...",
-
-  // Present only when the record was wrapped:
-  "ual": "mema://owner/ardin/fact/marcel-r/memory/01KR...",
-  "content_hash": "sha256:abc...",
-  "metadata_hash": "sha256:def...",
-  "asset_version": 1,
-  "verification_status": "anchored"
-}
-```
-
-The **system-wide verifiability guarantee** lives in the L6 audit log —
-every recall is hash-chained with `prev_hash` / `curr_hash` + external
-sealed witness. The L7 per-record verifiability is the upgrade for
-records you want to expose externally with provenance.
-
-A downstream consumer of a wrapped record can independently verify the
-hit by re-hashing the file at `ual` and comparing to `content_hash`.
-Inspired by OriginTrail's DKG Knowledge Asset model, **without** the
-blockchain dependency.
-
----
-
-## Threat model & adversarial hardening
-
-mema v2 underwent three independent adversarial reviews. Mitigations
-shipped:
-
-| Attack | Mitigation |
-|---|---|
-| Audit row deletion (mid-stream) | seq-contiguity check |
-| Audit suffix-drop | `sqlite_sequence` comparison + external witness file |
-| `sqlite_sequence` reset bypass | external sealed witness (`data/_meta/audit-witness.log`) cross-checked at verifyChain time |
-| Audit chain fork via race | `appendAudit` wrapped in `db.transaction()` (BEGIN IMMEDIATE) |
-| Cross-tenant recall leak | `recall()` owner filter is **deny-by-default** for missing owner |
-| Cross-tenant anchor leak | `listAnchors(owner, ual?)` is owner-scoped |
-| UAL path traversal | `SAFE_SEGMENT` regex `/^[A-Za-z0-9_.\-]+$/` after URL-decode |
-| NaN/Inf confidence poisoning | `clampConfidence()` at every write boundary + defensive clamp at read |
-| Disk-fill DoS | 2 MB body cap per v2 request (configurable via `MACHTSINN_V2_MAX_BODY_BYTES`) |
-| Silent retrieval failure (rg missing) | `ripgrepAcross` checks exit code, throws on missing binary |
-| Vector cross-embedder pollution | `vectorSearch` filters by embedder name |
-
-Full details in [`docs/WHITEPAPER.md`](docs/WHITEPAPER.md) §4.4–4.5.
-
----
-
-## Test coverage
-
-```
-v1 isolation + security:          38 tests (5 files)
-v2 six-layer smoke (end-to-end):   3 tests
-v2 professional:                  18 tests
-v2 verifiable assets:             12 tests
-v2 security-hardening round 1:    12 tests
-v2 security-hardening round 2:    14 tests
-─────────────────────────────────────────────
-Total:                            97 tests, all green
-```
-
-`bun test` runs them all in ~300 ms.
+- **Obsidian:** open `data/` as a vault and run
+  `./scripts/install-obsidian-config.sh` to install layer coloring, then
+  `Cmd+G`.
+- **Built-in viewer:** open `http://localhost:3001/graph`, enter an API key,
+  and load a zero-dependency force-directed canvas.
+- **External tools:** `curl 'http://localhost:3001/v2/graph?limit=2000'`
+  returns `{nodes, edges, stats}` ready for Cytoscape, vis-network, Gephi, or
+  D3.
 
 ---
 
 ## Stack
 
-- **Bun + TypeScript** (>= 1.1.0)
-- **Hono** for HTTP
-- **bun:sqlite** (audit, vectors, anchors stores)
-- **@modelcontextprotocol/sdk** for MCP server
-- **ripgrep** for keyword search (system dependency)
-- **gray-matter + js-yaml** for frontmatter
-- **ulid** for IDs
+- Bun and TypeScript
+- Hono for HTTP
+- `bun:sqlite` for the audit, vector, and anchor stores
+- `@modelcontextprotocol/sdk` for the MCP server
+- ripgrep for keyword search (system dependency)
+- gray-matter for frontmatter, ulid for IDs
 
-No graph DB, no vector DB extension, no blockchain. Optional: `OPENAI_API_KEY`
-enables the `OpenAIEmbedder` for semantic retrieval (auto-detected; falls
-back to `LocalHashEmbedder` when absent).
+No graph DB, no vector DB extension, no blockchain. Semantic embeddings are
+optional and fall back to a local hash embedder when no external embedder is
+configured.
 
 ---
 
 ## License
 
-**Business Source License 1.1**, converting to Apache 2.0 on
-**2030-05-15**. Non-production use (evaluation, academic research,
-internal development) is free. Production use requires a commercial
-license — contact the Licensor.
+**Business Source License 1.1**, converting to **Apache 2.0 on 2030-05-15**.
+Non-production use (evaluation, academic research, security review, internal
+development) is free. Production use requires a commercial license: contact the
+Licensor.
 
-Versions **v2.0.0 through v2.8.0 remain MIT-licensed** at their git
-tags on this repo. See [`LICENSE`](LICENSE),
+BUSL applies from v2.9.0 onward. Versions **v2.0.0 through v2.8.0 remain
+MIT-licensed** at their published git tags. See [`LICENSE`](LICENSE),
 [`NOTICE-LICENSE-HISTORY.md`](NOTICE-LICENSE-HISTORY.md), and
-[`LICENSE-MIT-PRE-V2.9.md`](LICENSE-MIT-PRE-V2.9.md) for the full
-history.
+[`LICENSE-MIT-PRE-V2.9.md`](LICENSE-MIT-PRE-V2.9.md) for the full history.
